@@ -66,6 +66,7 @@ int main(int argc, char* argv[]) {
   std::string mask_file;
   bool show_outlines = false;
   bool show_mask = false;
+  int solid_flag = 1;
   std::vector<std::string> vtk_files;
   std::vector<std::string> mask_field_names;
   int mask_field_index = 0;
@@ -203,6 +204,12 @@ int main(int argc, char* argv[]) {
           }
           ImGui::EndCombo();
         }
+        ImGui::Spacing();
+        ImGui::Text("Solid Flag");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(80);
+        // ImGui::InputInt(" ", &solid_flag, 1, 1, ImGuiInputTextFlags_EnterReturnsTrue);
+        ImGui::InputInt(" ", &solid_flag);
         ImGui::Spacing();
         ImGui::Checkbox("Show", &show_mask);
         ImGui::Spacing();
