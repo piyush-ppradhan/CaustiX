@@ -8,3 +8,6 @@
 [submodule "lib/ImGuiFileDialog"]
 	path = lib/ImGuiFileDialog
 	url = https://github.com/aiekick/ImGuiFileDialog
+[submodule "lib/vtk"]
+	path = lib/vtk
+	url = https://gitlab.kitware.com/vtk/vtk

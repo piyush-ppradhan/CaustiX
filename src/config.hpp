@@ -7,5 +7,5 @@ const char* font_bold = "../assets/JetBrainsMono-Bold.ttf";
 const char* font_regular = "../assets/JetBrainsMono-Regular.ttf";
 const char* font_italic = "../assets/JetBrainsMono-Italic.ttf";
 
-float ui_font_size = 18.0f;
+float ui_font_size = 19.0f;
 float ui_heading_font_size = 20.0f;

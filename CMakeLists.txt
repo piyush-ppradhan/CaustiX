@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.5)
+cmake_minimum_required(VERSION 3.12)
 project(CaustiX)
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/bin)
 
@@ -15,6 +15,14 @@ if (UNIX)
 	set(SDL_X11 OFF)
 	set(SDL_VULKAN ON)
 endif()
+
+set(SDL_AUDIO OFF)
+set(SDL_HAPTIC OFF)
+set(SDL_HIDAPI OFF)
+set(SDL_SENSOR OFF)
+set(SDL_CAMERA OFF)
+set(SDL_DIALOG OFF)
+set(SDL_JOYSTICK OFF)
 
 set(IMGUI_DIR ${CMAKE_SOURCE_DIR}/lib/imgui)
 
@@ -38,4 +46,19 @@ target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
 	${IMGUI_DIR}/backends
 	${CMAKE_SOURCE_DIR}/lib/ImGuiFileDialog
 )
-target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE SDL3::SDL3)
+set(VTK_BUILD_ALL_MODULES OFF)
+set(VTK_BUILD_TESTING OFF)
+set(VTK_ENABLE_WRAPPING OFF)
+set(VTK_GROUP_ENABLE_Rendering "NO")
+set(VTK_GROUP_ENABLE_StandAlone "DEFAULT")
+set(VTK_GROUP_ENABLE_Tk "NO")
+set(VTK_GROUP_ENABLE_MPI "NO")
+set(VTK_GROUP_ENABLE_Web "NO")
+set(VTK_GROUP_ENABLE_Qt "NO")
+set(VTK_BUILD_EXAMPLES OFF)
+set(VTK_BUILD_DOCUMENTATION OFF)
+set(VTK_MODULE_ENABLE_VTK_IOLegacy "YES")
+set(VTK_MODULE_ENABLE_VTK_CommonDataModel "YES")
+add_subdirectory(${CMAKE_SOURCE_DIR}/lib/vtk)
+
+target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE SDL3::SDL3 VTK::IOLegacy VTK::CommonDataModel)
