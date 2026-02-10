@@ -5,23 +5,25 @@
 #include <imgui_impl_sdl3.h>
 #include <imgui_impl_sdlrenderer3.h>
 #include <ImGuiFileDialog.h>
-#include <vtkGenericDataObjectReader.h>
-#include <vtkNew.h>
-#include <vtkDataSet.h>
-#include <vtkPointData.h>
-#include <vtkCellData.h>
-#include <vtkImageData.h>
-#include <vtkStructuredPoints.h>
-#include <vtkStructuredGrid.h>
-#include <vtkRectilinearGrid.h>
-#include <vtkUnstructuredGrid.h>
-#include <vtkPolyData.h>
+#include <viskores/io/VTKDataSetReader.h>
+#include <viskores/cont/DataSet.h>
+#include <viskores/cont/Field.h>
+#include <viskores/cont/CellSetStructured.h>
 #include <algorithm>
 #include <filesystem>
 #include <string>
 #include <vector>
-#include "config.hpp"
 #include <iostream>
+#include "config.hpp"
+
+struct DataLayer {
+  std::string name;
+  ImVec4 color = ImVec4(1.0f, 0.0f, 0.0f, 1.0f);
+  float opacity = 1.0f;
+  bool visible = true;
+  float line_width = 1.0f;
+  bool show_config = false;
+};
 
 int main(int argc, char* argv[]) {
   if (!SDL_Init(SDL_INIT_VIDEO)) {
@@ -73,6 +75,8 @@ int main(int argc, char* argv[]) {
   bool show_mask_error = false;
   std::string mask_error_msg;
   int vtk_index = 0;
+  std::vector<std::string> dataset_cell_names;
+  std::vector<DataLayer> data_layers;
   bool first_frame = true;
 
   bool running = true;
@@ -152,6 +156,8 @@ int main(int argc, char* argv[]) {
       vtk_dir.clear();
       vtk_files.clear();
       vtk_index = 0;
+      dataset_cell_names.clear();
+      data_layers.clear();
     }
     if (!vtk_files.empty()) {
       ImGui::Spacing();
@@ -218,6 +224,38 @@ int main(int argc, char* argv[]) {
         ImGui::PushFont(bold_font);
         ImGui::Text("Render:Data");
         ImGui::PopFont();
+        ImGui::Spacing();
+        if (!dataset_cell_names.empty()) {
+          if (ImGui::Button("Add##data")) {
+            ImGui::OpenPopup("AddDataLayer");
+          }
+          if (ImGui::BeginPopup("AddDataLayer")) {
+            for (int i = 0; i < (int)dataset_cell_names.size(); i++) {
+              if (ImGui::Selectable(dataset_cell_names[i].c_str())) {
+                data_layers.push_back(DataLayer{dataset_cell_names[i]});
+              }
+            }
+            ImGui::EndPopup();
+          }
+          ImGui::SameLine();
+        }
+        if (ImGui::Button("Clear##data")) {
+          data_layers.clear();
+        }
+        for (int i = 0; i < (int)data_layers.size(); i++) {
+          ImGui::Text("%s", data_layers[i].name.c_str());
+          ImGui::SameLine();
+          std::string config_id = "Config##data_config_" + std::to_string(i);
+          if (ImGui::SmallButton(config_id.c_str())) {
+            data_layers[i].show_config = true;
+          }
+          ImGui::SameLine();
+          std::string remove_id = "X##data_remove_" + std::to_string(i);
+          if (ImGui::SmallButton(remove_id.c_str())) {
+            data_layers.erase(data_layers.begin() + i);
+            i--;
+          }
+        }
       }
     }
     ImGui::End();
@@ -233,6 +271,21 @@ int main(int argc, char* argv[]) {
         }
         std::sort(vtk_files.begin(), vtk_files.end());
         vtk_index = 0;
+        dataset_cell_names.clear();
+        data_layers.clear();
+        if (!vtk_files.empty()) {
+          try {
+            viskores::io::VTKDataSetReader data_reader(vtk_files[0]);
+            viskores::cont::DataSet ds = data_reader.ReadDataSet();
+            for (viskores::IdComponent i = 0; i < ds.GetNumberOfFields(); i++) {
+              const auto& field = ds.GetField(i);
+              if (field.IsPointField() || field.IsCellField()) {
+                dataset_cell_names.push_back(field.GetName());
+              }
+            }
+          } catch (...) {
+          }
+        }
       }
       ImGuiFileDialog::Instance()->Close();
     }
@@ -241,61 +294,22 @@ int main(int argc, char* argv[]) {
       if (ImGuiFileDialog::Instance()->IsOk()) {
         std::string selected_file = ImGuiFileDialog::Instance()->GetFilePathName();
 
-        vtkNew<vtkGenericDataObjectReader> reader;
-        reader->SetFileName(selected_file.c_str());
-        reader->ReadAllScalarsOn();
-        reader->ReadAllVectorsOn();
-        reader->ReadAllTensorsOn();
-        reader->ReadAllFieldsOn();
-        reader->ReadAllNormalsOn();
-        reader->ReadAllTCoordsOn();
-        reader->ReadAllColorScalarsOn();
-        reader->Update();
+        try {
+          viskores::io::VTKDataSetReader reader(selected_file);
+          viskores::cont::DataSet dataset = reader.ReadDataSet();
 
-        vtkDataSet* dataset = nullptr;
-        if (reader->IsFileStructuredPoints()) {
-          std::cout << "DEBUG: File is StructuredPoints" << std::endl;
-          dataset = reader->GetStructuredPointsOutput();
-        } else if (reader->IsFileStructuredGrid()) {
-          std::cout << "DEBUG: File is StructuredGrid" << std::endl;
-          dataset = reader->GetStructuredGridOutput();
-        } else if (reader->IsFileRectilinearGrid()) {
-          std::cout << "DEBUG: File is RectilinearGrid" << std::endl;
-          dataset = reader->GetRectilinearGridOutput();
-        } else if (reader->IsFileUnstructuredGrid()) {
-          std::cout << "DEBUG: File is UnstructuredGrid" << std::endl;
-          dataset = reader->GetUnstructuredGridOutput();
-        } else if (reader->IsFilePolyData()) {
-          std::cout << "DEBUG: File is PolyData" << std::endl;
-          dataset = reader->GetPolyDataOutput();
-        } else {
-          std::cout << "DEBUG: File type not recognized" << std::endl;
-        }
-
-        if (!dataset) {
-          show_mask_error = true;
-          mask_error_msg = "Failed to read file as a VTK dataset.";
-        } else {
-          std::cout << "DEBUG: Number of points: " << dataset->GetNumberOfPoints() << std::endl;
-          std::cout << "DEBUG: Point data arrays: " << dataset->GetPointData()->GetNumberOfArrays() << std::endl;
-          std::cout << "DEBUG: Cell data arrays: " << dataset->GetCellData()->GetNumberOfArrays() << std::endl;
+          std::cout << "DEBUG: Number of points: " << dataset.GetNumberOfPoints() << std::endl;
+          std::cout << "DEBUG: Number of cells: " << dataset.GetNumberOfCells() << std::endl;
+          std::cout << "DEBUG: Number of fields: " << dataset.GetNumberOfFields() << std::endl;
 
           bool is_3d = true;
-          int dims[3];
-          if (auto* img = vtkImageData::SafeDownCast(dataset)) {
-            img->GetDimensions(dims);
-            std::cout << "DEBUG: ImageData dims: " << dims[0] << "x" << dims[1] << "x" << dims[2] << std::endl;
-            if (dims[0] <= 1 || dims[1] <= 1 || dims[2] <= 1) is_3d = false;
-          } else if (auto* sg = vtkStructuredGrid::SafeDownCast(dataset)) {
-            sg->GetDimensions(dims);
-            std::cout << "DEBUG: StructuredGrid dims: " << dims[0] << "x" << dims[1] << "x" << dims[2] << std::endl;
-            if (dims[0] <= 1 || dims[1] <= 1 || dims[2] <= 1) is_3d = false;
-          } else if (auto* rg = vtkRectilinearGrid::SafeDownCast(dataset)) {
-            rg->GetDimensions(dims);
-            std::cout << "DEBUG: RectilinearGrid dims: " << dims[0] << "x" << dims[1] << "x" << dims[2] << std::endl;
-            if (dims[0] <= 1 || dims[1] <= 1 || dims[2] <= 1) is_3d = false;
+          auto cellSet = dataset.GetCellSet();
+          if (cellSet.CanConvert<viskores::cont::CellSetStructured<1>>() ||
+              cellSet.CanConvert<viskores::cont::CellSetStructured<2>>()) {
+            is_3d = false;
+            std::cout << "DEBUG: Structured 1D or 2D dataset" << std::endl;
           } else {
-            std::cout << "DEBUG: No dimension check (unstructured/polydata)" << std::endl;
+            std::cout << "DEBUG: 3D or unstructured dataset" << std::endl;
           }
 
           if (!is_3d) {
@@ -305,15 +319,19 @@ int main(int argc, char* argv[]) {
             mask_file = selected_file;
             mask_field_names.clear();
             mask_field_index = 0;
-            vtkPointData* pd = dataset->GetPointData();
-            for (int i = 0; i < pd->GetNumberOfArrays(); i++) {
-              mask_field_names.push_back(pd->GetArrayName(i));
-            }
-            vtkCellData* cd = dataset->GetCellData();
-            for (int i = 0; i < cd->GetNumberOfArrays(); i++) {
-              mask_field_names.push_back(cd->GetArrayName(i));
+            for (viskores::IdComponent i = 0; i < dataset.GetNumberOfFields(); i++) {
+              const auto& field = dataset.GetField(i);
+              if (field.IsPointField() || field.IsCellField()) {
+                mask_field_names.push_back(field.GetName());
+              }
             }
           }
+        } catch (const viskores::io::ErrorIO& e) {
+          show_mask_error = true;
+          mask_error_msg = std::string("Failed to read file: ") + e.what();
+        } catch (...) {
+          show_mask_error = true;
+          mask_error_msg = "Failed to read file as a VTK dataset.";
         }
       }
       ImGuiFileDialog::Instance()->Close();
@@ -329,6 +347,37 @@ int main(int argc, char* argv[]) {
         ImGui::CloseCurrentPopup();
       }
       ImGui::EndPopup();
+    }
+
+    for (int i = 0; i < (int)data_layers.size(); i++) {
+      std::string popup_id = "Data Config##" + std::to_string(i);
+      if (data_layers[i].show_config) {
+        ImGui::OpenPopup(popup_id.c_str());
+        data_layers[i].show_config = false;
+      }
+      if (ImGui::BeginPopupModal(popup_id.c_str(), nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::Text("Layer: %s", data_layers[i].name.c_str());
+        ImGui::Spacing();
+        ImGui::Text("Color");
+        std::string color_id = "##data_color_" + std::to_string(i);
+        ImGui::ColorPicker3(color_id.c_str(), (float*)&data_layers[i].color, ImGuiColorEditFlags_PickerHueWheel);
+        ImGui::Spacing();
+        ImGui::Text("Opacity");
+        std::string opacity_id = "##data_opacity_" + std::to_string(i);
+        ImGui::SliderFloat(opacity_id.c_str(), &data_layers[i].opacity, 0.0f, 1.0f);
+        ImGui::Spacing();
+        std::string visible_id = "Visible##data_visible_" + std::to_string(i);
+        ImGui::Checkbox(visible_id.c_str(), &data_layers[i].visible);
+        ImGui::Spacing();
+        ImGui::Text("Line Width");
+        std::string lw_id = "##data_lw_" + std::to_string(i);
+        ImGui::SliderFloat(lw_id.c_str(), &data_layers[i].line_width, 0.5f, 5.0f);
+        ImGui::Spacing();
+        if (ImGui::Button("OK")) {
+          ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+      }
     }
 
     ImGui::Render();
