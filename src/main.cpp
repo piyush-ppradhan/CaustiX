@@ -9,12 +9,19 @@
 #include <viskores/cont/DataSet.h>
 #include <viskores/cont/Field.h>
 #include <viskores/cont/CellSetStructured.h>
+#include <viskores/filter/entity_extraction/Threshold.h>
+#include <viskores/filter/entity_extraction/ExternalFaces.h>
+#include <viskores/filter/geometry_refinement/Triangulate.h>
+#include <viskores/filter/vector_analysis/SurfaceNormals.h>
 #include <algorithm>
+#include <cctype>
+#include <cmath>
 #include <filesystem>
 #include <string>
 #include <vector>
 #include <iostream>
 #include "config.hpp"
+#include "pathtracer.hpp"
 
 struct DataLayer {
   std::string name;
@@ -25,7 +32,82 @@ struct DataLayer {
   bool show_config = false;
 };
 
-int main(int argc, char* argv[]) {
+static void extract_mesh(const std::string& mask_filepath, const std::string& field_name,
+                         int solid_val, pt::PathTracer& tracer, const pt::Material& mat) {
+  viskores::io::VTKDataSetReader reader(mask_filepath);
+  viskores::cont::DataSet ds = reader.ReadDataSet();
+
+  // Threshold: keep cells where field == solid_val
+  viskores::filter::entity_extraction::Threshold threshold;
+  threshold.SetActiveField(field_name);
+  threshold.SetThresholdBetween((double)solid_val, (double)solid_val);
+  viskores::cont::DataSet thresholded = threshold.Execute(ds);
+
+  // External faces
+  viskores::filter::entity_extraction::ExternalFaces externalFaces;
+  externalFaces.SetCompactPoints(true);
+  viskores::cont::DataSet surface = externalFaces.Execute(thresholded);
+
+  // Triangulate
+  viskores::filter::geometry_refinement::Triangulate triangulate;
+  viskores::cont::DataSet triangulated = triangulate.Execute(surface);
+
+  // Surface normals (point normals)
+  viskores::filter::vector_analysis::SurfaceNormals normals;
+  normals.SetGeneratePointNormals(true);
+  normals.SetGenerateCellNormals(false);
+  normals.SetAutoOrientNormals(true);
+  viskores::cont::DataSet result = normals.Execute(triangulated);
+
+  // Extract positions
+  auto coords = result.GetCoordinateSystem();
+  auto coordData = coords.GetData();
+  viskores::Id numPoints = result.GetNumberOfPoints();
+
+  std::vector<float> positions(numPoints * 3);
+  auto coordArray = coordData.AsArrayHandle<viskores::cont::ArrayHandle<viskores::Vec3f_32>>();
+  {
+    auto portal = coordArray.ReadPortal();
+    for (viskores::Id i = 0; i < numPoints; i++) {
+      auto p = portal.Get(i);
+      positions[i * 3 + 0] = p[0];
+      positions[i * 3 + 1] = p[1];
+      positions[i * 3 + 2] = p[2];
+    }
+  }
+
+  // Extract normals
+  std::vector<float> normal_data;
+  if (result.HasPointField("Normals")) {
+    auto normalField = result.GetPointField("Normals");
+    auto normalArray = normalField.GetData().AsArrayHandle<viskores::cont::ArrayHandle<viskores::Vec3f_32>>();
+    auto portal = normalArray.ReadPortal();
+    normal_data.resize(numPoints * 3);
+    for (viskores::Id i = 0; i < numPoints; i++) {
+      auto n = portal.Get(i);
+      normal_data[i * 3 + 0] = n[0];
+      normal_data[i * 3 + 1] = n[1];
+      normal_data[i * 3 + 2] = n[2];
+    }
+  }
+
+  // Extract connectivity
+  viskores::Id numCells = result.GetNumberOfCells();
+  std::vector<int> indices(numCells * 3);
+  auto cellSet = result.GetCellSet();
+
+  for (viskores::Id c = 0; c < numCells; c++) {
+    viskores::Id ids[3];
+    cellSet.GetCellPointIds(c, ids);
+    indices[c * 3 + 0] = (int)ids[0];
+    indices[c * 3 + 1] = (int)ids[1];
+    indices[c * 3 + 2] = (int)ids[2];
+  }
+
+  tracer.set_mesh(positions, normal_data, indices, mat);
+}
+
+int main(int /*argc*/, char* /*argv*/[]) {
   if (!SDL_Init(SDL_INIT_VIDEO)) {
     SDL_Log("SDL failed to initialize: %s", SDL_GetError());
     return 1;
@@ -68,16 +150,48 @@ int main(int argc, char* argv[]) {
   std::string mask_file;
   bool show_outlines = false;
   bool show_mask = false;
+  bool prev_show_mask = false;
   int solid_flag = 1;
+  int prev_solid_flag = 1;
   std::vector<std::string> vtk_files;
   std::vector<std::string> mask_field_names;
   int mask_field_index = 0;
+  int prev_mask_field_index = 0;
   bool show_mask_error = false;
   std::string mask_error_msg;
   int vtk_index = 0;
   std::vector<std::string> dataset_cell_names;
   std::vector<DataLayer> data_layers;
   bool first_frame = true;
+
+  // Mask material
+  ImVec4 mask_color = ImVec4(0.8f, 0.8f, 0.8f, 1.0f);
+  float mask_metallic = 0.0f;
+  float mask_roughness = 0.5f;
+  float mask_opacity = 1.0f;
+
+  // Ray tracing config
+  int rt_bounces = 4;
+  int rt_samples = 1;
+  int rt_width = 512;
+  int rt_height = 512;
+
+  // Orbit camera
+  float cam_yaw = 0.0f;
+  float cam_pitch = 30.0f;
+  float cam_distance = 5.0f;
+  float cam_target[3] = {0, 0, 0};
+  float cam_fov = 60.0f;
+  bool viewport_needs_render = true;
+
+  // Viewport texture
+  SDL_Texture* viewport_tex = nullptr;
+  int viewport_tex_w = 0, viewport_tex_h = 0;
+  std::vector<uint8_t> pixel_buffer;
+
+  // Path tracer
+  pt::PathTracer path_tracer;
+  bool mesh_loaded = false;
 
   bool running = true;
   while (running) {
@@ -112,6 +226,7 @@ int main(int argc, char* argv[]) {
       ImGui::DockBuilderSplitNode(dockspace_id, ImGuiDir_Left, 0.125f, &dock_left, &dock_main);
       ImGui::DockBuilderDockWindow("Config", dock_left);
       ImGui::DockBuilderDockWindow("Render", dock_left);
+      ImGui::DockBuilderDockWindow("Viewport", dock_main);
       ImGui::DockBuilderFinish(dockspace_id);
     }
 
@@ -132,10 +247,33 @@ int main(int argc, char* argv[]) {
     ImGui::InputFloat("##strength", &light_strength);
     ImGui::Text("Color");
     ImGui::ColorPicker3("##light_color", (float*)&light_color, ImGuiColorEditFlags_PickerHueWheel);
-    // ImGui::Separator();
-    // ImGui::PushFont(bold_font);
-    // ImGui::Text("Lights");
-    // ImGui::PopFont();
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+    ImGui::PushFont(bold_font);
+    ImGui::Text("Ray Tracing");
+    ImGui::PopFont();
+    ImGui::Spacing();
+    ImGui::Text("Bounces");
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(80);
+    ImGui::InputInt("##rt_bounces", &rt_bounces);
+    rt_bounces = std::max(1, std::min(16, rt_bounces));
+    ImGui::Text("Samples");
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(80);
+    ImGui::InputInt("##rt_samples", &rt_samples);
+    rt_samples = std::max(1, std::min(64, rt_samples));
+    ImGui::Text("Width");
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(80);
+    ImGui::InputInt("##rt_width", &rt_width);
+    rt_width = std::max(64, std::min(2048, rt_width));
+    ImGui::Text("Height");
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(80);
+    ImGui::InputInt("##rt_height", &rt_height);
+    rt_height = std::max(64, std::min(2048, rt_height));
     ImGui::End();
 
     ImGui::Begin("Render");
@@ -214,10 +352,28 @@ int main(int argc, char* argv[]) {
         ImGui::Text("Solid Flag");
         ImGui::SameLine();
         ImGui::SetNextItemWidth(80);
-        // ImGui::InputInt(" ", &solid_flag, 1, 1, ImGuiInputTextFlags_EnterReturnsTrue);
         ImGui::InputInt(" ", &solid_flag);
         ImGui::Spacing();
         ImGui::Checkbox("Show", &show_mask);
+
+        if (show_mask) {
+          ImGui::Spacing();
+          ImGui::Text("Color");
+          ImGui::ColorEdit3("##mask_color", (float*)&mask_color);
+          ImGui::Text("Metallic");
+          ImGui::SameLine();
+          ImGui::SetNextItemWidth(-1);
+          ImGui::SliderFloat("##mask_metallic", &mask_metallic, 0.0f, 1.0f);
+          ImGui::Text("Roughness");
+          ImGui::SameLine();
+          ImGui::SetNextItemWidth(-1);
+          ImGui::SliderFloat("##mask_roughness", &mask_roughness, 0.0f, 1.0f);
+          ImGui::Text("Opacity");
+          ImGui::SameLine();
+          ImGui::SetNextItemWidth(-1);
+          ImGui::SliderFloat("##mask_opacity", &mask_opacity, 0.0f, 1.0f);
+        }
+
         ImGui::Spacing();
         ImGui::Separator();
         ImGui::Spacing();
@@ -298,18 +454,11 @@ int main(int argc, char* argv[]) {
           viskores::io::VTKDataSetReader reader(selected_file);
           viskores::cont::DataSet dataset = reader.ReadDataSet();
 
-          std::cout << "DEBUG: Number of points: " << dataset.GetNumberOfPoints() << std::endl;
-          std::cout << "DEBUG: Number of cells: " << dataset.GetNumberOfCells() << std::endl;
-          std::cout << "DEBUG: Number of fields: " << dataset.GetNumberOfFields() << std::endl;
-
           bool is_3d = true;
           auto cellSet = dataset.GetCellSet();
           if (cellSet.CanConvert<viskores::cont::CellSetStructured<1>>() ||
               cellSet.CanConvert<viskores::cont::CellSetStructured<2>>()) {
             is_3d = false;
-            std::cout << "DEBUG: Structured 1D or 2D dataset" << std::endl;
-          } else {
-            std::cout << "DEBUG: 3D or unstructured dataset" << std::endl;
           }
 
           if (!is_3d) {
@@ -323,6 +472,16 @@ int main(int argc, char* argv[]) {
               const auto& field = dataset.GetField(i);
               if (field.IsPointField() || field.IsCellField()) {
                 mask_field_names.push_back(field.GetName());
+              }
+            }
+            // Auto-select field containing "mask" (case-insensitive)
+            for (int i = 0; i < (int)mask_field_names.size(); i++) {
+              std::string lower_name = mask_field_names[i];
+              std::transform(lower_name.begin(), lower_name.end(), lower_name.begin(),
+                             [](unsigned char c) { return std::tolower(c); });
+              if (lower_name.find("mask") != std::string::npos) {
+                mask_field_index = i;
+                break;
               }
             }
           }
@@ -380,6 +539,156 @@ int main(int argc, char* argv[]) {
       }
     }
 
+    // Detect mesh extraction triggers
+    bool mask_params_changed = (show_mask != prev_show_mask) ||
+                               (show_mask && (mask_field_index != prev_mask_field_index ||
+                                              solid_flag != prev_solid_flag));
+    prev_show_mask = show_mask;
+    prev_mask_field_index = mask_field_index;
+    prev_solid_flag = solid_flag;
+
+    if (show_mask && mask_params_changed && !mask_file.empty() && !mask_field_names.empty()) {
+      pt::Material mat;
+      mat.albedo = {mask_color.x, mask_color.y, mask_color.z};
+      mat.metallic = mask_metallic;
+      mat.roughness = mask_roughness;
+      mat.opacity = mask_opacity;
+      try {
+        extract_mesh(mask_file, mask_field_names[mask_field_index], solid_flag, path_tracer, mat);
+        mesh_loaded = true;
+        viewport_needs_render = true;
+
+        // Auto-fit camera to mesh bounding box
+        auto& tris = path_tracer.bvh().triangles;
+        if (!tris.empty()) {
+          pt::Vec3f lo(1e30f), hi(-1e30f);
+          for (auto& tri : tris) {
+            lo = pt::vmin(lo, pt::vmin(tri.v0, pt::vmin(tri.v1, tri.v2)));
+            hi = pt::vmax(hi, pt::vmax(tri.v0, pt::vmax(tri.v1, tri.v2)));
+          }
+          pt::Vec3f center = (lo + hi) * 0.5f;
+          cam_target[0] = center.x;
+          cam_target[1] = center.y;
+          cam_target[2] = center.z;
+          float extent = (hi - lo).length();
+          cam_distance = extent * 1.5f;
+        }
+      } catch (const std::exception& e) {
+        show_mask_error = true;
+        mask_error_msg = std::string("Mesh extraction failed: ") + e.what();
+        mesh_loaded = false;
+      } catch (...) {
+        show_mask_error = true;
+        mask_error_msg = "Mesh extraction failed.";
+        mesh_loaded = false;
+      }
+    }
+
+    // Viewport window
+    ImGui::Begin("Viewport");
+
+    if (ImGui::IsWindowHovered()) {
+      // Scroll wheel: zoom
+      float scroll = io.MouseWheel;
+      if (scroll != 0.0f) {
+        cam_distance *= (1.0f - scroll * 0.1f);
+        cam_distance = std::max(0.1f, cam_distance);
+        viewport_needs_render = true;
+      }
+
+      // Left mouse drag: orbit
+      if (ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
+        ImVec2 delta = io.MouseDelta;
+        cam_yaw -= delta.x * 0.3f;
+        cam_pitch += delta.y * 0.3f;
+        cam_pitch = std::max(-89.0f, std::min(89.0f, cam_pitch));
+        viewport_needs_render = true;
+      }
+
+      // Middle mouse drag: pan
+      if (ImGui::IsMouseDragging(ImGuiMouseButton_Middle)) {
+        ImVec2 delta = io.MouseDelta;
+        float yaw_rad = cam_yaw * 3.14159265f / 180.0f;
+        float pitch_rad = cam_pitch * 3.14159265f / 180.0f;
+
+        // Camera right and up vectors
+        pt::Vec3f forward = {
+            std::cos(pitch_rad) * std::sin(yaw_rad),
+            std::sin(pitch_rad),
+            std::cos(pitch_rad) * std::cos(yaw_rad)};
+        pt::Vec3f world_up = {0, 1, 0};
+        pt::Vec3f right = pt::cross(forward, world_up).normalized();
+        pt::Vec3f up = pt::cross(right, forward).normalized();
+
+        float pan_speed = cam_distance * 0.002f;
+        cam_target[0] -= (right.x * delta.x + up.x * delta.y) * pan_speed;
+        cam_target[1] -= (right.y * delta.x + up.y * delta.y) * pan_speed;
+        cam_target[2] -= (right.z * delta.x + up.z * delta.y) * pan_speed;
+        viewport_needs_render = true;
+      }
+    }
+
+    if (show_mask && mesh_loaded && viewport_needs_render) {
+      viewport_needs_render = false;
+
+      // Compute camera eye from spherical coordinates
+      float yaw_rad = cam_yaw * 3.14159265f / 180.0f;
+      float pitch_rad = cam_pitch * 3.14159265f / 180.0f;
+      pt::Vec3f eye = {
+          cam_target[0] + cam_distance * std::cos(pitch_rad) * std::sin(yaw_rad),
+          cam_target[1] + cam_distance * std::sin(pitch_rad),
+          cam_target[2] + cam_distance * std::cos(pitch_rad) * std::cos(yaw_rad)};
+      pt::Vec3f target = {cam_target[0], cam_target[1], cam_target[2]};
+
+      // Update material
+      pt::Material mat;
+      mat.albedo = {mask_color.x, mask_color.y, mask_color.z};
+      mat.metallic = mask_metallic;
+      mat.roughness = mask_roughness;
+      mat.opacity = mask_opacity;
+
+      path_tracer.set_camera(eye, target, {0, 1, 0}, cam_fov);
+      path_tracer.set_config(rt_width, rt_height, rt_bounces, rt_samples);
+      path_tracer.set_background(bg_color.x * 0.2f, bg_color.y * 0.2f, bg_color.z * 0.2f);
+      path_tracer.render(pixel_buffer);
+
+      // Create or resize SDL texture
+      if (!viewport_tex || viewport_tex_w != rt_width || viewport_tex_h != rt_height) {
+        if (viewport_tex) SDL_DestroyTexture(viewport_tex);
+        viewport_tex = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_RGBA32,
+                                         SDL_TEXTUREACCESS_STREAMING, rt_width, rt_height);
+        viewport_tex_w = rt_width;
+        viewport_tex_h = rt_height;
+      }
+
+      // Upload pixels to texture
+      void* tex_pixels = nullptr;
+      int tex_pitch = 0;
+      if (SDL_LockTexture(viewport_tex, nullptr, &tex_pixels, &tex_pitch)) {
+        for (int y = 0; y < rt_height; y++) {
+          memcpy((uint8_t*)tex_pixels + y * tex_pitch,
+                 pixel_buffer.data() + y * rt_width * 4, rt_width * 4);
+        }
+        SDL_UnlockTexture(viewport_tex);
+      }
+    }
+
+    if (viewport_tex && show_mask && mesh_loaded) {
+      ImVec2 avail = ImGui::GetContentRegionAvail();
+      float aspect = (float)viewport_tex_w / (float)viewport_tex_h;
+      float disp_w = avail.x;
+      float disp_h = avail.x / aspect;
+      if (disp_h > avail.y) {
+        disp_h = avail.y;
+        disp_w = avail.y * aspect;
+      }
+      ImGui::Image((ImTextureID)(intptr_t)viewport_tex, ImVec2(disp_w, disp_h));
+    } else {
+      ImGui::TextDisabled("Enable mask rendering to see viewport");
+    }
+
+    ImGui::End();
+
     ImGui::Render();
     SDL_SetRenderScale(renderer, io.DisplayFramebufferScale.x, io.DisplayFramebufferScale.y);
     SDL_SetRenderDrawColorFloat(renderer, bg_color.x, bg_color.y, bg_color.z, bg_color.w);
@@ -387,6 +696,8 @@ int main(int argc, char* argv[]) {
     ImGui_ImplSDLRenderer3_RenderDrawData(ImGui::GetDrawData(), renderer);
     SDL_RenderPresent(renderer);
   }
+
+  if (viewport_tex) SDL_DestroyTexture(viewport_tex);
 
   ImGui_ImplSDLRenderer3_Shutdown();
   ImGui_ImplSDL3_Shutdown();

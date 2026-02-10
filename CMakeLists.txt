@@ -59,4 +59,10 @@ set(Viskores_ENABLE_TBB OFF)
 set(Viskores_ENABLE_OPENMP OFF)
 add_subdirectory(${CMAKE_SOURCE_DIR}/lib/viskores)
 
-target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE SDL3::SDL3 viskores_io viskores_cont)
+target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE
+	SDL3::SDL3
+	viskores_io viskores_cont
+	viskores_filter_entity_extraction
+	viskores_filter_geometry_refinement
+	viskores_filter_vector_analysis
+)
