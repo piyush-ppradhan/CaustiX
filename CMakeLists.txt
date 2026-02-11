@@ -59,10 +59,34 @@ set(Viskores_ENABLE_TBB OFF)
 set(Viskores_ENABLE_OPENMP OFF)
 add_subdirectory(${CMAKE_SOURCE_DIR}/lib/viskores)
 
+find_package(CUDAToolkit REQUIRED)
+set(OptiX_INSTALL_DIR /opt/NVIDIA-OptiX-SDK-9.1.0-linux64-x86_64)
+
+# Compile shaders.cu -> shaders.ptx via nvcc
+set(SHADER_SRC ${CMAKE_SOURCE_DIR}/src/shaders.cu)
+set(SHADER_PTX ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/shaders.ptx)
+add_custom_command(
+	OUTPUT ${SHADER_PTX}
+	COMMAND ${CUDAToolkit_NVCC_EXECUTABLE} -ptx
+		-I${OptiX_INSTALL_DIR}/include
+		-I${CMAKE_SOURCE_DIR}/src
+		--gpu-architecture=compute_75
+		-o ${SHADER_PTX}
+		${SHADER_SRC}
+	DEPENDS ${SHADER_SRC} ${CMAKE_SOURCE_DIR}/src/optix_params.h
+	COMMENT "Compiling OptiX shaders to PTX"
+)
+add_custom_target(shaders ALL DEPENDS ${SHADER_PTX})
+add_dependencies(${CMAKE_PROJECT_NAME} shaders)
+
+target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
+	${OptiX_INSTALL_DIR}/include
+)
+
 target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE
 	SDL3::SDL3
 	viskores_io viskores_cont
-	viskores_filter_entity_extraction
-	viskores_filter_geometry_refinement
-	viskores_filter_vector_analysis
+	viskores_filter_contour
+	viskores_filter_field_conversion
+	CUDA::cudart
 )
