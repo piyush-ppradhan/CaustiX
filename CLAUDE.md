@@ -72,8 +72,11 @@ Stack:
    - Iterations from UI slider
    - Strength (`lambda`) from UI slider
    - Recompute normals afterward
-9. Upload mesh buffers to GPU.
-10. Rebuild GAS and update SBT hitgroups.
+9. Optional geometry rotation:
+   - Rotate X / Y / Z (degrees) from `Render:Misc`
+   - Applied to positions and normals before upload
+10. Upload mesh buffers to GPU.
+11. Rebuild GAS and update SBT hitgroups.
 
 ## OptiX Pipeline + SBT
 
@@ -93,6 +96,20 @@ Ray types:
 
 SBT hitgroup indexing:
 - `index = ray_type + RAY_TYPE_COUNT * geometry_index`
+
+## Error Handling Macros
+
+`src/main.cpp` uses macro-based error checks:
+- `CUDA_CHECK(call)`
+- `OPTIX_CHECK(call)`
+- `OPTIX_CHECK_LOG(call)`
+
+They build detailed `std::ostringstream` messages and throw `std::runtime_error`.
+
+Important:
+- These are multi-line macros and require trailing `\` line continuations.
+- If line continuations are removed/altered, parsing fails early (before normal compilation), often near the top of
+  `main.cpp`.
 
 ## Shading and Materials
 
@@ -134,6 +151,7 @@ Mesh shading in `__closesthit__ch` uses:
 - `Render:Misc`:
   - Enable Shadows
   - Show Outlines
+  - Rotate X / Rotate Y / Rotate Z (degrees)
 - `Render:Mask`:
   - Mask file + field
   - `Solid Flag`
@@ -147,6 +165,7 @@ Mesh shading in `__closesthit__ch` uses:
 - Full mesh rebuild (extract + upload + GAS + SBT):
   - mask show/field/solid flag changes
   - smoothing iteration/strength changes
+  - geometry rotation changes (X/Y/Z)
 - GAS-only rebuild:
   - ground enabled toggle
   - ground y offset changes

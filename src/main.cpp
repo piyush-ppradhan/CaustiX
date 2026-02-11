@@ -29,41 +29,47 @@
 #include <iostream>
 #include <stdexcept>
 #include <limits>
+#include <sstream>
 #include "config.hpp"
 #include "optix_params.h"
 
 // --- Error checking macros ---
 
-#define CUDA_CHECK(call)                                                                                         \
-  do {                                                                                                           \
-    cudaError_t rc = call;                                                                                       \
-    if (rc != cudaSuccess) {                                                                                     \
-      std::cerr << "CUDA error " << cudaGetErrorName(rc) << ": " << cudaGetErrorString(rc) << " at " << __FILE__ \
-                << ":" << __LINE__ << std::endl;                                                                 \
-      throw std::runtime_error(std::string("CUDA error: ") + cudaGetErrorString(rc));                            \
-    }                                                                                                            \
+#define CUDA_CHECK(call)                                                                                 \
+  do {                                                                                                   \
+    cudaError_t rc = call;                                                                               \
+    if (rc != cudaSuccess) {                                                                             \
+      std::ostringstream oss;                                                                            \
+      oss << "CUDA error " << cudaGetErrorName(rc) << ": " << cudaGetErrorString(rc) << " at "         \
+          << __FILE__ << ":" << __LINE__;                                                                \
+      std::cerr << oss.str() << "\n";                                                                    \
+      throw std::runtime_error(oss.str());                                                               \
+    }                                                                                                    \
   } while (0)
 
-#define OPTIX_CHECK(call)                                                                       \
-  do {                                                                                          \
-    OptixResult res = call;                                                                     \
-    if (res != OPTIX_SUCCESS) {                                                                 \
-      std::cerr << "OptiX error " << res << " at " << __FILE__ << ":" << __LINE__ << std::endl; \
-      throw std::runtime_error("OptiX error");                                                  \
-    }                                                                                           \
+#define OPTIX_CHECK(call)                                                            \
+  do {                                                                               \
+    OptixResult res = call;                                                          \
+    if (res != OPTIX_SUCCESS) {                                                      \
+      std::ostringstream oss;                                                        \
+      oss << "OptiX error " << res << " at " << __FILE__ << ":" << __LINE__ << "\n"; \
+      std::cerr << oss.str() << "\n";                                                \
+      throw std::runtime_error(oss.str());                                           \
+    }                                                                                \
   } while (0)
 
 static char optix_log[2048];
 static size_t optix_log_size = sizeof(optix_log);
 
-#define OPTIX_CHECK_LOG(call)                                               \
-  do {                                                                      \
-    optix_log_size = sizeof(optix_log);                                     \
-    OptixResult res = call;                                                 \
-    if (res != OPTIX_SUCCESS) {                                             \
-      std::cerr << "OptiX error " << res << ": " << optix_log << std::endl; \
-      throw std::runtime_error("OptiX error");                              \
-    }                                                                       \
+#define OPTIX_CHECK_LOG(call)                                    \
+  do {                                                           \
+    optix_log_size = sizeof(optix_log);                          \
+    OptixResult res = call;                                      \
+    if (res != OPTIX_SUCCESS) {                                  \
+      std::ostringstream oss;                                    \
+      oss << "OptiX error " << res << ": " << optix_log << "\n"; \
+      throw std::runtime_error(oss.str());                       \
+    }                                                            \
   } while (0)
 
 // --- SBT record template ---
@@ -722,8 +728,8 @@ static void rebuild_gas(OptixState& state, const BBox& bbox, bool ground_enabled
   }
 
   OPTIX_CHECK(optixAccelBuild(state.context, 0, &accel_options, build_inputs, num_inputs, state.d_gas_temp,
-                              state.gas_temp_capacity, state.d_gas_output, state.gas_output_capacity,
-                              &state.gas_handle, nullptr, 0));
+                              state.gas_temp_capacity, state.d_gas_output, state.gas_output_capacity, &state.gas_handle,
+                              nullptr, 0));
 
   // Update SBT counts
   state.hitgroup_record_count = ground_enabled ? 4 : 2;
@@ -736,9 +742,9 @@ static void upload_mesh_to_gpu(const std::vector<float3>& positions, const std::
                                const std::vector<uint3>& indices, OptixState& state, float base_r, float base_g,
                                float base_b, float metallic, float roughness, float opacity, float ior,
                                const float3& light_dir, float light_r, float light_g, float light_b,
-                               float light_strength, const BBox& bbox, bool ground_enabled,
-                               const ImVec4& ground_color, float ground_metallic, float ground_roughness,
-                               float ground_opacity, float ground_y_offset) {
+                               float light_strength, const BBox& bbox, bool ground_enabled, const ImVec4& ground_color,
+                               float ground_metallic, float ground_roughness, float ground_opacity,
+                               float ground_y_offset) {
   if (positions.empty() || normal_data.size() != positions.size() || indices.empty()) {
     throw std::runtime_error("Invalid mesh buffers for GPU upload.");
   }
@@ -764,12 +770,14 @@ static void upload_mesh_to_gpu(const std::vector<float3>& positions, const std::
   // Upload vertices to GPU
   size_t vert_size = positions.size() * sizeof(float3);
   CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&state.d_vertices), vert_size));
-  CUDA_CHECK(cudaMemcpy(reinterpret_cast<void*>(state.d_vertices), positions.data(), vert_size, cudaMemcpyHostToDevice));
+  CUDA_CHECK(
+      cudaMemcpy(reinterpret_cast<void*>(state.d_vertices), positions.data(), vert_size, cudaMemcpyHostToDevice));
 
   // Upload index buffer for GAS build
   size_t idx_size = indices.size() * sizeof(uint3);
   CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&state.d_indices_buf), idx_size));
-  CUDA_CHECK(cudaMemcpy(reinterpret_cast<void*>(state.d_indices_buf), indices.data(), idx_size, cudaMemcpyHostToDevice));
+  CUDA_CHECK(
+      cudaMemcpy(reinterpret_cast<void*>(state.d_indices_buf), indices.data(), idx_size, cudaMemcpyHostToDevice));
 
   // Store mesh counts for rebuild_gas
   state.num_mesh_vertices = static_cast<unsigned int>(positions.size());
@@ -789,12 +797,12 @@ static void upload_mesh_to_gpu(const std::vector<float3>& positions, const std::
   rebuild_gas(state, bbox, ground_enabled, ground_y_offset);
 
   // Update SBT hitgroup records
-  update_mesh_hitgroup_sbt(state, base_r, base_g, base_b, metallic, roughness, opacity, ior, light_dir, light_r, light_g,
-                           light_b, light_strength);
+  update_mesh_hitgroup_sbt(state, base_r, base_g, base_b, metallic, roughness, opacity, ior, light_dir, light_r,
+                           light_g, light_b, light_strength);
   write_shadow_hitgroup_records(state);
   if (ground_enabled) {
-    update_ground_hitgroup_sbt(state, ground_color, ground_metallic, ground_roughness, ground_opacity, light_dir, light_r,
-                               light_g, light_b, light_strength);
+    update_ground_hitgroup_sbt(state, ground_color, ground_metallic, ground_roughness, ground_opacity, light_dir,
+                               light_r, light_g, light_b, light_strength);
   }
 }
 
@@ -1182,7 +1190,7 @@ int main(int argc, char* argv[]) {
     ImGui::PushFont(bold_font);
     ImGui::Text("Background Color");
     ImGui::PopFont();
-    ImGui::ColorPicker3("##bg", (float*)&bg_color, ImGuiColorEditFlags_PickerHueWheel);
+    ImGui::ColorEdit3("##bg", (float*)&bg_color);
     ImGui::Spacing();
     ImGui::Separator();
     ImGui::Spacing();
@@ -1194,7 +1202,7 @@ int main(int argc, char* argv[]) {
     ImGui::SameLine();
     ImGui::InputFloat("##strength", &light_strength);
     ImGui::Text("Color");
-    ImGui::ColorPicker3("##light_color", (float*)&light_color, ImGuiColorEditFlags_PickerHueWheel);
+    ImGui::ColorEdit3("##light_color", (float*)&light_color);
     ImGui::Spacing();
     ImGui::Separator();
     ImGui::Spacing();
@@ -1558,20 +1566,20 @@ int main(int argc, char* argv[]) {
     bool ground_toggled = (ground_enabled != prev_ground_enabled);
     bool ground_offset_changed = (ground_y_offset != prev_ground_y_offset);
 
-    bool has_mask_selection =
-        !mask_file.empty() && !mask_field_names.empty() && mask_field_index >= 0 &&
-        mask_field_index < static_cast<int>(mask_field_names.size());
+    bool has_mask_selection = !mask_file.empty() && !mask_field_names.empty() && mask_field_index >= 0 &&
+                              mask_field_index < static_cast<int>(mask_field_names.size());
     std::string selected_mask_field = has_mask_selection ? mask_field_names[mask_field_index] : std::string();
 
-    bool cache_matches_selection =
-        has_mask_selection && mesh_cache.valid && mesh_cache.source_file == mask_file &&
-        mesh_cache.source_field == selected_mask_field && mesh_cache.source_solid_flag == solid_flag;
+    bool cache_matches_selection = has_mask_selection && mesh_cache.valid && mesh_cache.source_file == mask_file &&
+                                   mesh_cache.source_field == selected_mask_field &&
+                                   mesh_cache.source_solid_flag == solid_flag;
 
     bool needs_extract = show_mask && has_mask_selection && (mask_selection_changed || !cache_matches_selection);
-    bool needs_mesh_rebuild_from_cache = show_mask && has_mask_selection && !needs_extract &&
-                                         (smooth_changed || transform_changed || !mesh_loaded);
+    bool needs_mesh_rebuild_from_cache =
+        show_mask && has_mask_selection && !needs_extract && (smooth_changed || transform_changed || !mesh_loaded);
     bool needs_full_rebuild = needs_extract || needs_mesh_rebuild_from_cache;
-    bool needs_gas_rebuild = show_mask && mesh_loaded && !needs_full_rebuild && (ground_toggled || ground_offset_changed);
+    bool needs_gas_rebuild =
+        show_mask && mesh_loaded && !needs_full_rebuild && (ground_toggled || ground_offset_changed);
 
     prev_show_mask = show_mask;
     prev_mask_field_index = mask_field_index;
@@ -1588,10 +1596,10 @@ int main(int argc, char* argv[]) {
       try {
         BBox bbox;
         extract_mesh(mask_file, selected_mask_field, solid_flag, mesh_cache, optix_state, mask_color.x, mask_color.y,
-                     mask_color.z, mask_metallic, mask_roughness, mask_opacity, mask_glass_ior, light_dir, light_color.x,
-                     light_color.y, light_color.z, light_strength, bbox, smooth_iterations, smooth_strength,
-                     rotate_x_deg, rotate_y_deg, rotate_z_deg, ground_enabled, ground_color, ground_metallic,
-                     ground_roughness, ground_opacity, ground_y_offset);
+                     mask_color.z, mask_metallic, mask_roughness, mask_opacity, mask_glass_ior, light_dir,
+                     light_color.x, light_color.y, light_color.z, light_strength, bbox, smooth_iterations,
+                     smooth_strength, rotate_x_deg, rotate_y_deg, rotate_z_deg, ground_enabled, ground_color,
+                     ground_metallic, ground_roughness, ground_opacity, ground_y_offset);
         mesh_loaded = true;
         mesh_bbox = bbox;
         viewport_needs_render = true;
@@ -1733,7 +1741,8 @@ int main(int argc, char* argv[]) {
 
     // Viewport window
     ImGuiWindowClass viewport_window_class;
-    viewport_window_class.DockNodeFlagsOverrideSet = ImGuiDockNodeFlags_NoTabBar | ImGuiDockNodeFlags_NoWindowMenuButton;
+    viewport_window_class.DockNodeFlagsOverrideSet =
+        ImGuiDockNodeFlags_NoTabBar | ImGuiDockNodeFlags_NoWindowMenuButton;
     ImGui::SetNextWindowClass(&viewport_window_class);
     ImGui::Begin("###ViewportPanel", nullptr, ImGuiWindowFlags_NoTitleBar);
 

@@ -45,9 +45,9 @@ if (UNIX)
 		message(STATUS "Wayland not detected; falling back to X11 backend.")
 	else()
 		# Keep Wayland as the preferred default when desktop stack detection is unavailable.
-		set(SDL_WAYLAND ON CACHE BOOL "" FORCE)
-		set(SDL_X11 OFF CACHE BOOL "" FORCE)
-		message(STATUS "Could not detect Wayland/X11 via pkg-config; defaulting to Wayland.")
+		set(SDL_WAYLAND OFF CACHE BOOL "" FORCE)
+		set(SDL_X11 ON CACHE BOOL "" FORCE)
+		message(STATUS "Could not detect Wayland/X11 via pkg-config; defaulting to X11.")
 	endif()
 
 	set(SDL_X11_XTEST OFF CACHE BOOL "" FORCE)
@@ -122,7 +122,10 @@ set(Viskores_ENABLE_DEVELOPER_FLAGS OFF CACHE BOOL "" FORCE)
 add_subdirectory(${CMAKE_SOURCE_DIR}/lib/viskores)
 
 find_package(CUDAToolkit REQUIRED)
-set(OptiX_INSTALL_DIR /opt/NVIDIA-OptiX-SDK-9.1.0-linux64-x86_64)
+set(OptiX_INSTALL_DIR "/opt/NVIDIA-OptiX-SDK-9.1.0-linux64-x86_64" CACHE PATH "Path to the NVIDIA OptiX SDK root")
+if (NOT EXISTS "${OptiX_INSTALL_DIR}/include/optix.h")
+	message(FATAL_ERROR "OptiX headers not found at ${OptiX_INSTALL_DIR}/include/optix.h. Set Optix_INSTALL_DIR to your SDK root.")
+endif()
 
 # Compile shaders.cu -> shaders.ptx via nvcc
 set(SHADER_SRC ${CMAKE_SOURCE_DIR}/src/shaders.cu)
@@ -130,13 +133,14 @@ set(SHADER_PTX ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/shaders.ptx)
 add_custom_command(
 	OUTPUT ${SHADER_PTX}
 	COMMAND ${CUDAToolkit_NVCC_EXECUTABLE} -ptx
-		-I${OptiX_INSTALL_DIR}/include
-		-I${CMAKE_SOURCE_DIR}/src
+		-I "${OptiX_INSTALL_DIR}/include"
+		-I "${CMAKE_SOURCE_DIR}/src"
 		--gpu-architecture=compute_${CAUSTIX_CUDA_ARCH}
-		-o ${SHADER_PTX}
-		${SHADER_SRC}
+		-o "${SHADER_PTX}"
+		"${SHADER_SRC}"
 	DEPENDS ${SHADER_SRC} ${CMAKE_SOURCE_DIR}/src/optix_params.h
 	COMMENT "Compiling OptiX shaders to PTX"
+	VERBATIM
 )
 add_custom_target(shaders ALL DEPENDS ${SHADER_PTX})
 add_dependencies(${CMAKE_PROJECT_NAME} shaders)
