@@ -14,6 +14,8 @@ It extracts an isosurface from a scalar field and renders it with OptiX using in
 - CPU Laplacian surface smoothing:
   - Iterations
   - Smooth strength
+- Geometry transform controls:
+  - Rotate X / Rotate Y / Rotate Z
 - Docked ImGui UI with clean viewport panel
 
 ## Requirements
@@ -75,6 +77,7 @@ Build outputs:
 - `Render:Misc`
   - `Enable Shadows`
   - `Show Outlines`
+  - `Rotate X`, `Rotate Y`, `Rotate Z` (degrees, default `0`)
 - `Render:Mask`
   - Mask file/field selection
   - `Solid Flag`

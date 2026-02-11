@@ -179,6 +179,12 @@ struct RenderMiscState {
   bool show_outlines = false;
   ImVec4 outline_color = ImVec4(1.0f, 1.0f, 0.0f, 1.0f);
   float outline_thickness = 2.0f;
+  float rotate_x_deg = 0.0f;
+  float prev_rotate_x_deg = rotate_x_deg;
+  float rotate_y_deg = 0.0f;
+  float prev_rotate_y_deg = rotate_y_deg;
+  float rotate_z_deg = 0.0f;
+  float prev_rotate_z_deg = rotate_z_deg;
   bool show_mask_error = false;
   std::string mask_error_msg;
 };
@@ -559,6 +565,59 @@ static void laplacian_smooth(std::vector<float3>& positions, const std::vector<u
   }
 }
 
+static float3 rotate_euler_xyz(const float3& v, float sx, float cx, float sy, float cy, float sz, float cz) {
+  float3 r = v;
+
+  // Rotate around X axis.
+  float y = cx * r.y - sx * r.z;
+  float z = sx * r.y + cx * r.z;
+  r.y = y;
+  r.z = z;
+
+  // Rotate around Y axis.
+  float x = cy * r.x + sy * r.z;
+  z = -sy * r.x + cy * r.z;
+  r.x = x;
+  r.z = z;
+
+  // Rotate around Z axis.
+  x = cz * r.x - sz * r.y;
+  y = sz * r.x + cz * r.y;
+  r.x = x;
+  r.y = y;
+
+  return r;
+}
+
+static void apply_geometry_rotation(std::vector<float3>& positions, std::vector<float3>& normals, float rotate_x_deg,
+                                    float rotate_y_deg, float rotate_z_deg) {
+  const float deg_to_rad = 3.14159265f / 180.0f;
+  float rx = rotate_x_deg * deg_to_rad;
+  float ry = rotate_y_deg * deg_to_rad;
+  float rz = rotate_z_deg * deg_to_rad;
+
+  if (std::fabs(rx) <= 1e-8f && std::fabs(ry) <= 1e-8f && std::fabs(rz) <= 1e-8f) {
+    return;
+  }
+
+  float sx = std::sin(rx), cx = std::cos(rx);
+  float sy = std::sin(ry), cy = std::cos(ry);
+  float sz = std::sin(rz), cz = std::cos(rz);
+
+  for (auto& p : positions) {
+    p = rotate_euler_xyz(p, sx, cx, sy, cy, sz, cz);
+  }
+  for (auto& n : normals) {
+    n = rotate_euler_xyz(n, sx, cx, sy, cy, sz, cz);
+    float len = std::sqrt(n.x * n.x + n.y * n.y + n.z * n.z);
+    if (len > 1e-12f) {
+      n.x /= len;
+      n.y /= len;
+      n.z /= len;
+    }
+  }
+}
+
 static void compute_bbox(const std::vector<float3>& positions, BBox& bbox) {
   bbox.lo = make_float3(1e30f, 1e30f, 1e30f);
   bbox.hi = make_float3(-1e30f, -1e30f, -1e30f);
@@ -743,8 +802,9 @@ static void rebuild_mesh_from_cache(const MeshCache& mesh_cache, OptixState& sta
                                     float base_b, float metallic, float roughness, float opacity, float ior,
                                     const float3& light_dir, float light_r, float light_g, float light_b,
                                     float light_strength, BBox& bbox, int smooth_iters, float smooth_lambda,
-                                    bool ground_enabled, const ImVec4& ground_color, float ground_metallic,
-                                    float ground_roughness, float ground_opacity, float ground_y_offset) {
+                                    float rotate_x_deg, float rotate_y_deg, float rotate_z_deg, bool ground_enabled,
+                                    const ImVec4& ground_color, float ground_metallic, float ground_roughness,
+                                    float ground_opacity, float ground_y_offset) {
   if (!mesh_cache.valid || mesh_cache.base_positions.empty() || mesh_cache.indices.empty()) {
     throw std::runtime_error("Cached mesh is not available.");
   }
@@ -758,6 +818,7 @@ static void rebuild_mesh_from_cache(const MeshCache& mesh_cache, OptixState& sta
   if (smooth_iters > 0) {
     laplacian_smooth(positions, mesh_cache.indices, normal_data, smooth_iters, smooth_lambda);
   }
+  apply_geometry_rotation(positions, normal_data, rotate_x_deg, rotate_y_deg, rotate_z_deg);
   compute_bbox(positions, bbox);
 
   upload_mesh_to_gpu(positions, normal_data, mesh_cache.indices, state, base_r, base_g, base_b, metallic, roughness,
@@ -769,8 +830,9 @@ static void extract_mesh(const std::string& mask_filepath, const std::string& fi
                          MeshCache& mesh_cache, OptixState& state, float base_r, float base_g, float base_b,
                          float metallic, float roughness, float opacity, float ior, const float3& light_dir,
                          float light_r, float light_g, float light_b, float light_strength, BBox& bbox,
-                         int smooth_iters, float smooth_lambda, bool ground_enabled, const ImVec4& ground_color,
-                         float ground_metallic, float ground_roughness, float ground_opacity, float ground_y_offset) {
+                         int smooth_iters, float smooth_lambda, float rotate_x_deg, float rotate_y_deg,
+                         float rotate_z_deg, bool ground_enabled, const ImVec4& ground_color, float ground_metallic,
+                         float ground_roughness, float ground_opacity, float ground_y_offset) {
   viskores::io::VTKDataSetReader reader(mask_filepath);
   viskores::cont::DataSet ds = reader.ReadDataSet();
 
@@ -890,8 +952,9 @@ static void extract_mesh(const std::string& mask_filepath, const std::string& fi
   mesh_cache.valid = true;
 
   rebuild_mesh_from_cache(mesh_cache, state, base_r, base_g, base_b, metallic, roughness, opacity, ior, light_dir,
-                          light_r, light_g, light_b, light_strength, bbox, smooth_iters, smooth_lambda, ground_enabled,
-                          ground_color, ground_metallic, ground_roughness, ground_opacity, ground_y_offset);
+                          light_r, light_g, light_b, light_strength, bbox, smooth_iters, smooth_lambda, rotate_x_deg,
+                          rotate_y_deg, rotate_z_deg, ground_enabled, ground_color, ground_metallic, ground_roughness,
+                          ground_opacity, ground_y_offset);
 }
 
 // --- Cleanup OptiX ---
@@ -1022,6 +1085,12 @@ int main(int argc, char* argv[]) {
   bool& show_outlines = misc.show_outlines;
   ImVec4& outline_color = misc.outline_color;
   float& outline_thickness = misc.outline_thickness;
+  float& rotate_x_deg = misc.rotate_x_deg;
+  float& prev_rotate_x_deg = misc.prev_rotate_x_deg;
+  float& rotate_y_deg = misc.rotate_y_deg;
+  float& prev_rotate_y_deg = misc.prev_rotate_y_deg;
+  float& rotate_z_deg = misc.rotate_z_deg;
+  float& prev_rotate_z_deg = misc.prev_rotate_z_deg;
   bool& show_mask_error = misc.show_mask_error;
   std::string& mask_error_msg = misc.mask_error_msg;
 
@@ -1223,6 +1292,18 @@ int main(int argc, char* argv[]) {
         ImGui::SetNextItemWidth(-1);
         ImGui::SliderFloat("##outline_thickness", &outline_thickness, 1.0f, 10.0f);
       }
+      ImGui::Text("Rotate X");
+      ImGui::SameLine();
+      ImGui::SetNextItemWidth(-1);
+      ImGui::DragFloat("##rotate_x", &rotate_x_deg, 0.5f);
+      ImGui::Text("Rotate Y");
+      ImGui::SameLine();
+      ImGui::SetNextItemWidth(-1);
+      ImGui::DragFloat("##rotate_y", &rotate_y_deg, 0.5f);
+      ImGui::Text("Rotate Z");
+      ImGui::SameLine();
+      ImGui::SetNextItemWidth(-1);
+      ImGui::DragFloat("##rotate_z", &rotate_z_deg, 0.5f);
       ImGui::Spacing();
       ImGui::Separator();
       ImGui::PushFont(bold_font);
@@ -1471,6 +1552,9 @@ int main(int argc, char* argv[]) {
         show_mask && (mask_field_index != prev_mask_field_index || solid_flag != prev_solid_flag);
     bool smooth_changed =
         (smooth_iterations != prev_smooth_iterations) || (std::fabs(smooth_strength - prev_smooth_strength) > 1e-4f);
+    bool transform_changed = (std::fabs(rotate_x_deg - prev_rotate_x_deg) > 1e-4f) ||
+                             (std::fabs(rotate_y_deg - prev_rotate_y_deg) > 1e-4f) ||
+                             (std::fabs(rotate_z_deg - prev_rotate_z_deg) > 1e-4f);
     bool ground_toggled = (ground_enabled != prev_ground_enabled);
     bool ground_offset_changed = (ground_y_offset != prev_ground_y_offset);
 
@@ -1485,7 +1569,7 @@ int main(int argc, char* argv[]) {
 
     bool needs_extract = show_mask && has_mask_selection && (mask_selection_changed || !cache_matches_selection);
     bool needs_mesh_rebuild_from_cache = show_mask && has_mask_selection && !needs_extract &&
-                                         (smooth_changed || !mesh_loaded);
+                                         (smooth_changed || transform_changed || !mesh_loaded);
     bool needs_full_rebuild = needs_extract || needs_mesh_rebuild_from_cache;
     bool needs_gas_rebuild = show_mask && mesh_loaded && !needs_full_rebuild && (ground_toggled || ground_offset_changed);
 
@@ -1494,6 +1578,9 @@ int main(int argc, char* argv[]) {
     prev_solid_flag = solid_flag;
     prev_smooth_iterations = smooth_iterations;
     prev_smooth_strength = smooth_strength;
+    prev_rotate_x_deg = rotate_x_deg;
+    prev_rotate_y_deg = rotate_y_deg;
+    prev_rotate_z_deg = rotate_z_deg;
     prev_ground_enabled = ground_enabled;
     prev_ground_y_offset = ground_y_offset;
 
@@ -1502,8 +1589,9 @@ int main(int argc, char* argv[]) {
         BBox bbox;
         extract_mesh(mask_file, selected_mask_field, solid_flag, mesh_cache, optix_state, mask_color.x, mask_color.y,
                      mask_color.z, mask_metallic, mask_roughness, mask_opacity, mask_glass_ior, light_dir, light_color.x,
-                     light_color.y, light_color.z, light_strength, bbox, smooth_iterations, smooth_strength, ground_enabled,
-                     ground_color, ground_metallic, ground_roughness, ground_opacity, ground_y_offset);
+                     light_color.y, light_color.z, light_strength, bbox, smooth_iterations, smooth_strength,
+                     rotate_x_deg, rotate_y_deg, rotate_z_deg, ground_enabled, ground_color, ground_metallic,
+                     ground_roughness, ground_opacity, ground_y_offset);
         mesh_loaded = true;
         mesh_bbox = bbox;
         viewport_needs_render = true;
@@ -1548,8 +1636,9 @@ int main(int argc, char* argv[]) {
         BBox bbox;
         rebuild_mesh_from_cache(mesh_cache, optix_state, mask_color.x, mask_color.y, mask_color.z, mask_metallic,
                                 mask_roughness, mask_opacity, mask_glass_ior, light_dir, light_color.x, light_color.y,
-                                light_color.z, light_strength, bbox, smooth_iterations, smooth_strength, ground_enabled,
-                                ground_color, ground_metallic, ground_roughness, ground_opacity, ground_y_offset);
+                                light_color.z, light_strength, bbox, smooth_iterations, smooth_strength, rotate_x_deg,
+                                rotate_y_deg, rotate_z_deg, ground_enabled, ground_color, ground_metallic,
+                                ground_roughness, ground_opacity, ground_y_offset);
         mesh_loaded = true;
         mesh_bbox = bbox;
         viewport_needs_render = true;
