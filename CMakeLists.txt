@@ -1,13 +1,20 @@
 cmake_minimum_required(VERSION 3.15)
-project(CaustiX)
+project(CaustiX LANGUAGES CXX)
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/bin)
 
-if (CMAKE_BUILD_TYPE STREQUAL "Release")
-	set(CMAKE_CXX_FLAGS "-O3 -Wall")
-else ()
-	message(WARNING "CMAKE_BUILD_TYPE not set, using debug.")
-	set(CMAKE_BUILD_TYPE "Debug")
-	set(CMAKE_CXX_FLAGS "-O2 -Wall")
+if (NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+	set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
+include(CheckIPOSupported)
+check_ipo_supported(RESULT CAUSTIX_IPO_SUPPORTED OUTPUT CAUSTIX_IPO_ERROR)
+if (CAUSTIX_IPO_SUPPORTED)
+	set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE ON)
+	set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELWITHDEBINFO ON)
 endif()
 
 if (UNIX)
@@ -24,6 +31,15 @@ set(SDL_CAMERA OFF)
 set(SDL_DIALOG OFF)
 set(SDL_JOYSTICK OFF)
 
+set(CAUSTIX_CUDA_ARCH "75" CACHE STRING "CUDA compute capability for OptiX PTX (e.g. 75, 86, 89)")
+
+find_package(OpenMP QUIET)
+set(CAUSTIX_VISKORES_OPENMP_DEFAULT OFF)
+if (OpenMP_CXX_FOUND)
+	set(CAUSTIX_VISKORES_OPENMP_DEFAULT ON)
+endif()
+option(CAUSTIX_ENABLE_VISKORES_OPENMP "Enable OpenMP backend for Viskores filters" ${CAUSTIX_VISKORES_OPENMP_DEFAULT})
+
 set(IMGUI_DIR ${CMAKE_SOURCE_DIR}/lib/imgui)
 
 add_executable(${CMAKE_PROJECT_NAME}
@@ -37,6 +53,7 @@ add_executable(${CMAKE_PROJECT_NAME}
 	${IMGUI_DIR}/backends/imgui_impl_sdlrenderer3.cpp
 	${CMAKE_SOURCE_DIR}/lib/ImGuiFileDialog/ImGuiFileDialog.cpp
 )
+target_compile_options(${CMAKE_PROJECT_NAME} PRIVATE -Wall)
 
 add_subdirectory(${CMAKE_SOURCE_DIR}/lib/SDL)
 
@@ -46,17 +63,19 @@ target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
 	${IMGUI_DIR}/backends
 	${CMAKE_SOURCE_DIR}/lib/ImGuiFileDialog
 )
-set(Viskores_ENABLE_TESTING OFF)
-set(Viskores_ENABLE_RENDERING OFF)
-set(Viskores_ENABLE_EXAMPLES OFF)
-set(Viskores_ENABLE_TUTORIALS OFF)
-set(Viskores_ENABLE_BENCHMARKS OFF)
-set(Viskores_ENABLE_DOCUMENTATION OFF)
-set(Viskores_ENABLE_MPI OFF)
-set(Viskores_ENABLE_CUDA OFF)
-set(Viskores_ENABLE_KOKKOS OFF)
-set(Viskores_ENABLE_TBB OFF)
-set(Viskores_ENABLE_OPENMP OFF)
+set(Viskores_ENABLE_TESTING OFF CACHE BOOL "" FORCE)
+set(Viskores_ENABLE_RENDERING OFF CACHE BOOL "" FORCE)
+set(Viskores_ENABLE_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(Viskores_ENABLE_TUTORIALS OFF CACHE BOOL "" FORCE)
+set(Viskores_ENABLE_BENCHMARKS OFF CACHE BOOL "" FORCE)
+set(Viskores_ENABLE_DOCUMENTATION OFF CACHE BOOL "" FORCE)
+set(Viskores_ENABLE_MPI OFF CACHE BOOL "" FORCE)
+set(Viskores_ENABLE_CUDA OFF CACHE BOOL "" FORCE)
+set(Viskores_ENABLE_KOKKOS OFF CACHE BOOL "" FORCE)
+set(Viskores_ENABLE_TBB OFF CACHE BOOL "" FORCE)
+set(Viskores_ENABLE_OPENMP ${CAUSTIX_ENABLE_VISKORES_OPENMP} CACHE BOOL "" FORCE)
+set(Viskores_ENABLE_LOGGING OFF CACHE BOOL "" FORCE)
+set(Viskores_ENABLE_DEVELOPER_FLAGS OFF CACHE BOOL "" FORCE)
 add_subdirectory(${CMAKE_SOURCE_DIR}/lib/viskores)
 
 find_package(CUDAToolkit REQUIRED)
@@ -70,7 +89,7 @@ add_custom_command(
 	COMMAND ${CUDAToolkit_NVCC_EXECUTABLE} -ptx
 		-I${OptiX_INSTALL_DIR}/include
 		-I${CMAKE_SOURCE_DIR}/src
-		--gpu-architecture=compute_75
+		--gpu-architecture=compute_${CAUSTIX_CUDA_ARCH}
 		-o ${SHADER_PTX}
 		${SHADER_SRC}
 	DEPENDS ${SHADER_SRC} ${CMAKE_SOURCE_DIR}/src/optix_params.h

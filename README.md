@@ -114,8 +114,3 @@ Build outputs:
 - `src/optix_params.h`: shared host/device structs
 - `assets/`: UI fonts
 - `lib/`: submodules (SDL, ImGui, ImGuiFileDialog, Viskores)
-
-## Development Notes
-
-- No automated test suite is currently included.
-- Main project guidance for coding agents lives in `CLAUDE.md`.

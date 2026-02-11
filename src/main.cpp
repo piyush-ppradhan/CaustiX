@@ -94,6 +94,26 @@ struct BBox {
   float3 hi = make_float3(-1e30f, -1e30f, -1e30f);
 };
 
+struct MeshCache {
+  std::string source_file;
+  std::string source_field;
+  int source_solid_flag = 1;
+  std::vector<float3> base_positions;
+  std::vector<float3> base_normals;
+  std::vector<uint3> indices;
+  bool valid = false;
+
+  void Clear() {
+    source_file.clear();
+    source_field.clear();
+    source_solid_flag = 1;
+    base_positions.clear();
+    base_normals.clear();
+    indices.clear();
+    valid = false;
+  }
+};
+
 struct LightingState {
   ImVec4 bg_color = ImVec4(1.0f, 1.0f, 1.0f, 1.0f);
   ImVec4 prev_bg_color = bg_color;
@@ -197,7 +217,10 @@ struct OptixState {
   CUdeviceptr d_hitgroup_records = 0;  // 4 hitgroup records (when ground enabled) or 2
   int hitgroup_record_count = 0;
   OptixTraversableHandle gas_handle = 0;
+  CUdeviceptr d_gas_temp = 0;
   CUdeviceptr d_gas_output = 0;
+  size_t gas_temp_capacity = 0;
+  size_t gas_output_capacity = 0;
   CUdeviceptr d_vertices = 0;
   CUdeviceptr d_indices_buf = 0;
   CUdeviceptr d_normals = 0;
@@ -536,25 +559,24 @@ static void laplacian_smooth(std::vector<float3>& positions, const std::vector<u
   }
 }
 
+static void compute_bbox(const std::vector<float3>& positions, BBox& bbox) {
+  bbox.lo = make_float3(1e30f, 1e30f, 1e30f);
+  bbox.hi = make_float3(-1e30f, -1e30f, -1e30f);
+  for (const auto& p : positions) {
+    bbox.lo.x = std::min(bbox.lo.x, p.x);
+    bbox.lo.y = std::min(bbox.lo.y, p.y);
+    bbox.lo.z = std::min(bbox.lo.z, p.z);
+    bbox.hi.x = std::max(bbox.hi.x, p.x);
+    bbox.hi.y = std::max(bbox.hi.y, p.y);
+    bbox.hi.z = std::max(bbox.hi.z, p.z);
+  }
+}
+
 // --- Rebuild GAS (geometry acceleration structure) ---
 // Rebuilds the GAS from existing mesh GPU data + optional ground plane.
 // Does NOT re-extract mesh from Viskores — uses d_vertices/d_indices_buf already on GPU.
 
 static void rebuild_gas(OptixState& state, const BBox& bbox, bool ground_enabled, float ground_y_offset) {
-  // Free old GAS
-  if (state.d_gas_output) {
-    cudaFree(reinterpret_cast<void*>(state.d_gas_output));
-    state.d_gas_output = 0;
-  }
-  if (state.d_ground_vertices) {
-    cudaFree(reinterpret_cast<void*>(state.d_ground_vertices));
-    state.d_ground_vertices = 0;
-  }
-  if (state.d_ground_indices) {
-    cudaFree(reinterpret_cast<void*>(state.d_ground_indices));
-    state.d_ground_indices = 0;
-  }
-
   // Prepare ground plane geometry
   float3 ground_verts[4];
   uint3 ground_tris[2];
@@ -572,17 +594,21 @@ static void rebuild_gas(OptixState& state, const BBox& bbox, bool ground_enabled
     ground_tris[0] = make_uint3(0, 1, 2);
     ground_tris[1] = make_uint3(0, 2, 3);
 
-    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&state.d_ground_vertices), 4 * sizeof(float3)));
+    if (!state.d_ground_vertices) {
+      CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&state.d_ground_vertices), 4 * sizeof(float3)));
+    }
     CUDA_CHECK(cudaMemcpy(reinterpret_cast<void*>(state.d_ground_vertices), ground_verts, 4 * sizeof(float3),
                           cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&state.d_ground_indices), 2 * sizeof(uint3)));
+    if (!state.d_ground_indices) {
+      CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&state.d_ground_indices), 2 * sizeof(uint3)));
+    }
     CUDA_CHECK(cudaMemcpy(reinterpret_cast<void*>(state.d_ground_indices), ground_tris, 2 * sizeof(uint3),
                           cudaMemcpyHostToDevice));
   }
 
   // Build GAS
   OptixAccelBuildOptions accel_options = {};
-  accel_options.buildFlags = OPTIX_BUILD_FLAG_ALLOW_COMPACTION | OPTIX_BUILD_FLAG_PREFER_FAST_TRACE;
+  accel_options.buildFlags = OPTIX_BUILD_FLAG_PREFER_FAST_TRACE;
   accel_options.operation = OPTIX_BUILD_OPERATION_BUILD;
 
   const uint32_t mesh_flags[1] = {OPTIX_GEOMETRY_FLAG_NONE};
@@ -619,15 +645,26 @@ static void rebuild_gas(OptixState& state, const BBox& bbox, bool ground_enabled
   OptixAccelBufferSizes gas_sizes;
   OPTIX_CHECK(optixAccelComputeMemoryUsage(state.context, &accel_options, build_inputs, num_inputs, &gas_sizes));
 
-  CUdeviceptr d_temp;
-  CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_temp), gas_sizes.tempSizeInBytes));
-  CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&state.d_gas_output), gas_sizes.outputSizeInBytes));
+  if (state.gas_temp_capacity < gas_sizes.tempSizeInBytes) {
+    if (state.d_gas_temp) {
+      CUDA_CHECK(cudaFree(reinterpret_cast<void*>(state.d_gas_temp)));
+      state.d_gas_temp = 0;
+    }
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&state.d_gas_temp), gas_sizes.tempSizeInBytes));
+    state.gas_temp_capacity = gas_sizes.tempSizeInBytes;
+  }
+  if (state.gas_output_capacity < gas_sizes.outputSizeInBytes) {
+    if (state.d_gas_output) {
+      CUDA_CHECK(cudaFree(reinterpret_cast<void*>(state.d_gas_output)));
+      state.d_gas_output = 0;
+    }
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&state.d_gas_output), gas_sizes.outputSizeInBytes));
+    state.gas_output_capacity = gas_sizes.outputSizeInBytes;
+  }
 
-  OPTIX_CHECK(optixAccelBuild(state.context, 0, &accel_options, build_inputs, num_inputs, d_temp,
-                              gas_sizes.tempSizeInBytes, state.d_gas_output, gas_sizes.outputSizeInBytes,
+  OPTIX_CHECK(optixAccelBuild(state.context, 0, &accel_options, build_inputs, num_inputs, state.d_gas_temp,
+                              state.gas_temp_capacity, state.d_gas_output, state.gas_output_capacity,
                               &state.gas_handle, nullptr, 0));
-
-  CUDA_CHECK(cudaFree(reinterpret_cast<void*>(d_temp)));
 
   // Update SBT counts
   state.hitgroup_record_count = ground_enabled ? 4 : 2;
@@ -636,12 +673,104 @@ static void rebuild_gas(OptixState& state, const BBox& bbox, bool ground_enabled
 
 // --- Build GAS from mesh data ---
 
+static void upload_mesh_to_gpu(const std::vector<float3>& positions, const std::vector<float3>& normal_data,
+                               const std::vector<uint3>& indices, OptixState& state, float base_r, float base_g,
+                               float base_b, float metallic, float roughness, float opacity, float ior,
+                               const float3& light_dir, float light_r, float light_g, float light_b,
+                               float light_strength, const BBox& bbox, bool ground_enabled,
+                               const ImVec4& ground_color, float ground_metallic, float ground_roughness,
+                               float ground_opacity, float ground_y_offset) {
+  if (positions.empty() || normal_data.size() != positions.size() || indices.empty()) {
+    throw std::runtime_error("Invalid mesh buffers for GPU upload.");
+  }
+
+  // Free old mesh GPU buffers
+  if (state.d_vertices) {
+    cudaFree(reinterpret_cast<void*>(state.d_vertices));
+    state.d_vertices = 0;
+  }
+  if (state.d_indices_buf) {
+    cudaFree(reinterpret_cast<void*>(state.d_indices_buf));
+    state.d_indices_buf = 0;
+  }
+  if (state.d_normals) {
+    cudaFree(reinterpret_cast<void*>(state.d_normals));
+    state.d_normals = 0;
+  }
+  if (state.d_indices) {
+    cudaFree(reinterpret_cast<void*>(state.d_indices));
+    state.d_indices = 0;
+  }
+
+  // Upload vertices to GPU
+  size_t vert_size = positions.size() * sizeof(float3);
+  CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&state.d_vertices), vert_size));
+  CUDA_CHECK(cudaMemcpy(reinterpret_cast<void*>(state.d_vertices), positions.data(), vert_size, cudaMemcpyHostToDevice));
+
+  // Upload index buffer for GAS build
+  size_t idx_size = indices.size() * sizeof(uint3);
+  CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&state.d_indices_buf), idx_size));
+  CUDA_CHECK(cudaMemcpy(reinterpret_cast<void*>(state.d_indices_buf), indices.data(), idx_size, cudaMemcpyHostToDevice));
+
+  // Store mesh counts for rebuild_gas
+  state.num_mesh_vertices = static_cast<unsigned int>(positions.size());
+  state.num_mesh_triangles = static_cast<unsigned int>(indices.size());
+
+  // Upload normals for shader access
+  size_t norm_size = normal_data.size() * sizeof(float3);
+  CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&state.d_normals), norm_size));
+  CUDA_CHECK(
+      cudaMemcpy(reinterpret_cast<void*>(state.d_normals), normal_data.data(), norm_size, cudaMemcpyHostToDevice));
+
+  // Upload indices for shader access
+  CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&state.d_indices), idx_size));
+  CUDA_CHECK(cudaMemcpy(reinterpret_cast<void*>(state.d_indices), indices.data(), idx_size, cudaMemcpyHostToDevice));
+
+  // Build GAS (handles ground plane geometry internally)
+  rebuild_gas(state, bbox, ground_enabled, ground_y_offset);
+
+  // Update SBT hitgroup records
+  update_mesh_hitgroup_sbt(state, base_r, base_g, base_b, metallic, roughness, opacity, ior, light_dir, light_r, light_g,
+                           light_b, light_strength);
+  write_shadow_hitgroup_records(state);
+  if (ground_enabled) {
+    update_ground_hitgroup_sbt(state, ground_color, ground_metallic, ground_roughness, ground_opacity, light_dir, light_r,
+                               light_g, light_b, light_strength);
+  }
+}
+
+static void rebuild_mesh_from_cache(const MeshCache& mesh_cache, OptixState& state, float base_r, float base_g,
+                                    float base_b, float metallic, float roughness, float opacity, float ior,
+                                    const float3& light_dir, float light_r, float light_g, float light_b,
+                                    float light_strength, BBox& bbox, int smooth_iters, float smooth_lambda,
+                                    bool ground_enabled, const ImVec4& ground_color, float ground_metallic,
+                                    float ground_roughness, float ground_opacity, float ground_y_offset) {
+  if (!mesh_cache.valid || mesh_cache.base_positions.empty() || mesh_cache.indices.empty()) {
+    throw std::runtime_error("Cached mesh is not available.");
+  }
+
+  std::vector<float3> positions = mesh_cache.base_positions;
+  std::vector<float3> normal_data = mesh_cache.base_normals;
+  if (normal_data.size() != positions.size()) {
+    normal_data.assign(positions.size(), make_float3(0.0f, 1.0f, 0.0f));
+  }
+
+  if (smooth_iters > 0) {
+    laplacian_smooth(positions, mesh_cache.indices, normal_data, smooth_iters, smooth_lambda);
+  }
+  compute_bbox(positions, bbox);
+
+  upload_mesh_to_gpu(positions, normal_data, mesh_cache.indices, state, base_r, base_g, base_b, metallic, roughness,
+                     opacity, ior, light_dir, light_r, light_g, light_b, light_strength, bbox, ground_enabled,
+                     ground_color, ground_metallic, ground_roughness, ground_opacity, ground_y_offset);
+}
+
 static void extract_mesh(const std::string& mask_filepath, const std::string& field_name, int solid_val,
-                         OptixState& state, float base_r, float base_g, float base_b, float metallic, float roughness,
-                         float opacity, float ior, const float3& light_dir, float light_r, float light_g, float light_b,
-                         float light_strength, BBox& bbox, int smooth_iters, float smooth_lambda, bool ground_enabled,
-                         const ImVec4& ground_color, float ground_metallic, float ground_roughness,
-                         float ground_opacity, float ground_y_offset) {
+                         MeshCache& mesh_cache, OptixState& state, float base_r, float base_g, float base_b,
+                         float metallic, float roughness, float opacity, float ior, const float3& light_dir,
+                         float light_r, float light_g, float light_b, float light_strength, BBox& bbox,
+                         int smooth_iters, float smooth_lambda, bool ground_enabled, const ImVec4& ground_color,
+                         float ground_metallic, float ground_roughness, float ground_opacity, float ground_y_offset) {
   viskores::io::VTKDataSetReader reader(mask_filepath);
   viskores::cont::DataSet ds = reader.ReadDataSet();
 
@@ -693,17 +822,9 @@ static void extract_mesh(const std::string& mask_filepath, const std::string& fi
   auto coordArray = coordData.AsArrayHandle<viskores::cont::ArrayHandle<viskores::Vec3f_32>>();
   {
     auto portal = coordArray.ReadPortal();
-    bbox.lo = make_float3(1e30f, 1e30f, 1e30f);
-    bbox.hi = make_float3(-1e30f, -1e30f, -1e30f);
     for (viskores::Id i = 0; i < numPoints; i++) {
       auto p = portal.Get(i);
       positions[i] = make_float3(p[0], p[1], p[2]);
-      bbox.lo.x = std::min(bbox.lo.x, p[0]);
-      bbox.lo.y = std::min(bbox.lo.y, p[1]);
-      bbox.lo.z = std::min(bbox.lo.z, p[2]);
-      bbox.hi.x = std::max(bbox.hi.x, p[0]);
-      bbox.hi.y = std::max(bbox.hi.y, p[1]);
-      bbox.hi.z = std::max(bbox.hi.z, p[2]);
     }
   }
 
@@ -760,77 +881,17 @@ static void extract_mesh(const std::string& mask_filepath, const std::string& fi
     throw std::runtime_error("Contour produced no valid triangles.");
   }
 
-  // Laplacian smoothing (before GPU upload)
-  if (smooth_iters > 0) {
-    laplacian_smooth(positions, indices, normal_data, smooth_iters, smooth_lambda);
-    // Recompute bounding box after smoothing
-    bbox.lo = make_float3(1e30f, 1e30f, 1e30f);
-    bbox.hi = make_float3(-1e30f, -1e30f, -1e30f);
-    for (const auto& p : positions) {
-      bbox.lo.x = std::min(bbox.lo.x, p.x);
-      bbox.lo.y = std::min(bbox.lo.y, p.y);
-      bbox.lo.z = std::min(bbox.lo.z, p.z);
-      bbox.hi.x = std::max(bbox.hi.x, p.x);
-      bbox.hi.y = std::max(bbox.hi.y, p.y);
-      bbox.hi.z = std::max(bbox.hi.z, p.z);
-    }
-  }
+  mesh_cache.source_file = mask_filepath;
+  mesh_cache.source_field = field_name;
+  mesh_cache.source_solid_flag = solid_val;
+  mesh_cache.base_positions = std::move(positions);
+  mesh_cache.base_normals = std::move(normal_data);
+  mesh_cache.indices = std::move(indices);
+  mesh_cache.valid = true;
 
-  // Free old mesh GPU buffers
-  if (state.d_vertices) {
-    cudaFree(reinterpret_cast<void*>(state.d_vertices));
-    state.d_vertices = 0;
-  }
-  if (state.d_indices_buf) {
-    cudaFree(reinterpret_cast<void*>(state.d_indices_buf));
-    state.d_indices_buf = 0;
-  }
-  if (state.d_normals) {
-    cudaFree(reinterpret_cast<void*>(state.d_normals));
-    state.d_normals = 0;
-  }
-  if (state.d_indices) {
-    cudaFree(reinterpret_cast<void*>(state.d_indices));
-    state.d_indices = 0;
-  }
-
-  // Upload vertices to GPU
-  size_t vert_size = positions.size() * sizeof(float3);
-  CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&state.d_vertices), vert_size));
-  CUDA_CHECK(
-      cudaMemcpy(reinterpret_cast<void*>(state.d_vertices), positions.data(), vert_size, cudaMemcpyHostToDevice));
-
-  // Upload index buffer for GAS build
-  size_t idx_size = indices.size() * sizeof(uint3);
-  CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&state.d_indices_buf), idx_size));
-  CUDA_CHECK(
-      cudaMemcpy(reinterpret_cast<void*>(state.d_indices_buf), indices.data(), idx_size, cudaMemcpyHostToDevice));
-
-  // Store mesh counts for rebuild_gas
-  state.num_mesh_vertices = static_cast<unsigned int>(positions.size());
-  state.num_mesh_triangles = static_cast<unsigned int>(indices.size());
-
-  // Upload normals for shader access
-  size_t norm_size = normal_data.size() * sizeof(float3);
-  CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&state.d_normals), norm_size));
-  CUDA_CHECK(
-      cudaMemcpy(reinterpret_cast<void*>(state.d_normals), normal_data.data(), norm_size, cudaMemcpyHostToDevice));
-
-  // Upload indices for shader access
-  CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&state.d_indices), idx_size));
-  CUDA_CHECK(cudaMemcpy(reinterpret_cast<void*>(state.d_indices), indices.data(), idx_size, cudaMemcpyHostToDevice));
-
-  // Build GAS (handles ground plane geometry internally)
-  rebuild_gas(state, bbox, ground_enabled, ground_y_offset);
-
-  // Update SBT hitgroup records
-  update_mesh_hitgroup_sbt(state, base_r, base_g, base_b, metallic, roughness, opacity, ior, light_dir, light_r, light_g,
-                           light_b, light_strength);
-  write_shadow_hitgroup_records(state);
-  if (ground_enabled) {
-    update_ground_hitgroup_sbt(state, ground_color, ground_metallic, ground_roughness, ground_opacity, light_dir,
-                               light_r, light_g, light_b, light_strength);
-  }
+  rebuild_mesh_from_cache(mesh_cache, state, base_r, base_g, base_b, metallic, roughness, opacity, ior, light_dir,
+                          light_r, light_g, light_b, light_strength, bbox, smooth_iters, smooth_lambda, ground_enabled,
+                          ground_color, ground_metallic, ground_roughness, ground_opacity, ground_y_offset);
 }
 
 // --- Cleanup OptiX ---
@@ -838,6 +899,7 @@ static void extract_mesh(const std::string& mask_filepath, const std::string& fi
 static void cleanup_optix(OptixState& state) {
   if (state.d_image) cudaFree(reinterpret_cast<void*>(state.d_image));
   if (state.d_params) cudaFree(reinterpret_cast<void*>(state.d_params));
+  if (state.d_gas_temp) cudaFree(reinterpret_cast<void*>(state.d_gas_temp));
   if (state.d_gas_output) cudaFree(reinterpret_cast<void*>(state.d_gas_output));
   if (state.d_vertices) cudaFree(reinterpret_cast<void*>(state.d_vertices));
   if (state.d_indices_buf) cudaFree(reinterpret_cast<void*>(state.d_indices_buf));
@@ -1002,6 +1064,7 @@ int main(int argc, char* argv[]) {
 
   // Persistent mesh bounding box for outline drawing
   BBox mesh_bbox;
+  MeshCache mesh_cache;
 
   // Host pixel buffer for copying from GPU
   std::vector<uchar4> host_pixels;
@@ -1178,6 +1241,8 @@ int main(int argc, char* argv[]) {
         mask_file.clear();
         mask_field_names.clear();
         mask_field_index = 0;
+        mesh_cache.Clear();
+        mesh_loaded = false;
       }
 
       if (!mask_file.empty()) {
@@ -1328,6 +1393,8 @@ int main(int argc, char* argv[]) {
             mask_file = selected_file;
             mask_field_names.clear();
             mask_field_index = 0;
+            mesh_cache.Clear();
+            mesh_loaded = false;
             for (viskores::IdComponent i = 0; i < mask_dataset.GetNumberOfFields(); i++) {
               const auto& field = mask_dataset.GetField(i);
               if (field.IsPointField() || field.IsCellField()) {
@@ -1399,16 +1466,29 @@ int main(int argc, char* argv[]) {
       }
     }
 
-    // Detect mesh extraction triggers (full rebuild)
-    bool mask_params_changed =
-        (show_mask != prev_show_mask) ||
-        (show_mask && (mask_field_index != prev_mask_field_index || solid_flag != prev_solid_flag));
+    // Detect mesh extraction triggers (full rebuild) vs smoothing-only cache rebuild.
+    bool mask_selection_changed =
+        show_mask && (mask_field_index != prev_mask_field_index || solid_flag != prev_solid_flag);
     bool smooth_changed =
         (smooth_iterations != prev_smooth_iterations) || (std::fabs(smooth_strength - prev_smooth_strength) > 1e-4f);
     bool ground_toggled = (ground_enabled != prev_ground_enabled);
     bool ground_offset_changed = (ground_y_offset != prev_ground_y_offset);
-    bool needs_full_rebuild = mask_params_changed || (show_mask && mesh_loaded && smooth_changed);
-    bool needs_gas_rebuild = show_mask && mesh_loaded && (ground_toggled || ground_offset_changed);
+
+    bool has_mask_selection =
+        !mask_file.empty() && !mask_field_names.empty() && mask_field_index >= 0 &&
+        mask_field_index < static_cast<int>(mask_field_names.size());
+    std::string selected_mask_field = has_mask_selection ? mask_field_names[mask_field_index] : std::string();
+
+    bool cache_matches_selection =
+        has_mask_selection && mesh_cache.valid && mesh_cache.source_file == mask_file &&
+        mesh_cache.source_field == selected_mask_field && mesh_cache.source_solid_flag == solid_flag;
+
+    bool needs_extract = show_mask && has_mask_selection && (mask_selection_changed || !cache_matches_selection);
+    bool needs_mesh_rebuild_from_cache = show_mask && has_mask_selection && !needs_extract &&
+                                         (smooth_changed || !mesh_loaded);
+    bool needs_full_rebuild = needs_extract || needs_mesh_rebuild_from_cache;
+    bool needs_gas_rebuild = show_mask && mesh_loaded && !needs_full_rebuild && (ground_toggled || ground_offset_changed);
+
     prev_show_mask = show_mask;
     prev_mask_field_index = mask_field_index;
     prev_solid_flag = solid_flag;
@@ -1417,10 +1497,10 @@ int main(int argc, char* argv[]) {
     prev_ground_enabled = ground_enabled;
     prev_ground_y_offset = ground_y_offset;
 
-    if (show_mask && needs_full_rebuild && !mask_file.empty() && !mask_field_names.empty()) {
+    if (needs_extract) {
       try {
         BBox bbox;
-        extract_mesh(mask_file, mask_field_names[mask_field_index], solid_flag, optix_state, mask_color.x, mask_color.y,
+        extract_mesh(mask_file, selected_mask_field, solid_flag, mesh_cache, optix_state, mask_color.x, mask_color.y,
                      mask_color.z, mask_metallic, mask_roughness, mask_opacity, mask_glass_ior, light_dir, light_color.x,
                      light_color.y, light_color.z, light_strength, bbox, smooth_iterations, smooth_strength, ground_enabled,
                      ground_color, ground_metallic, ground_roughness, ground_opacity, ground_y_offset);
@@ -1453,10 +1533,33 @@ int main(int argc, char* argv[]) {
       } catch (const std::exception& e) {
         show_mask_error = true;
         mask_error_msg = std::string("Mesh extraction failed: ") + e.what();
+        mesh_cache.Clear();
         mesh_loaded = false;
       } catch (...) {
         show_mask_error = true;
         mask_error_msg = "Mesh extraction failed.";
+        mesh_cache.Clear();
+        mesh_loaded = false;
+      }
+    }
+
+    if (needs_mesh_rebuild_from_cache) {
+      try {
+        BBox bbox;
+        rebuild_mesh_from_cache(mesh_cache, optix_state, mask_color.x, mask_color.y, mask_color.z, mask_metallic,
+                                mask_roughness, mask_opacity, mask_glass_ior, light_dir, light_color.x, light_color.y,
+                                light_color.z, light_strength, bbox, smooth_iterations, smooth_strength, ground_enabled,
+                                ground_color, ground_metallic, ground_roughness, ground_opacity, ground_y_offset);
+        mesh_loaded = true;
+        mesh_bbox = bbox;
+        viewport_needs_render = true;
+      } catch (const std::exception& e) {
+        show_mask_error = true;
+        mask_error_msg = std::string("Mesh rebuild failed: ") + e.what();
+        mesh_loaded = false;
+      } catch (...) {
+        show_mask_error = true;
+        mask_error_msg = "Mesh rebuild failed.";
         mesh_loaded = false;
       }
     }
