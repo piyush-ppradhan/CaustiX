@@ -40,6 +40,32 @@ static __forceinline__ __device__ float3 reflect(float3 I, float3 N) {
   return I - 2.0f * dot(I, N) * N;
 }
 
+static __forceinline__ __device__ bool refract_dir(float3 I, float3 N, float ior, float3& T) {
+  float cosi = fminf(fmaxf(dot(I, N), -1.0f), 1.0f);
+  float etai = 1.0f;
+  float etat = ior;
+  float3 n = N;
+  if (cosi > 0.0f) {
+    float tmp = etai;
+    etai = etat;
+    etat = tmp;
+    n = n * (-1.0f);
+  } else {
+    cosi = -cosi;
+  }
+  float eta = etai / etat;
+  float k = 1.0f - eta * eta * (1.0f - cosi * cosi);
+  if (k < 0.0f) return false;
+  T = normalize(I * eta + n * (eta * cosi - sqrtf(k)));
+  return true;
+}
+
+static __forceinline__ __device__ float fresnel_schlick(float cos_theta, float ior) {
+  float r0 = (1.0f - ior) / (1.0f + ior);
+  r0 = r0 * r0;
+  return r0 + (1.0f - r0) * powf(1.0f - cos_theta, 5.0f);
+}
+
 static __forceinline__ __device__ float clampf(float x, float lo, float hi) {
   return fminf(fmaxf(x, lo), hi);
 }
@@ -223,10 +249,11 @@ extern "C" __global__ void __closesthit__ch() {
   float3 n0 = data->normals[tri.x];
   float3 n1 = data->normals[tri.y];
   float3 n2 = data->normals[tri.z];
-  float3 N = normalize(n0 * (1.0f - bary.x - bary.y) + n1 * bary.x + n2 * bary.y);
+  float3 N_geom = normalize(n0 * (1.0f - bary.x - bary.y) + n1 * bary.x + n2 * bary.y);
 
   // Ensure normal faces the ray (flip if backface)
   float3 ray_dir = optixGetWorldRayDirection();
+  float3 N = N_geom;
   if (dot(N, ray_dir) > 0.0f) N = N * (-1.0f);
 
   // Compute hit position
@@ -235,8 +262,33 @@ extern "C" __global__ void __closesthit__ch() {
   // View direction
   float3 V = normalize(ray_dir * (-1.0f));
 
-  // Shade with all lights + shadows
-  float3 color = shade_lights(hit_pos, N, V, data) * data->opacity;
+  // Shade with direct lights/shadows at the hit.
+  float3 surface_color = shade_lights(hit_pos, N, V, data);
+  float opacity = clampf(data->opacity, 0.0f, 1.0f);
+  float3 color = surface_color * opacity;
+
+  // Glass-like transmission/reflection blend.
+  // Apply on secondary hits too (up to max_depth) so refracted rays can exit
+  // closed surfaces instead of turning into a black interior silhouette.
+  unsigned int depth = optixGetPayload_3();
+  if (opacity < 0.999f && depth < params.max_depth) {
+    float kIOR = clampf(data->ior, 1.0f, 2.5f);
+    float cos_theta = fmaxf(dot(V, N), 0.0f);
+    float fresnel = fresnel_schlick(cos_theta, kIOR);
+
+    float3 refl_dir = reflect(ray_dir, N);
+    float3 refl_color = trace_radiance(hit_pos + N * 0.01f, refl_dir, depth + 1);
+
+    float3 refr_dir;
+    float3 trans_color = refl_color;
+    if (refract_dir(ray_dir, N_geom, kIOR, refr_dir)) {
+      trans_color = trace_radiance(hit_pos - N * 0.01f, refr_dir, depth + 1);
+    }
+
+    float3 tint = make_float3(1.0f, 1.0f, 1.0f) * 0.75f + data->base_color * 0.25f;
+    float3 glass_color = (trans_color * (1.0f - fresnel) + refl_color * fresnel) * tint;
+    color = surface_color * opacity + glass_color * (1.0f - opacity);
+  }
 
   setPayload(color);
 }

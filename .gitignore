@@ -1,2 +1,7 @@
+# Folders
 bin/
 build/
+output/
+
+# Files
+*.vtk

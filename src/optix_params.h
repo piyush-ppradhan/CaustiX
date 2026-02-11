@@ -28,6 +28,7 @@ struct HitGroupData {
   float metallic;
   float roughness;
   float opacity;
+  float ior;
   float3 light_dir;
   float3 light_color;
   float light_strength;
