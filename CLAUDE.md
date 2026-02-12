@@ -1,59 +1,55 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working in this repository.
+This file provides guidance to Claude Code when working in this repository.
 
 ## Build
 
 ```bash
-# From repo root
 cmake -S . -B build
 make -C build -j6
 ```
 
 Outputs:
-- App binary: `bin/CaustiX`
-- OptiX PTX: `bin/shaders.ptx` (built by CMake custom target)
+- `bin/CaustiX`
+- `bin/shaders.ptx`
 
 ## Runtime Dependencies
 
-- CUDA Toolkit 13.1+ (`/opt/cuda` on this machine)
-- OptiX SDK 9.1.0 (`/opt/NVIDIA-OptiX-SDK-9.1.0-linux64-x86_64`)
-- NVIDIA GPU (project currently targets `compute_75` in CMake)
+- CUDA Toolkit 13.1+
+- OptiX SDK 9.1.0
+- NVIDIA GPU
 
-No test infrastructure exists in this repo.
+No automated test suite is currently present.
 
 ## Architecture
 
-CaustiX is a 3D scientific visualization app that ray-traces isosurfaces from VTK datasets.
+CaustiX is a 3D scientific visualization app that ray-traces extracted surfaces from VTK data.
 
 Stack:
 - SDL3 window + renderer
 - ImGui docking UI
-- Viskores data processing (VTK read + contour extraction)
-- OptiX 9.1 GPU ray tracing
+- Viskores for VTK IO/filtering
+- OptiX for GPU ray tracing
 
-### Key Source Files
+## Key Source Files
 
 - `src/main.cpp`
-  - App/UI loop
-  - VTK/mask loading
-  - Mesh extraction + smoothing + rotation
-  - Hybrid fluid extraction (masked density isosurface + volume texture)
-  - OptiX host setup, SBT/GAS updates, launch
+  - UI and application loop
+  - Dataset/mask loading
+  - Mask/fluid surface extraction
+  - Mesh smoothing + rotation
+  - OptiX host setup, SBT/GAS rebuilds, launch
 - `src/shaders.cu`
-  - `__raygen__rg`, `__miss__radiance`, `__miss__shadow`
-  - `__closesthit__ch` (mask), `__closesthit__ground`
+  - raygen/miss programs
+  - mesh + ground closest-hit shading
 - `src/fluid_shading.cuh`
-  - `__closesthit__fluid`
-  - Fluid-only volume/refraction helpers
+  - fluid closest-hit shading (surface-based, no volumetric marching)
 - `src/optix_params.h`
-  - Shared launch and SBT structs (`Params`, `MissData`, `HitGroupData`)
-- `src/config.hpp`
-  - Window/font constants
+  - shared host/device launch and hitgroup structs
 
-### Main Runtime State Organization
+## Runtime State Organization (`main.cpp`)
 
-`main.cpp` groups UI/runtime variables into structs:
+Runtime/UI state is grouped into structs:
 - `LightingState`
 - `MaskState`
 - `GroundState`
@@ -64,186 +60,103 @@ Stack:
 - `CameraState`
 - `OptixState`
 
-## Data + Mesh Pipeline
+## Data + Extraction Pipeline
 
-### Mask Surface (`extract_mesh`)
-1. Read mask VTK via `viskores::io::VTKDataSetReader`.
-2. Validate selected field is scalar.
-3. If field is cell-associated, convert to point field using `PointAverage`.
-4. Normalize field storage to default float using `GetDataAsDefaultFloat()`.
-5. Run contour extraction at isovalue `solid_flag - 0.5`, generate normals.
-6. Extract positions/normals/connectivity.
-7. Triangulate non-triangle cells with a fan fallback.
-8. Optional CPU Laplacian smoothing:
-   - Iterations from UI slider
-   - Strength (`lambda`) from UI slider
-   - Recompute normals afterward
-9. Optional geometry rotation:
-   - Rotate X / Y / Z (degrees) from `Render:Misc`
-   - Applied to positions and normals before upload
-10. Upload mesh buffers to GPU.
-11. Rebuild GAS and update SBT hitgroups.
+### Mask surface (`extract_mesh`)
 
-### Hybrid Fluid (`extract_fluid_mesh`)
-1. Read density dataset (from current `Render:Dataset` frame) and mask dataset (from `Render:Mask`).
-   - The active density file follows `Begin/Prev/Next/End` frame navigation (`vtk_files[vtk_index]`).
-   - UI density candidates are scalar cell arrays only; non-scalar cell arrays are excluded.
-   - Default field name is chosen from the first dataset file in the sequence: first scalar cell field whose name contains `rho` (case-insensitive), fallback first scalar cell field.
-2. Convert density and mask fields to point scalar arrays.
-3. Build masked density:
-   - keep density where `mask == fluid_flag`
-   - keep only values in [`Density Threshold Min`, `Density Threshold Max`]
-4. Contour the in-range occupancy at `0.5` to get fluid interface surface.
-5. Build normalized masked volume density and upload as a 3D CUDA texture.
-   - normalization uses density range over all points matching `fluid_flag`
-6. Rebuild mesh/GAS with fluid-specific surface material controls.
+1. Read mask VTK.
+2. Validate selected mask field is scalar.
+3. Convert cell field to point field when needed.
+4. Convert to default float storage.
+5. Contour at `solid_flag - 0.5`.
+6. Extract points/normals/connectivity.
+7. Optional Laplacian smoothing.
+8. Optional rotation (`Rotate X/Y/Z`).
+9. Upload to GPU and rebuild GAS/SBT.
 
-## OptiX Pipeline + SBT
+### Fluid surface (`extract_fluid_mesh`)
 
-One-time init:
-1. `cudaFree(0)` then `optixInit()`
-2. PTX module creation from `bin/shaders.ptx`
-3. Program groups: raygen, 2 miss, mesh hitgroup, ground hitgroup
-4. Pipeline creation (`maxTraceDepth=3`)
-5. SBT allocation:
-   - 1 raygen record
-   - 2 miss records (radiance + shadow)
-   - Up to 4 hitgroup records (mesh/ground x radiance/shadow)
+1. Read density dataset from current `Render:Dataset` frame.
+2. Read mask dataset from `Render:Mask` selection (same file or separate file).
+3. Validate selected data field is scalar cell field.
+4. Convert density and mask to point scalar fields.
+5. Keep points where:
+   - `mask == fluid_flag`
+   - `threshold_min <= data_value <= threshold_max`
+6. Build binary occupancy field from the filtered points.
+7. Contour occupancy at `0.5` to extract fluid surface.
+8. Triangulate polygons when needed.
+9. Cache mesh for rebuild/material updates.
 
-Ray types:
-- `RAY_TYPE_RADIANCE`
-- `RAY_TYPE_SHADOW`
+No volumetric texture upload or ray marching is used in the current design.
 
-SBT hitgroup indexing:
-- `index = ray_type + RAY_TYPE_COUNT * geometry_index`
+## Material + Shading
 
-## Error Handling Macros
+### Mask and fluid surfaces
 
-`src/main.cpp` uses macro-based error checks:
-- `CUDA_CHECK(call)`
-- `OPTIX_CHECK(call)`
-- `OPTIX_CHECK_LOG(call)`
+- Surface shading with directional light + optional shadows.
+- Supports reflection/refraction blend when opacity is below 1.
+- Uses Fresnel + IOR for glass-like appearance.
+- Fluid has independent material controls from mask:
+  - color
+  - metallic
+  - roughness
+  - opacity
+  - glass IOR
 
-They build detailed `std::ostringstream` messages and throw `std::runtime_error`.
+### Ground
 
-Important:
-- These are multi-line macros and require trailing `\` line continuations.
-- If line continuations are removed/altered, parsing fails early (before normal compilation), often near the top of
-  `main.cpp`.
+- Optional ground plane with independent material controls.
 
-## Shading and Materials
+## UI Mapping
 
-### Lighting
+### `Render:Mask`
 
-- Single global directional light (from `HitGroupData`)
-- Optional hard shadows via dedicated shadow rays (`Params.shadows_enabled`)
+- File/field selection
+- `Solid Flag`
+- `Show`
+- Material controls
+- Smoothing controls
 
-### Glass-like Transparency
+### `Render:Data`
 
-Mesh shading in `__closesthit__ch` uses:
-- Local direct lighting (Blinn-Phong style)
-- Reflection + refraction blend when `opacity < 1`
-- Schlick Fresnel
-- Runtime IOR from mask material (`HitGroupData.ior`, controlled by UI slider)
-- Applies on secondary hits too (`depth < params.max_depth`) to avoid black interior artifacts
+- `Add`/`Clear` scalar cell fields
+- `Show`
+- `Field`
+- `Threshold Min`, `Threshold Max`
+- `Fluid Flag`
+- Fluid material controls (`Color`, `Metallic`, `Roughness`, `Opacity`, `Glass IOR`)
+- Fluid smoothing controls (`Boundary Smoothing`, `Boundary Smooth Strength`)
 
-### Hybrid Fluid Volume
+## Rebuild Strategy
 
-When `Render:Data > Show Fluid` is enabled:
-- Refracted rays sample a masked 3D density texture (`cudaTextureObject_t`) inside fluid bounds.
-- Beer-Lambert attenuation uses `Volume Absorption`.
-- A soft in-scatter tint uses `Volume Scattering`.
-- Marching step length is controlled by `Volume Step`.
-- `Show Volume` toggles volumetric contribution on/off at launch-param level.
-- `Show Interface` toggles surface/interface shading visibility.
-- Fluid and mask surfaces can be present in the same GAS so fluid refraction can see the mask geometry.
-
-### Ground Plane
-
-- Optional large quad under mesh (`bbox.lo.y + ground_y_offset`)
-- Ground has separate material controls (color/metallic/roughness/opacity)
-- Reflection path on ground for primary hits when metallic is non-trivial
-
-## UI Layout
-
-- Docked `Config` + `Render` sidebar and central viewport.
-- Viewport panel intentionally hides title/tab bar for a clean look (`NoTitleBar`, dock node no-tab flags).
-
-### Config Panel
-
-- Background color
-- Global illumination (strength/color)
-- Ray tracing (`Bounces`, `Samples`)
-- Ground plane controls
-
-### Render Panel
-
-- Dataset open/navigation
-- `Render:Misc`:
-  - Enable Shadows
-  - Show Outlines
-  - Rotate X / Rotate Y / Rotate Z (degrees)
-- `Render:Mask`:
-  - Mask file + field
-  - `Solid Flag`
-  - Show
-  - Material: color/metallic/roughness/opacity
-  - `Glass IOR`
-  - Smoothing iterations + smooth strength
-- `Render:Data`:
-  - `Show Fluid`
-  - `Show Interface`
-  - `Show Volume`
-  - `Density Field` (scalar cell fields from current dataset frame, defaulting to first `rho*` match)
-  - `Density Threshold Min`
-  - `Density Threshold Max`
-  - `Fluid Flag` (default `0`)
-  - Fluid material controls (separate from mask): color/interface roughness/opacity/`Glass IOR`
-  - `Interface Smoothing`, `Interface Smooth Strength`
-  - `Volume Absorption`, `Volume Scattering`, `Volume Step`
-
-## Rebuild/Update Strategy
-
-- Full mesh rebuild (extract + upload + GAS + SBT):
-  - mask show/field/solid flag changes
-  - smoothing iteration/strength changes
-  - geometry rotation changes (X/Y/Z)
-  - fluid interface/volume mode, field/threshold/fluid-flag/source-file changes
-  - fluid interface smoothing iteration/strength changes
+- Full extract + rebuild:
+  - file/field/flag/threshold changes
+  - smoothing changes
+  - rotation changes
+  - visibility changes requiring mesh inclusion
 - GAS-only rebuild:
-  - ground enabled toggle
-  - ground y offset changes
-- Cheap SBT updates only:
-  - mask material (including glass IOR)
-  - fluid surface material (including glass IOR/interface visibility)
-  - ground material
-  - global light params
-  - background miss color
-- Launch params only:
-  - camera
-  - samples/bounces
-  - shadow toggle
-  - fluid volume shading params (`Volume Absorption`, `Volume Scattering`, `Volume Step`)
+  - ground enable/disable or ground offset changes
+- SBT-only update:
+  - material and lighting parameter changes
+
+## Error Handling
+
+`main.cpp` uses:
+- `CUDA_CHECK`
+- `OPTIX_CHECK`
+- `OPTIX_CHECK_LOG`
+
+These macros throw `std::runtime_error` with location/context.
 
 ## Viskores Notes
 
-- `viskores::cont::Initialize(argc, argv)` is called at startup.
-- Viskores may warn for VTK file versions > 4.2 (common with 5.1 files); this is a reader warning and not necessarily fatal.
+- `viskores::cont::Initialize(argc, argv)` is called during app startup.
+- Reader warnings about VTK versions > 4.2 can appear for VTK 5.1 files.
 
-## Submodules
+## Submodules (`lib/`)
 
-Under `lib/`:
-- SDL (3.4.0)
-- imgui (docking branch, 1.92.5)
-- ImGuiFileDialog (0.6.8)
-- viskores (1.1.0)
-
-Viskores is intentionally trimmed in `CMakeLists.txt`:
-- tests/rendering/examples/tutorials/benchmarks/docs disabled
-- MPI/CUDA/Kokkos/TBB/OpenMP disabled
-
-## Code Style
-
-- Google C++ style
-- 120 column limit
-- Includes intentionally not sorted (`SortIncludes: false`)
+- SDL
+- ImGui
+- ImGuiFileDialog
+- Viskores

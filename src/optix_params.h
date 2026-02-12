@@ -15,13 +15,6 @@ struct Params {
   float3 cam_u, cam_v, cam_w;
   OptixTraversableHandle handle;
   int shadows_enabled;
-  int fluid_volume_enabled;
-  cudaTextureObject_t fluid_density_tex;
-  float3 fluid_bounds_lo;
-  float3 fluid_bounds_hi;
-  float fluid_absorption_strength;
-  float fluid_volume_scattering;
-  float fluid_step_size;
 };
 
 struct RayGenData {};

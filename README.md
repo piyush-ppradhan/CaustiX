@@ -1,31 +1,22 @@
 # CaustiX
 
-CaustiX is a GPU ray-traced visualization app for volumetric VTK data.
-It extracts and ray-traces isosurfaces from scalar fields, with an optional hybrid fluid mode that combines a masked density surface with a lightweight volume pass.
+CaustiX is a GPU ray-traced visualization app for VTK datasets.
+It extracts and renders surfaces from scalar fields for both solid masks and fluid regions.
 
 ## Features
 
 - VTK dataset loading and frame navigation
-- Mask/isosurface extraction from scalar fields (`solid_flag - 0.5`)
-- Interactive ray-traced rendering (OptiX)
-- Glass-like transparency with adjustable `Glass IOR`
-- Hybrid fluid rendering:
-  - Surface: masked density isosurface
-  - Volume: masked density ray-marched on refracted rays
-  - Mask and fluid surfaces can be rendered together
-  - Independent toggles for surface interface and volumetric pass
-  - Dedicated fluid material controls (separate from mask material)
-  - Dedicated fluid interface smoothing controls
-  - Physically-inspired volume controls (absorption + scattering + step size)
-  - Density field list is scalar cell fields from the active dataset frame, with default selected from first sequence file (`rho*`, case-insensitive)
-- Shadow toggle and global directional light controls
-- Ground plane with material and offset controls
-- CPU Laplacian surface smoothing:
-  - Iterations
-  - Smooth strength
-- Geometry transform controls:
-  - Rotate X / Rotate Y / Rotate Z
-- Docked ImGui UI with clean viewport panel
+- Mask surface extraction from scalar fields (`Solid Flag - 0.5` isovalue)
+- Fluid surface extraction from scalar cell fields using:
+  - dataset frame selected in `Render > Dataset`
+  - mask-based fluid gating via `Fluid Flag`
+  - lower/upper scalar threshold (`Threshold Min`, `Threshold Max`)
+- Independent smoothing controls for mask and fluid surfaces
+- Surface material controls for mask/fluid/ground:
+  - color, metallic, roughness, opacity
+  - glass IOR (for transparent/refraction look)
+- Optional shadows and ground plane
+- Geometry rotation controls (`Rotate X/Y/Z`)
 
 ## Requirements
 
@@ -33,11 +24,7 @@ It extracts and ray-traces isosurfaces from scalar fields, with an optional hybr
 - CMake 3.15+
 - CUDA Toolkit 13.1+
 - NVIDIA OptiX SDK 9.1.0
-- NVIDIA GPU (project currently compiles shaders for `compute_75`)
-
-Expected local paths in current `CMakeLists.txt`:
-- CUDA: discovered via `find_package(CUDAToolkit REQUIRED)`
-- OptiX SDK: `/opt/NVIDIA-OptiX-SDK-9.1.0-linux64-x86_64`
+- NVIDIA GPU
 
 ## Build
 
@@ -46,7 +33,7 @@ cmake -S . -B build
 make -C build -j6
 ```
 
-Build outputs:
+Outputs:
 - `bin/CaustiX`
 - `bin/shaders.ptx`
 
@@ -58,104 +45,68 @@ Build outputs:
 
 ## Quick Start
 
-1. Open a dataset folder in `Render > Dataset > Open`.
-2. In `Render:Mask`, open/select a mask VTK file.
-3. Choose mask `Field` and enable `Show` for regular mask-surface rendering.
-4. For fluid rendering, go to `Render:Data`:
-   - enable `Show Fluid`
-   - select `Density Field` (default comes from first dataset file: first scalar cell field containing `rho`, case-insensitive)
-   - set `Density Threshold Min` and `Density Threshold Max`
+1. Open a dataset folder from `Render > Dataset > Open`.
+2. In `Render:Mask`, choose a mask `.vtk` and select the mask field.
+3. Enable `Show` in `Render:Mask` to render solids.
+4. In `Render:Data`:
+   - click `Add` and choose a scalar **cell** array
+   - enable `Show`
+   - choose `Field`
+   - set `Threshold Min/Max`
    - set `Fluid Flag` (default `0`)
-   - choose `Show Interface` and/or `Show Volume`
-   - tune fluid material (`Color`, `Interface Roughness`, `Opacity`, `Glass IOR`)
-5. Use `Begin/Prev/Next/End` in `Render > Dataset` to pick the frame used by fluid rendering.
-6. Tune fluid interface smoothing (`Interface Smoothing`, `Interface Smooth Strength`) and volume controls (`Volume Absorption`, `Volume Scattering`, `Volume Step`).
+5. Tune fluid material (`Color`, `Metallic`, `Roughness`, `Opacity`, `Glass IOR`) and fluid boundary smoothing.
+6. Use `Begin/Prev/Next/End` under `Render > Dataset` to change the active frame.
 
-## Controls
+## UI Summary
 
-### Camera
+### Render:Misc
 
-- Mouse wheel: zoom
-- Left drag: orbit
-- Middle drag: pan
+- `Enable Shadows`
+- `Show Outlines`
+- `Rotate X`, `Rotate Y`, `Rotate Z`
 
-### Config Panel
+### Render:Mask
 
-- Background color
-- Global illumination color/strength
-- Ray tracing:
-  - `Bounces`
-  - `Samples`
-- Ground plane material and offset
+- `File`, `Field`, `Solid Flag`, `Show`
+- Material: `Color`, `Metallic`, `Roughness`, `Opacity`, `Glass IOR`
+- Smoothing: `Smoothing`, `Smooth Strength`
 
-### Render Panel
+### Render:Data
 
-- `Render:Misc`
-  - `Enable Shadows`
-  - `Show Outlines`
-  - `Rotate X`, `Rotate Y`, `Rotate Z` (degrees, default `0`)
-- `Render:Mask`
-  - Mask file/field selection
-  - `Solid Flag`
-  - `Show`
-  - Material controls
-  - `Glass IOR` (`1.0` to `2.5`)
-  - Smoothing iterations (`0` to `50`)
-  - Smooth strength (`0.0` to `1.0`)
-- `Render:Data`
-  - `Show Fluid`
-  - `Show Interface`
-  - `Show Volume`
-  - `Density Field` (scalar cell fields from current dataset frame; default picked from first dataset file by `rho*` match)
-  - `Density Threshold Min`
-  - `Density Threshold Max`
-  - `Fluid Flag` (default `0`)
-  - Fluid material:
-    - `Color`
-    - `Interface Roughness`
-    - `Opacity`
-    - `Glass IOR`
-  - `Interface Smoothing`
-  - `Interface Smooth Strength`
-  - `Volume Absorption`
-  - `Volume Scattering`
-  - `Volume Step`
+- `Add`, `Clear`
+- `Show`
+- `Field` (from added scalar cell arrays)
+- `Threshold Min`, `Threshold Max`
+- `Fluid Flag`
+- Material: `Color`, `Metallic`, `Roughness`, `Opacity`, `Glass IOR`
+- Smoothing: `Boundary Smoothing`, `Boundary Smooth Strength`
 
-## Notes on Glass Rendering
+## Notes
 
-- `Opacity` near `0` makes the mesh mostly transmissive/reflection-driven.
-- `Glass IOR` controls refraction bending:
-  - Lower: weaker bending
-  - Higher: stronger bending
-- For cleaner transparent objects, use higher `Bounces` (e.g. `3-5`).
+- Fluid extraction uses the mask field selected in `Render:Mask`.
+- Points with `mask == Fluid Flag` are treated as fluid candidates.
+- Thresholding is then applied to the selected data field to build the fluid surface.
 
 ## Troubleshooting
 
-- Viskores warning about VTK version > 4.2:
-  - This warning can appear with VTK 5.1 files and is not always fatal.
 - If mask extraction fails:
-  - Ensure selected mask field is scalar.
-  - Ensure the dataset is 3D.
-- If fluid rendering fails:
-  - Ensure density and mask datasets have matching point topology.
-  - Ensure the selected density field is a scalar cell field.
-  - Ensure the active dataset frame has scalar cell fields (fluid density picker ignores non-scalar fields).
-  - Ensure the dataset is a 3D structured grid (required for the hybrid volume texture).
-- If fluid is enabled but nothing shows:
-  - Ensure at least one of `Show Interface` or `Show Volume` is enabled.
-- If transparent objects look too dark:
-  - Increase `Bounces`.
-  - Increase `Opacity` slightly for interface highlights.
-- If performance is slow:
-  - Reduce `Samples`.
-  - Reduce viewport size.
-  - Lower smoothing iterations.
+  - ensure the selected mask field is scalar
+  - ensure the dataset is 3D
+- If fluid extraction fails:
+  - ensure `Render:Mask` has a valid mask file/field
+  - ensure selected `Render:Data` field is scalar cell data
+  - ensure `Threshold Min/Max` includes values present in fluid regions
+  - ensure `Fluid Flag` matches the fluid label in the mask
+- If rendering is slow:
+  - reduce `Samples`
+  - reduce smoothing iterations
+  - reduce viewport size
 
 ## Repository Layout
 
-- `src/main.cpp`: application loop, UI, OptiX host code, mesh extraction
-- `src/shaders.cu`: OptiX device programs
-- `src/fluid_shading.cuh`: dedicated fluid closest-hit and volume shading code
-- `src/optix_params.h`: shared host/device structs
+- `src/main.cpp`: app loop, UI, extraction, OptiX host setup
+- `src/shaders.cu`: raygen/miss/mesh/ground shaders
+- `src/fluid_shading.cuh`: fluid closest-hit shader (surface-based)
+- `src/optix_params.h`: shared launch/SBT structs
 - `assets/`: UI fonts
-- `lib/`: submodules (SDL, ImGui, ImGuiFileDialog, Viskores)
+- `lib/`: dependencies
