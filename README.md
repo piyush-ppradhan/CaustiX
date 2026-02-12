@@ -12,6 +12,7 @@ It extracts and ray-traces isosurfaces from scalar fields, with an optional hybr
 - Hybrid fluid rendering:
   - Surface: masked density isosurface
   - Volume: masked density ray-marched on refracted rays
+  - Mask and fluid surfaces can be rendered together
   - Independent toggles for surface interface and volumetric pass
   - Dedicated fluid material controls (separate from mask material)
   - Dedicated fluid interface smoothing controls
@@ -63,10 +64,10 @@ Build outputs:
 4. For fluid rendering, go to `Render:Data`:
    - enable `Show Fluid`
    - select `Density Field` (default comes from first dataset file: first scalar cell field containing `rho`, case-insensitive)
-   - set `Density Threshold`
+   - set `Density Threshold Min` and `Density Threshold Max`
    - set `Fluid Flag` (default `0`)
    - choose `Show Interface` and/or `Show Volume`
-   - tune fluid material (`Color`, `Metallic`, `Roughness`, `Opacity`, `Glass IOR`)
+   - tune fluid material (`Color`, `Interface Roughness`, `Opacity`, `Glass IOR`)
 5. Use `Begin/Prev/Next/End` in `Render > Dataset` to pick the frame used by fluid rendering.
 6. Tune fluid interface smoothing (`Interface Smoothing`, `Interface Smooth Strength`) and volume controls (`Volume Absorption`, `Volume Scattering`, `Volume Step`).
 
@@ -106,12 +107,12 @@ Build outputs:
   - `Show Interface`
   - `Show Volume`
   - `Density Field` (scalar cell fields from current dataset frame; default picked from first dataset file by `rho*` match)
-  - `Density Threshold`
+  - `Density Threshold Min`
+  - `Density Threshold Max`
   - `Fluid Flag` (default `0`)
   - Fluid material:
     - `Color`
-    - `Metallic`
-    - `Roughness`
+    - `Interface Roughness`
     - `Opacity`
     - `Glass IOR`
   - `Interface Smoothing`
@@ -144,7 +145,7 @@ Build outputs:
   - Ensure at least one of `Show Interface` or `Show Volume` is enabled.
 - If transparent objects look too dark:
   - Increase `Bounces`.
-  - Reduce extreme `Metallic`.
+  - Increase `Opacity` slightly for interface highlights.
 - If performance is slow:
   - Reduce `Samples`.
   - Reduce viewport size.
@@ -154,6 +155,7 @@ Build outputs:
 
 - `src/main.cpp`: application loop, UI, OptiX host code, mesh extraction
 - `src/shaders.cu`: OptiX device programs
+- `src/fluid_shading.cuh`: dedicated fluid closest-hit and volume shading code
 - `src/optix_params.h`: shared host/device structs
 - `assets/`: UI fonts
 - `lib/`: submodules (SDL, ImGui, ImGuiFileDialog, Viskores)

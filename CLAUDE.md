@@ -42,7 +42,10 @@ Stack:
   - OptiX host setup, SBT/GAS updates, launch
 - `src/shaders.cu`
   - `__raygen__rg`, `__miss__radiance`, `__miss__shadow`
-  - `__closesthit__ch` (mesh), `__closesthit__ground`
+  - `__closesthit__ch` (mask), `__closesthit__ground`
+- `src/fluid_shading.cuh`
+  - `__closesthit__fluid`
+  - Fluid-only volume/refraction helpers
 - `src/optix_params.h`
   - Shared launch and SBT structs (`Params`, `MissData`, `HitGroupData`)
 - `src/config.hpp`
@@ -89,8 +92,8 @@ Stack:
 2. Convert density and mask fields to point scalar arrays.
 3. Build masked density:
    - keep density where `mask == fluid_flag`
-   - set non-fluid points below threshold so contour ignores them
-4. Contour masked density at `Density Threshold` to get fluid interface surface.
+   - keep only values in [`Density Threshold Min`, `Density Threshold Max`]
+4. Contour the in-range occupancy at `0.5` to get fluid interface surface.
 5. Build normalized masked volume density and upload as a 3D CUDA texture.
    - normalization uses density range over all points matching `fluid_flag`
 6. Rebuild mesh/GAS with fluid-specific surface material controls.
@@ -153,6 +156,7 @@ When `Render:Data > Show Fluid` is enabled:
 - Marching step length is controlled by `Volume Step`.
 - `Show Volume` toggles volumetric contribution on/off at launch-param level.
 - `Show Interface` toggles surface/interface shading visibility.
+- Fluid and mask surfaces can be present in the same GAS so fluid refraction can see the mask geometry.
 
 ### Ground Plane
 
@@ -191,9 +195,10 @@ When `Render:Data > Show Fluid` is enabled:
   - `Show Interface`
   - `Show Volume`
   - `Density Field` (scalar cell fields from current dataset frame, defaulting to first `rho*` match)
-  - `Density Threshold`
+  - `Density Threshold Min`
+  - `Density Threshold Max`
   - `Fluid Flag` (default `0`)
-  - Fluid material controls (separate from mask): color/metallic/roughness/opacity/`Glass IOR`
+  - Fluid material controls (separate from mask): color/interface roughness/opacity/`Glass IOR`
   - `Interface Smoothing`, `Interface Smooth Strength`
   - `Volume Absorption`, `Volume Scattering`, `Volume Step`
 

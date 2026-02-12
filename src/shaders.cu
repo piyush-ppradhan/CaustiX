@@ -169,91 +169,6 @@ static __forceinline__ __device__ float3 trace_radiance(float3 origin, float3 di
   return make_float3(__uint_as_float(p0), __uint_as_float(p1), __uint_as_float(p2));
 }
 
-static __forceinline__ __device__ bool intersect_aabb(float3 ro, float3 rd, float3 bmin, float3 bmax, float& tmin,
-                                                       float& tmax) {
-  float3 inv_d = make_float3((fabsf(rd.x) > 1e-8f) ? (1.0f / rd.x) : 1e16f,
-                             (fabsf(rd.y) > 1e-8f) ? (1.0f / rd.y) : 1e16f,
-                             (fabsf(rd.z) > 1e-8f) ? (1.0f / rd.z) : 1e16f);
-
-  float tx1 = (bmin.x - ro.x) * inv_d.x;
-  float tx2 = (bmax.x - ro.x) * inv_d.x;
-  if (tx1 > tx2) {
-    float tmp = tx1;
-    tx1 = tx2;
-    tx2 = tmp;
-  }
-
-  float ty1 = (bmin.y - ro.y) * inv_d.y;
-  float ty2 = (bmax.y - ro.y) * inv_d.y;
-  if (ty1 > ty2) {
-    float tmp = ty1;
-    ty1 = ty2;
-    ty2 = tmp;
-  }
-
-  float tz1 = (bmin.z - ro.z) * inv_d.z;
-  float tz2 = (bmax.z - ro.z) * inv_d.z;
-  if (tz1 > tz2) {
-    float tmp = tz1;
-    tz1 = tz2;
-    tz2 = tmp;
-  }
-
-  tmin = fmaxf(tx1, fmaxf(ty1, tz1));
-  tmax = fminf(tx2, fminf(ty2, tz2));
-  return tmax > fmaxf(tmin, 0.0f);
-}
-
-static __forceinline__ __device__ float sample_fluid_density(float3 p) {
-  if (!params.fluid_volume_enabled || params.fluid_density_tex == 0) return 0.0f;
-
-  float3 lo = params.fluid_bounds_lo;
-  float3 hi = params.fluid_bounds_hi;
-  float3 extent = make_float3(hi.x - lo.x, hi.y - lo.y, hi.z - lo.z);
-  if (extent.x <= 1e-8f || extent.y <= 1e-8f || extent.z <= 1e-8f) return 0.0f;
-
-  float u = clampf((p.x - lo.x) / extent.x, 0.0f, 1.0f);
-  float v = clampf((p.y - lo.y) / extent.y, 0.0f, 1.0f);
-  float w = clampf((p.z - lo.z) / extent.z, 0.0f, 1.0f);
-
-  return tex3D<float>(params.fluid_density_tex, u, v, w);
-}
-
-static __forceinline__ __device__ float3 apply_fluid_volume(float3 origin, float3 dir, const HitGroupData* data,
-                                                             float3 trans_color) {
-  if (!params.fluid_volume_enabled || params.fluid_density_tex == 0 || !data || data->is_ground) {
-    return trans_color;
-  }
-
-  float t0 = 0.0f;
-  float t1 = 0.0f;
-  if (!intersect_aabb(origin, dir, params.fluid_bounds_lo, params.fluid_bounds_hi, t0, t1)) {
-    return trans_color;
-  }
-
-  float step = fmaxf(params.fluid_step_size, 1e-4f);
-  float3 sigma = (make_float3(1.0f, 1.0f, 1.0f) - data->base_color * 0.7f) * params.fluid_absorption_strength;
-  sigma.x = fmaxf(sigma.x, 1e-4f);
-  sigma.y = fmaxf(sigma.y, 1e-4f);
-  sigma.z = fmaxf(sigma.z, 1e-4f);
-
-  float3 optical = make_float3(0.0f, 0.0f, 0.0f);
-  float t = fmaxf(t0, 0.0f) + step * 0.5f;
-  while (t < t1) {
-    float3 p = origin + dir * t;
-    float dens = sample_fluid_density(p);
-    optical.x += sigma.x * dens * step;
-    optical.y += sigma.y * dens * step;
-    optical.z += sigma.z * dens * step;
-    t += step;
-  }
-
-  float3 trans = make_float3(expf(-optical.x), expf(-optical.y), expf(-optical.z));
-  float scattering = clampf(params.fluid_volume_scattering, 0.0f, 1.0f);
-  float3 single_scatter = data->base_color * (make_float3(1.0f, 1.0f, 1.0f) - trans) * scattering;
-  return trans_color * trans + single_scatter;
-}
-
 // --- Ray generation ---
 
 // Simple hash-based pseudo-random for sub-pixel jitter
@@ -309,6 +224,8 @@ extern "C" __global__ void __miss__shadow() {
   optixSetPayload_0(__float_as_uint(1.0f));
 }
 
+#include "fluid_shading.cuh"
+
 // --- Closest hit: mesh ---
 
 extern "C" __global__ void __closesthit__ch() {
@@ -353,18 +270,6 @@ extern "C" __global__ void __closesthit__ch() {
   float3 color = surface_color * opacity;
   unsigned int depth = optixGetPayload_3();
 
-  // Volume-only mode: keep the fluid mesh as an entry shell but do not render
-  // interface highlights/reflections.
-  if (!data->interface_visible) {
-    float3 trans_color = make_float3(0.0f, 0.0f, 0.0f);
-    if (depth < params.max_depth) {
-      trans_color = trace_radiance(hit_pos - N * 0.01f, ray_dir, depth + 1);
-      trans_color = apply_fluid_volume(hit_pos - N * 0.01f, ray_dir, data, trans_color);
-    }
-    setPayload(trans_color);
-    return;
-  }
-
   // Glass-like transmission/reflection blend.
   // Apply on secondary hits too (up to max_depth) so refracted rays can exit
   // closed surfaces instead of turning into a black interior silhouette.
@@ -380,7 +285,6 @@ extern "C" __global__ void __closesthit__ch() {
     float3 trans_color = refl_color;
     if (refract_dir(ray_dir, N_geom, kIOR, refr_dir)) {
       trans_color = trace_radiance(hit_pos - N * 0.01f, refr_dir, depth + 1);
-      trans_color = apply_fluid_volume(hit_pos - N * 0.01f, refr_dir, data, trans_color);
     }
 
     float3 tint = make_float3(1.0f, 1.0f, 1.0f) * 0.75f + data->base_color * 0.25f;

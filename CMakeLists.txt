@@ -131,6 +131,7 @@ endif()
 
 # Compile shaders.cu -> shaders.ptx via nvcc
 set(SHADER_SRC ${CMAKE_SOURCE_DIR}/src/shaders.cu)
+set(FLUID_SHADER_INCLUDE ${CMAKE_SOURCE_DIR}/src/fluid_shading.cuh)
 set(SHADER_PTX ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/shaders.ptx)
 add_custom_command(
 	OUTPUT ${SHADER_PTX}
@@ -140,7 +141,7 @@ add_custom_command(
 		--gpu-architecture=compute_${CAUSTIX_CUDA_ARCH}
 		-o "${SHADER_PTX}"
 		"${SHADER_SRC}"
-	DEPENDS ${SHADER_SRC} ${CMAKE_SOURCE_DIR}/src/optix_params.h
+	DEPENDS ${SHADER_SRC} ${FLUID_SHADER_INCLUDE} ${CMAKE_SOURCE_DIR}/src/optix_params.h
 	COMMENT "Compiling OptiX shaders to PTX"
 	VERBATIM
 )
