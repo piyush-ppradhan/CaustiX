@@ -14,6 +14,8 @@ It extracts and ray-traces isosurfaces from scalar fields, with an optional hybr
   - Volume: masked density ray-marched on refracted rays
   - Independent toggles for surface interface and volumetric pass
   - Dedicated fluid material controls (separate from mask material)
+  - Dedicated fluid interface smoothing controls
+  - Physically-inspired volume controls (absorption + scattering + step size)
   - Density field list is scalar cell fields from the active dataset frame, with default selected from first sequence file (`rho*`, case-insensitive)
 - Shadow toggle and global directional light controls
 - Ground plane with material and offset controls
@@ -62,11 +64,11 @@ Build outputs:
    - enable `Show Fluid`
    - select `Density Field` (default comes from first dataset file: first scalar cell field containing `rho`, case-insensitive)
    - set `Density Threshold`
-   - set `Liquid Flag` (default `0`)
+   - set `Fluid Flag` (default `0`)
    - choose `Show Interface` and/or `Show Volume`
    - tune fluid material (`Color`, `Metallic`, `Roughness`, `Opacity`, `Glass IOR`)
 5. Use `Begin/Prev/Next/End` in `Render > Dataset` to pick the frame used by fluid rendering.
-6. Tune smoothing and fluid volume controls (`Volume Absorption`, `Volume Mix`, `Volume Step`).
+6. Tune fluid interface smoothing (`Interface Smoothing`, `Interface Smooth Strength`) and volume controls (`Volume Absorption`, `Volume Scattering`, `Volume Step`).
 
 ## Controls
 
@@ -105,15 +107,17 @@ Build outputs:
   - `Show Volume`
   - `Density Field` (scalar cell fields from current dataset frame; default picked from first dataset file by `rho*` match)
   - `Density Threshold`
-  - `Liquid Flag` (default `0`)
+  - `Fluid Flag` (default `0`)
   - Fluid material:
     - `Color`
     - `Metallic`
     - `Roughness`
     - `Opacity`
     - `Glass IOR`
+  - `Interface Smoothing`
+  - `Interface Smooth Strength`
   - `Volume Absorption`
-  - `Volume Mix`
+  - `Volume Scattering`
   - `Volume Step`
 
 ## Notes on Glass Rendering

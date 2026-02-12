@@ -183,8 +183,8 @@ struct FluidState {
   int prev_density_field_index = 0;
   float density_threshold = 0.5f;
   float prev_density_threshold = density_threshold;
-  int liquid_flag = 0;
-  int prev_liquid_flag = 0;
+  int fluid_flag = 0;
+  int prev_fluid_flag = 0;
   ImVec4 color = ImVec4(0.8f, 0.9f, 1.0f, 1.0f);
   ImVec4 prev_color = color;
   float metallic = 0.0f;
@@ -195,16 +195,20 @@ struct FluidState {
   float prev_opacity = opacity;
   float glass_ior = 1.33f;
   float prev_glass_ior = glass_ior;
-  float volume_absorption = 4.0f;
+  int interface_smooth_iterations = 8;
+  int prev_interface_smooth_iterations = interface_smooth_iterations;
+  float interface_smooth_strength = 0.2f;
+  float prev_interface_smooth_strength = interface_smooth_strength;
+  float volume_absorption = 8.0f;
   float prev_volume_absorption = volume_absorption;
-  float volume_mix = 0.15f;
-  float prev_volume_mix = volume_mix;
-  float volume_step = 0.01f;
+  float volume_scattering = 0.35f;
+  float prev_volume_scattering = volume_scattering;
+  float volume_step = 0.004f;
   float prev_volume_step = volume_step;
   bool suppress_retry_after_error = false;
   std::string failed_source_file;
   int failed_density_field_index = -1;
-  int failed_liquid_flag = 0;
+  int failed_fluid_flag = 0;
   float failed_density_threshold = 0.0f;
 };
 
@@ -1123,7 +1127,7 @@ static void extract_mesh(const std::string& mask_filepath, const std::string& fi
 
 static void extract_fluid_mesh(const std::string& density_filepath, const std::string& density_field_name,
                                float density_threshold, const std::string& mask_filepath,
-                               const std::string& mask_field_name, int liquid_flag, MeshCache& mesh_cache,
+                               const std::string& mask_field_name, int fluid_flag, MeshCache& mesh_cache,
                                OptixState& state, float base_r, float base_g, float base_b, float metallic,
                                float roughness, float opacity, float ior, bool interface_visible, const float3& light_dir,
                                float light_r, float light_g, float light_b, float light_strength, BBox& bbox,
@@ -1194,38 +1198,36 @@ static void extract_fluid_mesh(const std::string& density_filepath, const std::s
   auto density_portal = density_array.ReadPortal();
   auto mask_portal = mask_array.ReadPortal();
 
-  float min_liquid_density = std::numeric_limits<float>::max();
-  float max_liquid_density = std::numeric_limits<float>::lowest();
-  bool found_liquid = false;
+  float min_fluid_density = std::numeric_limits<float>::max();
+  float max_fluid_density = std::numeric_limits<float>::lowest();
+  bool found_fluid = false;
   for (viskores::Id i = 0; i < num_points; i++) {
     int mask_value = static_cast<int>(std::llround(mask_portal.Get(i)));
-    if (mask_value == liquid_flag) {
+    if (mask_value == fluid_flag) {
       float d = density_portal.Get(i);
-      min_liquid_density = std::min(min_liquid_density, d);
-      max_liquid_density = std::max(max_liquid_density, d);
-      found_liquid = true;
+      min_fluid_density = std::min(min_fluid_density, d);
+      max_fluid_density = std::max(max_fluid_density, d);
+      found_fluid = true;
     }
   }
-  if (!found_liquid) {
-    throw std::runtime_error("No points match the selected liquid flag in the mask field.");
+  if (!found_fluid) {
+    throw std::runtime_error("No points match the selected fluid flag in the mask field.");
   }
 
-  float outside_density = std::min(min_liquid_density, density_threshold) -
-                          std::max(1.0f, std::fabs(min_liquid_density) * 0.1f + 1e-3f);
-  float normalize_denom = std::max(1e-6f, max_liquid_density - density_threshold);
+  float outside_density = std::min(min_fluid_density, density_threshold) -
+                          std::max(1.0f, std::fabs(min_fluid_density) * 0.1f + 1e-3f);
+  float normalize_denom = std::max(1e-6f, max_fluid_density - min_fluid_density);
 
   std::vector<float> filtered_density(static_cast<size_t>(num_points), outside_density);
   std::vector<float> volume_density(static_cast<size_t>(num_points), 0.0f);
 
   for (viskores::Id i = 0; i < num_points; i++) {
     int mask_value = static_cast<int>(std::llround(mask_portal.Get(i)));
-    if (mask_value == liquid_flag) {
+    if (mask_value == fluid_flag) {
       float d = density_portal.Get(i);
       filtered_density[static_cast<size_t>(i)] = d;
-      if (d > density_threshold) {
-        float nd = (d - density_threshold) / normalize_denom;
-        volume_density[static_cast<size_t>(i)] = std::min(1.0f, std::max(0.0f, nd));
-      }
+      float nd = (d - min_fluid_density) / normalize_denom;
+      volume_density[static_cast<size_t>(i)] = std::min(1.0f, std::max(0.0f, nd));
     }
   }
 
@@ -1341,7 +1343,7 @@ static void extract_fluid_mesh(const std::string& density_filepath, const std::s
 
   mesh_cache.source_file = density_filepath;
   mesh_cache.source_field = density_field_name;
-  mesh_cache.source_solid_flag = liquid_flag;
+  mesh_cache.source_solid_flag = fluid_flag;
   mesh_cache.base_positions = std::move(positions);
   mesh_cache.base_normals = std::move(normal_data);
   mesh_cache.indices = std::move(indices);
@@ -1496,8 +1498,8 @@ int main(int argc, char* argv[]) {
   int& prev_fluid_density_field_index = fluid.prev_density_field_index;
   float& fluid_density_threshold = fluid.density_threshold;
   float& prev_fluid_density_threshold = fluid.prev_density_threshold;
-  int& fluid_liquid_flag = fluid.liquid_flag;
-  int& prev_fluid_liquid_flag = fluid.prev_liquid_flag;
+  int& fluid_flag = fluid.fluid_flag;
+  int& prev_fluid_flag = fluid.prev_fluid_flag;
   ImVec4& fluid_color = fluid.color;
   ImVec4& prev_fluid_color = fluid.prev_color;
   float& fluid_metallic = fluid.metallic;
@@ -1508,16 +1510,20 @@ int main(int argc, char* argv[]) {
   float& prev_fluid_opacity = fluid.prev_opacity;
   float& fluid_glass_ior = fluid.glass_ior;
   float& prev_fluid_glass_ior = fluid.prev_glass_ior;
+  int& fluid_interface_smooth_iterations = fluid.interface_smooth_iterations;
+  int& prev_fluid_interface_smooth_iterations = fluid.prev_interface_smooth_iterations;
+  float& fluid_interface_smooth_strength = fluid.interface_smooth_strength;
+  float& prev_fluid_interface_smooth_strength = fluid.prev_interface_smooth_strength;
   float& fluid_volume_absorption = fluid.volume_absorption;
   float& prev_fluid_volume_absorption = fluid.prev_volume_absorption;
-  float& fluid_volume_mix = fluid.volume_mix;
-  float& prev_fluid_volume_mix = fluid.prev_volume_mix;
+  float& fluid_volume_scattering = fluid.volume_scattering;
+  float& prev_fluid_volume_scattering = fluid.prev_volume_scattering;
   float& fluid_volume_step = fluid.volume_step;
   float& prev_fluid_volume_step = fluid.prev_volume_step;
   bool& suppress_fluid_retry_after_error = fluid.suppress_retry_after_error;
   std::string& failed_fluid_source_file = fluid.failed_source_file;
   int& failed_fluid_density_field_index = fluid.failed_density_field_index;
-  int& failed_fluid_liquid_flag = fluid.failed_liquid_flag;
+  int& failed_fluid_flag = fluid.failed_fluid_flag;
   float& failed_fluid_density_threshold = fluid.failed_density_threshold;
 
   bool& show_outlines = misc.show_outlines;
@@ -1712,7 +1718,7 @@ int main(int argc, char* argv[]) {
       suppress_fluid_retry_after_error = false;
       failed_fluid_source_file.clear();
       failed_fluid_density_field_index = -1;
-      failed_fluid_liquid_flag = 0;
+      failed_fluid_flag = 0;
       failed_fluid_density_threshold = 0.0f;
     }
     if (!vtk_files.empty()) {
@@ -1806,7 +1812,7 @@ int main(int argc, char* argv[]) {
         suppress_fluid_retry_after_error = false;
         failed_fluid_source_file.clear();
         failed_fluid_density_field_index = -1;
-        failed_fluid_liquid_flag = 0;
+        failed_fluid_flag = 0;
         failed_fluid_density_threshold = 0.0f;
         clear_fluid_volume(optix_state);
       }
@@ -1900,10 +1906,10 @@ int main(int argc, char* argv[]) {
             ImGui::SetNextItemWidth(-1);
             ImGui::DragFloat("##fluid_density_threshold", &fluid_density_threshold, 0.01f);
 
-            ImGui::Text("Liquid Flag");
+            ImGui::Text("Fluid Flag");
             ImGui::SameLine();
             ImGui::SetNextItemWidth(100.0f);
-            ImGui::InputInt("##fluid_liquid_flag", &fluid_liquid_flag);
+            ImGui::InputInt("##fluid_flag", &fluid_flag);
 
             ImGui::Text("Color");
             ImGui::ColorEdit3("##fluid_color", (float*)&fluid_color);
@@ -1924,15 +1930,24 @@ int main(int argc, char* argv[]) {
             ImGui::SetNextItemWidth(-1);
             ImGui::SliderFloat("##fluid_ior", &fluid_glass_ior, 1.0f, 2.5f);
 
+            ImGui::Text("Interface Smoothing");
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(-1);
+            ImGui::SliderInt("##fluid_interface_smooth_iters", &fluid_interface_smooth_iterations, 0, 50);
+            ImGui::Text("Interface Smooth Strength");
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(-1);
+            ImGui::SliderFloat("##fluid_interface_smooth_strength", &fluid_interface_smooth_strength, 0.0f, 1.0f);
+
             ImGui::Text("Volume Absorption");
             ImGui::SameLine();
             ImGui::SetNextItemWidth(-1);
             ImGui::SliderFloat("##fluid_volume_absorption", &fluid_volume_absorption, 0.0f, 20.0f);
 
-            ImGui::Text("Volume Mix");
+            ImGui::Text("Volume Scattering");
             ImGui::SameLine();
             ImGui::SetNextItemWidth(-1);
-            ImGui::SliderFloat("##fluid_volume_mix", &fluid_volume_mix, 0.0f, 1.0f);
+            ImGui::SliderFloat("##fluid_volume_scattering", &fluid_volume_scattering, 0.0f, 1.0f);
 
             ImGui::Text("Volume Step");
             ImGui::SameLine();
@@ -2006,7 +2021,7 @@ int main(int argc, char* argv[]) {
         suppress_fluid_retry_after_error = false;
         failed_fluid_source_file.clear();
         failed_fluid_density_field_index = -1;
-        failed_fluid_liquid_flag = 0;
+        failed_fluid_flag = 0;
         failed_fluid_density_threshold = 0.0f;
         if (!vtk_files.empty()) {
           try {
@@ -2129,7 +2144,7 @@ int main(int argc, char* argv[]) {
 
     // Detect mesh extraction triggers (full rebuild) vs smoothing-only cache rebuild.
     bool mask_selection_changed = show_mask && (mask_field_index != prev_mask_field_index || solid_flag != prev_solid_flag);
-    bool smooth_changed =
+    bool mask_smooth_changed =
         (smooth_iterations != prev_smooth_iterations) || (std::fabs(smooth_strength - prev_smooth_strength) > 1e-4f);
     bool transform_changed = (std::fabs(rotate_x_deg - prev_rotate_x_deg) > 1e-4f) ||
                              (std::fabs(rotate_y_deg - prev_rotate_y_deg) > 1e-4f) ||
@@ -2159,7 +2174,7 @@ int main(int argc, char* argv[]) {
     }
     bool fluid_same_failed_request =
         render_fluid && suppress_fluid_retry_after_error && failed_fluid_source_file == fluid_source_file &&
-        failed_fluid_density_field_index == fluid_density_field_index && failed_fluid_liquid_flag == fluid_liquid_flag &&
+        failed_fluid_density_field_index == fluid_density_field_index && failed_fluid_flag == fluid_flag &&
         std::fabs(failed_fluid_density_threshold - fluid_density_threshold) <= 1e-5f;
     if (render_fluid && suppress_fluid_retry_after_error && !fluid_same_failed_request) {
       suppress_fluid_retry_after_error = false;
@@ -2168,14 +2183,17 @@ int main(int argc, char* argv[]) {
 
     bool fluid_selection_changed = render_fluid &&
                                    (fluid_density_field_index != prev_fluid_density_field_index ||
-                                    fluid_liquid_flag != prev_fluid_liquid_flag ||
+                                    fluid_flag != prev_fluid_flag ||
                                     std::fabs(fluid_density_threshold - prev_fluid_density_threshold) > 1e-5f ||
                                     show_fluid != prev_show_fluid);
+    bool fluid_interface_smooth_changed =
+        render_fluid && ((fluid_interface_smooth_iterations != prev_fluid_interface_smooth_iterations) ||
+                         (std::fabs(fluid_interface_smooth_strength - prev_fluid_interface_smooth_strength) > 1e-4f));
     bool fluid_mode_changed = render_fluid && (fluid_show_interface != prev_fluid_show_interface ||
                                                fluid_show_volume != prev_fluid_show_volume);
     bool fluid_volume_param_changed = render_fluid &&
                                       (std::fabs(fluid_volume_absorption - prev_fluid_volume_absorption) > 1e-5f ||
-                                       std::fabs(fluid_volume_mix - prev_fluid_volume_mix) > 1e-5f ||
+                                       std::fabs(fluid_volume_scattering - prev_fluid_volume_scattering) > 1e-5f ||
                                        std::fabs(fluid_volume_step - prev_fluid_volume_step) > 1e-6f ||
                                        fluid_mode_changed);
 
@@ -2183,7 +2201,7 @@ int main(int argc, char* argv[]) {
     if (render_fluid) {
       cache_matches_selection = mesh_cache.valid && mesh_cache.source_file == fluid_source_file &&
                                 mesh_cache.source_field == selected_density_field &&
-                                mesh_cache.source_solid_flag == fluid_liquid_flag;
+                                mesh_cache.source_solid_flag == fluid_flag;
     } else if (render_mask) {
       cache_matches_selection = mesh_cache.valid && mesh_cache.source_file == mask_file &&
                                 mesh_cache.source_field == selected_mask_field &&
@@ -2193,8 +2211,9 @@ int main(int argc, char* argv[]) {
     bool needs_extract =
         render_any && ((render_fluid && !fluid_same_failed_request && (fluid_selection_changed || !cache_matches_selection)) ||
                        (render_mask && (mask_selection_changed || !cache_matches_selection)));
+    bool active_smooth_changed = render_fluid ? fluid_interface_smooth_changed : mask_smooth_changed;
     bool needs_mesh_rebuild_from_cache =
-        render_any && !needs_extract && mesh_cache.valid && (smooth_changed || transform_changed || !mesh_loaded);
+        render_any && !needs_extract && mesh_cache.valid && (active_smooth_changed || transform_changed || !mesh_loaded);
     bool needs_full_rebuild = needs_extract || needs_mesh_rebuild_from_cache;
     bool needs_gas_rebuild = render_any && mesh_loaded && !needs_full_rebuild && (ground_toggled || ground_offset_changed);
 
@@ -2206,7 +2225,9 @@ int main(int argc, char* argv[]) {
     prev_solid_flag = solid_flag;
     prev_fluid_density_field_index = fluid_density_field_index;
     prev_fluid_density_threshold = fluid_density_threshold;
-    prev_fluid_liquid_flag = fluid_liquid_flag;
+    prev_fluid_flag = fluid_flag;
+    prev_fluid_interface_smooth_iterations = fluid_interface_smooth_iterations;
+    prev_fluid_interface_smooth_strength = fluid_interface_smooth_strength;
     prev_smooth_iterations = smooth_iterations;
     prev_smooth_strength = smooth_strength;
     prev_rotate_x_deg = rotate_x_deg;
@@ -2220,12 +2241,12 @@ int main(int argc, char* argv[]) {
         BBox bbox;
         if (render_fluid) {
           extract_fluid_mesh(fluid_source_file, selected_density_field, fluid_density_threshold, mask_file,
-                             selected_mask_field, fluid_liquid_flag, mesh_cache, optix_state, fluid_color.x, fluid_color.y,
+                             selected_mask_field, fluid_flag, mesh_cache, optix_state, fluid_color.x, fluid_color.y,
                              fluid_color.z, fluid_metallic, fluid_roughness, fluid_opacity, fluid_glass_ior,
                              fluid_show_interface, light_dir, light_color.x, light_color.y, light_color.z, light_strength,
-                             bbox, smooth_iterations, smooth_strength, rotate_x_deg, rotate_y_deg, rotate_z_deg,
-                             ground_enabled, ground_color, ground_metallic, ground_roughness, ground_opacity,
-                             ground_y_offset);
+                             bbox, fluid_interface_smooth_iterations, fluid_interface_smooth_strength, rotate_x_deg,
+                             rotate_y_deg, rotate_z_deg, ground_enabled, ground_color, ground_metallic, ground_roughness,
+                             ground_opacity, ground_y_offset);
           suppress_fluid_retry_after_error = false;
         } else {
           clear_fluid_volume(optix_state);
@@ -2278,7 +2299,7 @@ int main(int argc, char* argv[]) {
           suppress_fluid_retry_after_error = true;
           failed_fluid_source_file = fluid_source_file;
           failed_fluid_density_field_index = fluid_density_field_index;
-          failed_fluid_liquid_flag = fluid_liquid_flag;
+          failed_fluid_flag = fluid_flag;
           failed_fluid_density_threshold = fluid_density_threshold;
         }
         clear_fluid_volume(optix_state);
@@ -2291,7 +2312,7 @@ int main(int argc, char* argv[]) {
           suppress_fluid_retry_after_error = true;
           failed_fluid_source_file = fluid_source_file;
           failed_fluid_density_field_index = fluid_density_field_index;
-          failed_fluid_liquid_flag = fluid_liquid_flag;
+          failed_fluid_flag = fluid_flag;
           failed_fluid_density_threshold = fluid_density_threshold;
         }
         clear_fluid_volume(optix_state);
@@ -2304,9 +2325,10 @@ int main(int argc, char* argv[]) {
         if (render_fluid) {
           rebuild_mesh_from_cache(mesh_cache, optix_state, fluid_color.x, fluid_color.y, fluid_color.z, fluid_metallic,
                                   fluid_roughness, fluid_opacity, fluid_glass_ior, fluid_show_interface, light_dir,
-                                  light_color.x, light_color.y, light_color.z, light_strength, bbox, smooth_iterations,
-                                  smooth_strength, rotate_x_deg, rotate_y_deg, rotate_z_deg, ground_enabled, ground_color,
-                                  ground_metallic, ground_roughness, ground_opacity, ground_y_offset);
+                                  light_color.x, light_color.y, light_color.z, light_strength, bbox,
+                                  fluid_interface_smooth_iterations, fluid_interface_smooth_strength, rotate_x_deg,
+                                  rotate_y_deg, rotate_z_deg, ground_enabled, ground_color, ground_metallic,
+                                  ground_roughness, ground_opacity, ground_y_offset);
         } else {
           rebuild_mesh_from_cache(mesh_cache, optix_state, mask_color.x, mask_color.y, mask_color.z, mask_metallic,
                                   mask_roughness, mask_opacity, mask_glass_ior, true, light_dir, light_color.x,
@@ -2434,7 +2456,7 @@ int main(int argc, char* argv[]) {
       viewport_needs_render = true;
     }
     prev_fluid_volume_step = fluid_volume_step;
-    prev_fluid_volume_mix = fluid_volume_mix;
+    prev_fluid_volume_scattering = fluid_volume_scattering;
     prev_fluid_volume_absorption = fluid_volume_absorption;
 
     // Viewport window
@@ -2593,7 +2615,7 @@ int main(int argc, char* argv[]) {
         launch_params.fluid_bounds_lo = optix_state.fluid_bounds_lo;
         launch_params.fluid_bounds_hi = optix_state.fluid_bounds_hi;
         launch_params.fluid_absorption_strength = fluid_volume_absorption;
-        launch_params.fluid_volume_mix = fluid_volume_mix;
+        launch_params.fluid_volume_scattering = fluid_volume_scattering;
         launch_params.fluid_step_size = fluid_volume_step;
 
         CUDA_CHECK(cudaMemcpy(reinterpret_cast<void*>(optix_state.d_params), &launch_params, sizeof(Params),

@@ -249,9 +249,9 @@ static __forceinline__ __device__ float3 apply_fluid_volume(float3 origin, float
   }
 
   float3 trans = make_float3(expf(-optical.x), expf(-optical.y), expf(-optical.z));
-  float mix_amount = clampf(params.fluid_volume_mix, 0.0f, 1.0f);
-  float3 volume_tint = data->base_color * (make_float3(1.0f, 1.0f, 1.0f) - trans);
-  return trans_color * trans + volume_tint * mix_amount;
+  float scattering = clampf(params.fluid_volume_scattering, 0.0f, 1.0f);
+  float3 single_scatter = data->base_color * (make_float3(1.0f, 1.0f, 1.0f) - trans) * scattering;
+  return trans_color * trans + single_scatter;
 }
 
 // --- Ray generation ---

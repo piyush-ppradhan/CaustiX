@@ -20,7 +20,7 @@ struct Params {
   float3 fluid_bounds_lo;
   float3 fluid_bounds_hi;
   float fluid_absorption_strength;
-  float fluid_volume_mix;
+  float fluid_volume_scattering;
   float fluid_step_size;
 };
 

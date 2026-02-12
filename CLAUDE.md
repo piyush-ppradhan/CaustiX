@@ -88,10 +88,11 @@ Stack:
    - Default field name is chosen from the first dataset file in the sequence: first scalar cell field whose name contains `rho` (case-insensitive), fallback first scalar cell field.
 2. Convert density and mask fields to point scalar arrays.
 3. Build masked density:
-   - keep density where `mask == liquid_flag`
-   - set non-liquid points below threshold so contour ignores them
-4. Contour masked density at `Density Threshold` to get liquid surface.
+   - keep density where `mask == fluid_flag`
+   - set non-fluid points below threshold so contour ignores them
+4. Contour masked density at `Density Threshold` to get fluid interface surface.
 5. Build normalized masked volume density and upload as a 3D CUDA texture.
+   - normalization uses density range over all points matching `fluid_flag`
 6. Rebuild mesh/GAS with fluid-specific surface material controls.
 
 ## OptiX Pipeline + SBT
@@ -148,7 +149,7 @@ Mesh shading in `__closesthit__ch` uses:
 When `Render:Data > Show Fluid` is enabled:
 - Refracted rays sample a masked 3D density texture (`cudaTextureObject_t`) inside fluid bounds.
 - Beer-Lambert attenuation uses `Volume Absorption`.
-- A soft in-scatter tint uses `Volume Mix`.
+- A soft in-scatter tint uses `Volume Scattering`.
 - Marching step length is controlled by `Volume Step`.
 - `Show Volume` toggles volumetric contribution on/off at launch-param level.
 - `Show Interface` toggles surface/interface shading visibility.
@@ -191,9 +192,10 @@ When `Render:Data > Show Fluid` is enabled:
   - `Show Volume`
   - `Density Field` (scalar cell fields from current dataset frame, defaulting to first `rho*` match)
   - `Density Threshold`
-  - `Liquid Flag` (default `0`)
+  - `Fluid Flag` (default `0`)
   - Fluid material controls (separate from mask): color/metallic/roughness/opacity/`Glass IOR`
-  - `Volume Absorption`, `Volume Mix`, `Volume Step`
+  - `Interface Smoothing`, `Interface Smooth Strength`
+  - `Volume Absorption`, `Volume Scattering`, `Volume Step`
 
 ## Rebuild/Update Strategy
 
@@ -201,7 +203,8 @@ When `Render:Data > Show Fluid` is enabled:
   - mask show/field/solid flag changes
   - smoothing iteration/strength changes
   - geometry rotation changes (X/Y/Z)
-  - fluid interface/volume mode, field/threshold/liquid-flag/source-file changes
+  - fluid interface/volume mode, field/threshold/fluid-flag/source-file changes
+  - fluid interface smoothing iteration/strength changes
 - GAS-only rebuild:
   - ground enabled toggle
   - ground y offset changes
@@ -215,7 +218,7 @@ When `Render:Data > Show Fluid` is enabled:
   - camera
   - samples/bounces
   - shadow toggle
-  - fluid volume shading params (`Volume Absorption`, `Volume Mix`, `Volume Step`)
+  - fluid volume shading params (`Volume Absorption`, `Volume Scattering`, `Volume Step`)
 
 ## Viskores Notes
 
