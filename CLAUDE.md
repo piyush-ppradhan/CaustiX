@@ -37,7 +37,8 @@ Stack:
 - `src/main.cpp`
   - App/UI loop
   - VTK/mask loading
-  - Mesh extraction + smoothing
+  - Mesh extraction + smoothing + rotation
+  - Hybrid fluid extraction (masked density isosurface + volume texture)
   - OptiX host setup, SBT/GAS updates, launch
 - `src/shaders.cu`
   - `__raygen__rg`, `__miss__radiance`, `__miss__shadow`
@@ -53,14 +54,16 @@ Stack:
 - `LightingState`
 - `MaskState`
 - `GroundState`
+- `FluidState`
 - `DatasetState`
 - `RenderMiscState`
 - `RayTracingState`
 - `CameraState`
 - `OptixState`
 
-## Data + Mesh Pipeline (`extract_mesh`)
+## Data + Mesh Pipeline
 
+### Mask Surface (`extract_mesh`)
 1. Read mask VTK via `viskores::io::VTKDataSetReader`.
 2. Validate selected field is scalar.
 3. If field is cell-associated, convert to point field using `PointAverage`.
@@ -77,6 +80,19 @@ Stack:
    - Applied to positions and normals before upload
 10. Upload mesh buffers to GPU.
 11. Rebuild GAS and update SBT hitgroups.
+
+### Hybrid Fluid (`extract_fluid_mesh`)
+1. Read density dataset (from current `Render:Dataset` frame) and mask dataset (from `Render:Mask`).
+   - The active density file follows `Begin/Prev/Next/End` frame navigation (`vtk_files[vtk_index]`).
+   - UI density candidates are scalar cell arrays only; non-scalar cell arrays are excluded.
+   - Default field name is chosen from the first dataset file in the sequence: first scalar cell field whose name contains `rho` (case-insensitive), fallback first scalar cell field.
+2. Convert density and mask fields to point scalar arrays.
+3. Build masked density:
+   - keep density where `mask == liquid_flag`
+   - set non-liquid points below threshold so contour ignores them
+4. Contour masked density at `Density Threshold` to get liquid surface.
+5. Build normalized masked volume density and upload as a 3D CUDA texture.
+6. Rebuild mesh/GAS with fluid-specific surface material controls.
 
 ## OptiX Pipeline + SBT
 
@@ -127,6 +143,16 @@ Mesh shading in `__closesthit__ch` uses:
 - Runtime IOR from mask material (`HitGroupData.ior`, controlled by UI slider)
 - Applies on secondary hits too (`depth < params.max_depth`) to avoid black interior artifacts
 
+### Hybrid Fluid Volume
+
+When `Render:Data > Show Fluid` is enabled:
+- Refracted rays sample a masked 3D density texture (`cudaTextureObject_t`) inside fluid bounds.
+- Beer-Lambert attenuation uses `Volume Absorption`.
+- A soft in-scatter tint uses `Volume Mix`.
+- Marching step length is controlled by `Volume Step`.
+- `Show Volume` toggles volumetric contribution on/off at launch-param level.
+- `Show Interface` toggles surface/interface shading visibility.
+
 ### Ground Plane
 
 - Optional large quad under mesh (`bbox.lo.y + ground_y_offset`)
@@ -159,6 +185,15 @@ Mesh shading in `__closesthit__ch` uses:
   - Material: color/metallic/roughness/opacity
   - `Glass IOR`
   - Smoothing iterations + smooth strength
+- `Render:Data`:
+  - `Show Fluid`
+  - `Show Interface`
+  - `Show Volume`
+  - `Density Field` (scalar cell fields from current dataset frame, defaulting to first `rho*` match)
+  - `Density Threshold`
+  - `Liquid Flag` (default `0`)
+  - Fluid material controls (separate from mask): color/metallic/roughness/opacity/`Glass IOR`
+  - `Volume Absorption`, `Volume Mix`, `Volume Step`
 
 ## Rebuild/Update Strategy
 
@@ -166,11 +201,13 @@ Mesh shading in `__closesthit__ch` uses:
   - mask show/field/solid flag changes
   - smoothing iteration/strength changes
   - geometry rotation changes (X/Y/Z)
+  - fluid interface/volume mode, field/threshold/liquid-flag/source-file changes
 - GAS-only rebuild:
   - ground enabled toggle
   - ground y offset changes
 - Cheap SBT updates only:
   - mask material (including glass IOR)
+  - fluid surface material (including glass IOR/interface visibility)
   - ground material
   - global light params
   - background miss color
@@ -178,6 +215,7 @@ Mesh shading in `__closesthit__ch` uses:
   - camera
   - samples/bounces
   - shadow toggle
+  - fluid volume shading params (`Volume Absorption`, `Volume Mix`, `Volume Step`)
 
 ## Viskores Notes
 
