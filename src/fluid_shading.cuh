@@ -80,6 +80,10 @@ static __forceinline__ __device__ float3 apply_fluid_volume(float3 origin, float
   if (!params.fluid_volume_enabled || params.fluid_density_tex == 0 || !data || data->is_ground) {
     return trans_color;
   }
+  float volume_strength = clampf(data->opacity, 0.0f, 1.0f);
+  if (volume_strength <= 1e-4f) {
+    return trans_color;
+  }
   if (params.fluid_absorption_strength <= 1e-5f && params.fluid_volume_scattering <= 1e-5f) {
     return trans_color;
   }
@@ -99,8 +103,8 @@ static __forceinline__ __device__ float3 apply_fluid_volume(float3 origin, float
 
   const float3 one = make_float3(1.0f, 1.0f, 1.0f);
   const float3 base = data->base_color;
-  const float absorption = fmaxf(params.fluid_absorption_strength, 0.0f);
-  const float scattering = clampf(params.fluid_volume_scattering, 0.0f, 1.0f);
+  const float absorption = fmaxf(params.fluid_absorption_strength, 0.0f) * volume_strength;
+  const float scattering = clampf(params.fluid_volume_scattering, 0.0f, 1.0f) * volume_strength;
 
   // Colored absorption (Beer-Lambert) + scattering coefficient.
   const float3 sigma_a = (one - base * 0.7f) * absorption;
@@ -195,12 +199,15 @@ extern "C" __global__ void __closesthit__fluid() {
   if (!data->interface_visible) {
     float3 trans_color = make_float3(0.0f, 0.0f, 0.0f);
     if (depth < params.max_depth) {
-      float3 refr_dir;
-      if (refract_dir(ray_dir, N_geom, clampf(data->ior, 1.0f, 2.5f), refr_dir)) {
-        trans_color = trace_radiance(hit_pos - N * 0.01f, refr_dir, depth + 1);
-        trans_color = apply_fluid_volume(hit_pos - N * 0.01f, refr_dir, data, trans_color);
+      const bool entering = (dot(ray_dir, N_geom) < 0.0f);
+      float3 march_origin = hit_pos + ray_dir * 0.01f;
+      if (!entering) {
+        // Back-face hit while volume-only: pass through and avoid applying
+        // volume twice on the same segment.
+        trans_color = trace_radiance(march_origin, ray_dir, depth + 1);
       } else {
-        trans_color = trace_radiance(hit_pos + N * 0.01f, reflect(ray_dir, N), depth + 1);
+        trans_color = trace_radiance(march_origin, ray_dir, depth + 1);
+        trans_color = apply_fluid_volume(march_origin, ray_dir, data, trans_color);
       }
     }
     setPayload(trans_color);
