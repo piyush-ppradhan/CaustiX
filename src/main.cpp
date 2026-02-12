@@ -90,6 +90,37 @@ typedef SbtRecord<HitGroupData> HitGroupSbtRecord;
 
 struct DataLayer {
   std::string name;
+  bool show = true;
+  bool prev_show = show;
+  float threshold_min = 0.5f;
+  float prev_threshold_min = threshold_min;
+  float threshold_max = 1.0f;
+  float prev_threshold_max = threshold_max;
+  int fluid_flag = 0;
+  int prev_fluid_flag = fluid_flag;
+  ImVec4 color = ImVec4(0.8f, 0.9f, 1.0f, 1.0f);
+  ImVec4 prev_color = color;
+  float metallic = 0.0f;
+  float prev_metallic = metallic;
+  float roughness = 0.05f;
+  float prev_roughness = roughness;
+  float opacity = 1.0f;
+  float prev_opacity = opacity;
+  float glass_ior = 1.33f;
+  float prev_glass_ior = glass_ior;
+  int smooth_iterations = 8;
+  int prev_smooth_iterations = smooth_iterations;
+  float smooth_strength = 0.2f;
+  float prev_smooth_strength = smooth_strength;
+  bool prev_renderable = false;
+  bool suppress_retry_after_error = false;
+  std::string failed_source_file;
+  std::string failed_mask_file;
+  std::string failed_mask_field;
+  std::string failed_field_name;
+  int failed_fluid_flag = 0;
+  float failed_threshold_min = 0.0f;
+  float failed_threshold_max = 0.0f;
 };
 
 struct BBox {
@@ -181,39 +212,6 @@ struct GroundState {
   float prev_opacity = opacity;
 };
 
-struct FluidState {
-  bool show = false;
-  bool prev_show = false;
-  int field_index = 0;
-  int prev_field_index = 0;
-  float density_threshold_min = 0.5f;
-  float prev_density_threshold_min = density_threshold_min;
-  float density_threshold_max = 1.0f;
-  float prev_density_threshold_max = density_threshold_max;
-  int fluid_flag = 0;
-  int prev_fluid_flag = 0;
-  ImVec4 color = ImVec4(0.8f, 0.9f, 1.0f, 1.0f);
-  ImVec4 prev_color = color;
-  float metallic = 0.0f;
-  float prev_metallic = metallic;
-  float roughness = 0.05f;
-  float prev_roughness = roughness;
-  float opacity = 1.0f;
-  float prev_opacity = opacity;
-  float glass_ior = 1.33f;
-  float prev_glass_ior = glass_ior;
-  int interface_smooth_iterations = 8;
-  int prev_interface_smooth_iterations = interface_smooth_iterations;
-  float interface_smooth_strength = 0.2f;
-  float prev_interface_smooth_strength = interface_smooth_strength;
-  bool suppress_retry_after_error = false;
-  std::string failed_source_file;
-  int failed_density_field_index = -1;
-  int failed_fluid_flag = 0;
-  float failed_density_threshold_min = 0.0f;
-  float failed_density_threshold_max = 0.0f;
-};
-
 struct DatasetState {
   std::string vtk_dir;
   std::vector<std::string> vtk_files;
@@ -221,6 +219,7 @@ struct DatasetState {
   std::vector<std::string> cell_names;
   std::vector<std::string> scalar_cell_names;
   std::vector<DataLayer> layers;
+  std::vector<MeshCache> layer_mesh_caches;
   int loaded_field_vtk_index = -1;
   bool first_frame = true;
 };
@@ -268,13 +267,16 @@ struct OptixState {
   OptixProgramGroup hitgroup_mesh_pg = nullptr;
   OptixProgramGroup hitgroup_fluid_pg = nullptr;
   OptixProgramGroup hitgroup_ground_pg = nullptr;
+  OptixProgramGroup hitgroup_shadow_pg = nullptr;
   OptixShaderBindingTable sbt = {};
   CUdeviceptr d_raygen_record = 0;
   CUdeviceptr d_miss_records = 0;      // 2 miss records
-  CUdeviceptr d_hitgroup_records = 0;  // up to 6 hitgroup records (mask/fluid/ground x 2 ray types)
+  CUdeviceptr d_hitgroup_records = 0;
+  int hitgroup_record_capacity = 0;
   int hitgroup_record_count = 0;
   int mask_sbt_index = -1;
-  int fluid_sbt_index = -1;
+  std::vector<int> fluid_sbt_indices;
+  std::vector<int> fluid_layer_indices;
   int ground_sbt_index = -1;
   OptixTraversableHandle gas_handle = 0;
   CUdeviceptr d_gas_temp = 0;
@@ -282,7 +284,7 @@ struct OptixState {
   size_t gas_temp_capacity = 0;
   size_t gas_output_capacity = 0;
   GpuMeshBuffers mask_mesh;
-  GpuMeshBuffers fluid_mesh;
+  std::vector<GpuMeshBuffers> fluid_meshes;
   CUdeviceptr d_ground_vertices = 0;
   CUdeviceptr d_ground_indices = 0;
   CUdeviceptr d_image = 0;
@@ -339,7 +341,7 @@ static void init_optix(OptixState& state, const std::string& ptx_path, const ImV
   OPTIX_CHECK_LOG(optixModuleCreate(state.context, &module_options, &pipeline_options, ptx.c_str(), ptx.size(),
                                     optix_log, &optix_log_size, &state.module));
 
-  // Program groups (6 total)
+  // Program groups (7 total)
   OptixProgramGroupOptions pg_options = {};
 
   // 1. Raygen
@@ -390,14 +392,23 @@ static void init_optix(OptixState& state, const std::string& ptx_path, const ImV
   OPTIX_CHECK_LOG(optixProgramGroupCreate(state.context, &hitgroup_ground_desc, 1, &pg_options, optix_log,
                                           &optix_log_size, &state.hitgroup_ground_pg));
 
+  // 7. Hitgroup shadow (closesthit__shadow)
+  OptixProgramGroupDesc hitgroup_shadow_desc = {};
+  hitgroup_shadow_desc.kind = OPTIX_PROGRAM_GROUP_KIND_HITGROUP;
+  hitgroup_shadow_desc.hitgroup.moduleCH = state.module;
+  hitgroup_shadow_desc.hitgroup.entryFunctionNameCH = "__closesthit__shadow";
+  OPTIX_CHECK_LOG(optixProgramGroupCreate(state.context, &hitgroup_shadow_desc, 1, &pg_options, optix_log,
+                                          &optix_log_size, &state.hitgroup_shadow_pg));
+
   // Pipeline
   const uint32_t max_trace_depth = 3;
   OptixProgramGroup program_groups[] = {state.raygen_pg, state.miss_radiance_pg, state.miss_shadow_pg,
-                                        state.hitgroup_mesh_pg, state.hitgroup_fluid_pg, state.hitgroup_ground_pg};
+                                        state.hitgroup_mesh_pg, state.hitgroup_fluid_pg, state.hitgroup_ground_pg,
+                                        state.hitgroup_shadow_pg};
 
   OptixPipelineLinkOptions link_options = {};
   link_options.maxTraceDepth = max_trace_depth;
-  OPTIX_CHECK_LOG(optixPipelineCreate(state.context, &pipeline_options, &link_options, program_groups, 6, optix_log,
+  OPTIX_CHECK_LOG(optixPipelineCreate(state.context, &pipeline_options, &link_options, program_groups, 7, optix_log,
                                       &optix_log_size, &state.pipeline));
 
   // Stack sizes
@@ -430,14 +441,16 @@ static void init_optix(OptixState& state, const std::string& ptx_path, const ImV
   CUDA_CHECK(cudaMemcpy(reinterpret_cast<void*>(state.d_miss_records), miss_records, 2 * sizeof(MissSbtRecord),
                         cudaMemcpyHostToDevice));
 
-  // SBT - hitgroup (allocate max 6 records: 3 geometries x 2 ray types)
-  CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&state.d_hitgroup_records), 6 * sizeof(HitGroupSbtRecord)));
-  HitGroupSbtRecord hg_defaults[6] = {};
-  for (int i = 0; i < 6; i++) {
+  // SBT - hitgroup (start with one geometry x 2 ray types; grows on demand)
+  state.hitgroup_record_capacity = 2;
+  CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&state.d_hitgroup_records),
+                        static_cast<size_t>(state.hitgroup_record_capacity) * sizeof(HitGroupSbtRecord)));
+  HitGroupSbtRecord hg_defaults[2] = {};
+  for (int i = 0; i < 2; i++) {
     OPTIX_CHECK(optixSbtRecordPackHeader(state.hitgroup_mesh_pg, &hg_defaults[i]));
   }
-  CUDA_CHECK(cudaMemcpy(reinterpret_cast<void*>(state.d_hitgroup_records), hg_defaults, 6 * sizeof(HitGroupSbtRecord),
-                        cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(reinterpret_cast<void*>(state.d_hitgroup_records), hg_defaults,
+                        2 * sizeof(HitGroupSbtRecord), cudaMemcpyHostToDevice));
   state.hitgroup_record_count = 2;  // default: one geometry x two ray types
 
   // Assemble SBT
@@ -451,6 +464,28 @@ static void init_optix(OptixState& state, const std::string& ptx_path, const ImV
 
   // Allocate params buffer on device
   CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&state.d_params), sizeof(Params)));
+}
+
+static void ensure_hitgroup_record_capacity(OptixState& state, int geometry_count) {
+  int required_records = std::max(2, 2 * geometry_count);
+  if (required_records <= state.hitgroup_record_capacity) {
+    return;
+  }
+  if (state.d_hitgroup_records) {
+    CUDA_CHECK(cudaFree(reinterpret_cast<void*>(state.d_hitgroup_records)));
+    state.d_hitgroup_records = 0;
+  }
+  CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&state.d_hitgroup_records),
+                        static_cast<size_t>(required_records) * sizeof(HitGroupSbtRecord)));
+  std::vector<HitGroupSbtRecord> defaults(static_cast<size_t>(required_records));
+  for (int i = 0; i < required_records; i++) {
+    defaults[static_cast<size_t>(i)] = {};
+    OPTIX_CHECK(optixSbtRecordPackHeader(state.hitgroup_mesh_pg, &defaults[static_cast<size_t>(i)]));
+  }
+  CUDA_CHECK(cudaMemcpy(reinterpret_cast<void*>(state.d_hitgroup_records), defaults.data(),
+                        static_cast<size_t>(required_records) * sizeof(HitGroupSbtRecord), cudaMemcpyHostToDevice));
+  state.hitgroup_record_capacity = required_records;
+  state.sbt.hitgroupRecordBase = state.d_hitgroup_records;
 }
 
 // --- Update miss records (background color) ---
@@ -500,11 +535,11 @@ static void upload_mesh_buffers_to_gpu(const std::vector<float3>& positions, con
   mesh.num_triangles = static_cast<unsigned int>(indices.size());
 }
 
-static void write_shadow_hitgroup_record(OptixState& state, int sbt_index, OptixProgramGroup program_group) {
+static void write_shadow_hitgroup_record(OptixState& state, int sbt_index, const HitGroupData& data) {
   if (sbt_index < 0) return;
   HitGroupSbtRecord shadow_rec = {};
-  shadow_rec.data = {};
-  OPTIX_CHECK(optixSbtRecordPackHeader(program_group, &shadow_rec));
+  shadow_rec.data = data;
+  OPTIX_CHECK(optixSbtRecordPackHeader(state.hitgroup_shadow_pg, &shadow_rec));
   size_t byte_offset = static_cast<size_t>(2 * sbt_index + RAY_TYPE_SHADOW) * sizeof(HitGroupSbtRecord);
   CUDA_CHECK(cudaMemcpy(reinterpret_cast<void*>(state.d_hitgroup_records + byte_offset), &shadow_rec,
                         sizeof(HitGroupSbtRecord), cudaMemcpyHostToDevice));
@@ -536,7 +571,7 @@ static void update_surface_hitgroup_sbt(OptixState& state, int sbt_index, OptixP
   size_t byte_offset = static_cast<size_t>(2 * sbt_index + RAY_TYPE_RADIANCE) * sizeof(HitGroupSbtRecord);
   CUDA_CHECK(cudaMemcpy(reinterpret_cast<void*>(state.d_hitgroup_records + byte_offset), &hg_sbt,
                         sizeof(HitGroupSbtRecord), cudaMemcpyHostToDevice));
-  write_shadow_hitgroup_record(state, sbt_index, program_group);
+  write_shadow_hitgroup_record(state, sbt_index, hg_sbt.data);
 }
 
 static void update_ground_hitgroup_sbt(OptixState& state, int sbt_index, const ImVec4& ground_color,
@@ -564,7 +599,7 @@ static void update_ground_hitgroup_sbt(OptixState& state, int sbt_index, const I
   size_t byte_offset = static_cast<size_t>(2 * sbt_index + RAY_TYPE_RADIANCE) * sizeof(HitGroupSbtRecord);
   CUDA_CHECK(cudaMemcpy(reinterpret_cast<void*>(state.d_hitgroup_records + byte_offset), &hg_sbt,
                         sizeof(HitGroupSbtRecord), cudaMemcpyHostToDevice));
-  write_shadow_hitgroup_record(state, sbt_index, state.hitgroup_ground_pg);
+  write_shadow_hitgroup_record(state, sbt_index, hg_sbt.data);
 }
 
 // --- Laplacian surface smoothing ---
@@ -755,47 +790,20 @@ static bool load_dataset_field_lists(const std::string& vtk_file, std::vector<st
   return true;
 }
 
-static void sanitize_data_layers(std::vector<DataLayer>& layers, const std::vector<std::string>& scalar_cell_field_names,
-                                 int& field_index) {
-  layers.erase(std::remove_if(layers.begin(), layers.end(), [&](const DataLayer& layer) {
-                 return find_field_index(scalar_cell_field_names, layer.name) < 0;
-               }),
-               layers.end());
-
-  std::vector<DataLayer> deduped;
-  deduped.reserve(layers.size());
-  for (const auto& layer : layers) {
-    bool seen = false;
-    for (const auto& existing : deduped) {
-      if (existing.name == layer.name) {
-        seen = true;
-        break;
-      }
-    }
-    if (!seen) {
-      deduped.push_back(layer);
-    }
-  }
-  layers.swap(deduped);
-
-  if (layers.empty()) {
-    field_index = 0;
-    return;
-  }
-  if (field_index < 0 || field_index >= static_cast<int>(layers.size())) {
-    field_index = 0;
+static void sync_data_layer_caches(std::vector<DataLayer>& layers, std::vector<MeshCache>& layer_mesh_caches) {
+  if (layer_mesh_caches.size() < layers.size()) {
+    layer_mesh_caches.resize(layers.size());
+  } else if (layer_mesh_caches.size() > layers.size()) {
+    layer_mesh_caches.resize(layers.size());
   }
 }
 
-static void add_data_layer_if_missing(std::vector<DataLayer>& layers, const std::string& field_name, int& field_index) {
-  for (int i = 0; i < static_cast<int>(layers.size()); i++) {
-    if (layers[i].name == field_name) {
-      field_index = i;
-      return;
-    }
-  }
-  layers.push_back(DataLayer{field_name});
-  field_index = static_cast<int>(layers.size()) - 1;
+static void add_data_layer(std::vector<DataLayer>& layers, std::vector<MeshCache>& layer_mesh_caches,
+                           const std::string& field_name) {
+  DataLayer layer;
+  layer.name = field_name;
+  layers.push_back(layer);
+  layer_mesh_caches.emplace_back();
 }
 
 static BBox merge_bbox(const BBox& a, const BBox& b) {
@@ -828,9 +836,9 @@ static void build_render_mesh_from_cache(const MeshCache& mesh_cache, int smooth
 
 // --- Rebuild GAS (geometry acceleration structure) ---
 
-static void rebuild_gas(OptixState& state, const BBox& bbox, bool include_mask, bool include_fluid, bool ground_enabled,
+static void rebuild_gas(OptixState& state, const BBox& bbox, bool include_mask, int fluid_mesh_count, bool ground_enabled,
                         float ground_y_offset) {
-  if (!include_mask && !include_fluid) {
+  if (!include_mask && fluid_mesh_count <= 0) {
     throw std::runtime_error("Scene rebuild requires at least one surface geometry.");
   }
 
@@ -868,13 +876,14 @@ static void rebuild_gas(OptixState& state, const BBox& bbox, bool include_mask, 
   accel_options.buildFlags = OPTIX_BUILD_FLAG_PREFER_FAST_TRACE;
   accel_options.operation = OPTIX_BUILD_OPERATION_BUILD;
 
-  const uint32_t flags[3] = {OPTIX_GEOMETRY_FLAG_NONE, OPTIX_GEOMETRY_FLAG_NONE, OPTIX_GEOMETRY_FLAG_NONE};
-  CUdeviceptr vertex_buffers[3] = {};
-  OptixBuildInput build_inputs[3] = {};
+  int num_inputs_expected = (include_mask ? 1 : 0) + std::max(0, fluid_mesh_count) + (ground_enabled ? 1 : 0);
+  std::vector<uint32_t> flags(static_cast<size_t>(num_inputs_expected), OPTIX_GEOMETRY_FLAG_NONE);
+  std::vector<CUdeviceptr> vertex_buffers(static_cast<size_t>(num_inputs_expected), 0);
+  std::vector<OptixBuildInput> build_inputs(static_cast<size_t>(num_inputs_expected));
   int num_inputs = 0;
 
   state.mask_sbt_index = -1;
-  state.fluid_sbt_index = -1;
+  state.fluid_sbt_indices.assign(static_cast<size_t>(std::max(0, fluid_mesh_count)), -1);
   state.ground_sbt_index = -1;
 
   if (include_mask) {
@@ -887,22 +896,26 @@ static void rebuild_gas(OptixState& state, const BBox& bbox, bool include_mask, 
     build_inputs[num_inputs].triangleArray.indexFormat = OPTIX_INDICES_FORMAT_UNSIGNED_INT3;
     build_inputs[num_inputs].triangleArray.numIndexTriplets = state.mask_mesh.num_triangles;
     build_inputs[num_inputs].triangleArray.indexBuffer = state.mask_mesh.d_indices_buf;
-    build_inputs[num_inputs].triangleArray.flags = &flags[num_inputs];
+    build_inputs[num_inputs].triangleArray.flags = &flags[static_cast<size_t>(num_inputs)];
     build_inputs[num_inputs].triangleArray.numSbtRecords = 1;
     num_inputs++;
   }
 
-  if (include_fluid) {
-    state.fluid_sbt_index = num_inputs;
-    vertex_buffers[num_inputs] = state.fluid_mesh.d_vertices;
+  for (int i = 0; i < fluid_mesh_count; i++) {
+    if (i >= static_cast<int>(state.fluid_meshes.size()) || !state.fluid_meshes[static_cast<size_t>(i)].IsValid()) {
+      continue;
+    }
+    const GpuMeshBuffers& fluid_mesh = state.fluid_meshes[static_cast<size_t>(i)];
+    state.fluid_sbt_indices[static_cast<size_t>(i)] = num_inputs;
+    vertex_buffers[num_inputs] = fluid_mesh.d_vertices;
     build_inputs[num_inputs].type = OPTIX_BUILD_INPUT_TYPE_TRIANGLES;
     build_inputs[num_inputs].triangleArray.vertexFormat = OPTIX_VERTEX_FORMAT_FLOAT3;
-    build_inputs[num_inputs].triangleArray.numVertices = state.fluid_mesh.num_vertices;
+    build_inputs[num_inputs].triangleArray.numVertices = fluid_mesh.num_vertices;
     build_inputs[num_inputs].triangleArray.vertexBuffers = &vertex_buffers[num_inputs];
     build_inputs[num_inputs].triangleArray.indexFormat = OPTIX_INDICES_FORMAT_UNSIGNED_INT3;
-    build_inputs[num_inputs].triangleArray.numIndexTriplets = state.fluid_mesh.num_triangles;
-    build_inputs[num_inputs].triangleArray.indexBuffer = state.fluid_mesh.d_indices_buf;
-    build_inputs[num_inputs].triangleArray.flags = &flags[num_inputs];
+    build_inputs[num_inputs].triangleArray.numIndexTriplets = fluid_mesh.num_triangles;
+    build_inputs[num_inputs].triangleArray.indexBuffer = fluid_mesh.d_indices_buf;
+    build_inputs[num_inputs].triangleArray.flags = &flags[static_cast<size_t>(num_inputs)];
     build_inputs[num_inputs].triangleArray.numSbtRecords = 1;
     num_inputs++;
   }
@@ -917,13 +930,18 @@ static void rebuild_gas(OptixState& state, const BBox& bbox, bool include_mask, 
     build_inputs[num_inputs].triangleArray.indexFormat = OPTIX_INDICES_FORMAT_UNSIGNED_INT3;
     build_inputs[num_inputs].triangleArray.numIndexTriplets = 2;
     build_inputs[num_inputs].triangleArray.indexBuffer = state.d_ground_indices;
-    build_inputs[num_inputs].triangleArray.flags = &flags[num_inputs];
+    build_inputs[num_inputs].triangleArray.flags = &flags[static_cast<size_t>(num_inputs)];
     build_inputs[num_inputs].triangleArray.numSbtRecords = 1;
     num_inputs++;
   }
 
+  if (num_inputs <= 0) {
+    throw std::runtime_error("No valid geometry inputs available for GAS rebuild.");
+  }
+  ensure_hitgroup_record_capacity(state, num_inputs);
+
   OptixAccelBufferSizes gas_sizes;
-  OPTIX_CHECK(optixAccelComputeMemoryUsage(state.context, &accel_options, build_inputs, num_inputs, &gas_sizes));
+  OPTIX_CHECK(optixAccelComputeMemoryUsage(state.context, &accel_options, build_inputs.data(), num_inputs, &gas_sizes));
 
   if (state.gas_temp_capacity < gas_sizes.tempSizeInBytes) {
     if (state.d_gas_temp) {
@@ -942,7 +960,7 @@ static void rebuild_gas(OptixState& state, const BBox& bbox, bool include_mask, 
     state.gas_output_capacity = gas_sizes.outputSizeInBytes;
   }
 
-  OPTIX_CHECK(optixAccelBuild(state.context, 0, &accel_options, build_inputs, num_inputs, state.d_gas_temp,
+  OPTIX_CHECK(optixAccelBuild(state.context, 0, &accel_options, build_inputs.data(), num_inputs, state.d_gas_temp,
                               state.gas_temp_capacity, state.d_gas_output, state.gas_output_capacity, &state.gas_handle,
                               nullptr, 0));
 
@@ -951,19 +969,19 @@ static void rebuild_gas(OptixState& state, const BBox& bbox, bool include_mask, 
   state.sbt.hitgroupRecordCount = state.hitgroup_record_count;
 }
 
-static void rebuild_scene_from_caches(const MeshCache* mask_cache, const MeshCache* fluid_cache, OptixState& state,
+static void rebuild_scene_from_caches(const MeshCache* mask_cache, const std::vector<int>& fluid_layer_indices,
+                                      const std::vector<DataLayer>& data_layers,
+                                      const std::vector<MeshCache>& fluid_layer_caches, OptixState& state,
                                       const float3& light_dir, float light_r, float light_g, float light_b,
                                       float light_strength, bool ground_enabled, const ImVec4& ground_color,
                                       float ground_metallic, float ground_roughness, float ground_opacity,
                                       float ground_y_offset, float rotate_x_deg, float rotate_y_deg, float rotate_z_deg,
-                                      int mask_smooth_iters, float mask_smooth_lambda, int fluid_smooth_iters,
-                                      float fluid_smooth_lambda, const ImVec4& mask_color, float mask_metallic,
-                                      float mask_roughness, float mask_opacity, float mask_ior,
-                                      const ImVec4& fluid_color, float fluid_metallic, float fluid_roughness,
-                                      float fluid_opacity, float fluid_ior, BBox& bbox) {
+                                      int mask_smooth_iters, float mask_smooth_lambda, const ImVec4& mask_color,
+                                      float mask_metallic, float mask_roughness, float mask_opacity, float mask_ior,
+                                      BBox& bbox) {
   bool include_mask = (mask_cache != nullptr && mask_cache->valid);
-  bool include_fluid = (fluid_cache != nullptr && fluid_cache->valid);
-  if (!include_mask && !include_fluid) {
+  int fluid_count = static_cast<int>(fluid_layer_indices.size());
+  if (!include_mask && fluid_count <= 0) {
     throw std::runtime_error("No renderable mask/fluid mesh is available.");
   }
 
@@ -983,31 +1001,62 @@ static void rebuild_scene_from_caches(const MeshCache* mask_cache, const MeshCac
     free_gpu_mesh_buffers(state.mask_mesh);
   }
 
-  if (include_fluid) {
+  for (auto& mesh : state.fluid_meshes) {
+    free_gpu_mesh_buffers(mesh);
+  }
+  state.fluid_meshes.clear();
+  state.fluid_layer_indices.clear();
+  state.fluid_meshes.reserve(static_cast<size_t>(fluid_count));
+  state.fluid_layer_indices.reserve(static_cast<size_t>(fluid_count));
+
+  for (int layer_idx : fluid_layer_indices) {
+    if (layer_idx < 0 || layer_idx >= static_cast<int>(data_layers.size()) ||
+        layer_idx >= static_cast<int>(fluid_layer_caches.size())) {
+      continue;
+    }
+    const DataLayer& layer = data_layers[static_cast<size_t>(layer_idx)];
+    const MeshCache& cache = fluid_layer_caches[static_cast<size_t>(layer_idx)];
+    if (!cache.valid) {
+      continue;
+    }
     std::vector<float3> positions;
     std::vector<float3> normals;
     BBox fluid_bbox;
-    build_render_mesh_from_cache(*fluid_cache, fluid_smooth_iters, fluid_smooth_lambda, rotate_x_deg, rotate_y_deg,
+    build_render_mesh_from_cache(cache, layer.smooth_iterations, layer.smooth_strength, rotate_x_deg, rotate_y_deg,
                                  rotate_z_deg, positions, normals, fluid_bbox);
-    upload_mesh_buffers_to_gpu(positions, normals, fluid_cache->indices, state.fluid_mesh);
+    state.fluid_meshes.emplace_back();
+    upload_mesh_buffers_to_gpu(positions, normals, cache.indices, state.fluid_meshes.back());
+    state.fluid_layer_indices.push_back(layer_idx);
     scene_bbox = has_bbox ? merge_bbox(scene_bbox, fluid_bbox) : fluid_bbox;
     has_bbox = true;
-  } else {
-    free_gpu_mesh_buffers(state.fluid_mesh);
+  }
+
+  fluid_count = static_cast<int>(state.fluid_meshes.size());
+  if (!include_mask && fluid_count <= 0) {
+    throw std::runtime_error("No renderable mask/fluid mesh is available.");
   }
 
   bbox = scene_bbox;
-  rebuild_gas(state, bbox, include_mask, include_fluid, ground_enabled, ground_y_offset);
+  rebuild_gas(state, bbox, include_mask, fluid_count, ground_enabled, ground_y_offset);
 
   if (state.mask_sbt_index >= 0 && include_mask) {
     update_surface_hitgroup_sbt(state, state.mask_sbt_index, state.hitgroup_mesh_pg, state.mask_mesh, mask_color.x,
                                 mask_color.y, mask_color.z, mask_metallic, mask_roughness, mask_opacity, mask_ior, true,
                                 light_dir, light_r, light_g, light_b, light_strength);
   }
-  if (state.fluid_sbt_index >= 0 && include_fluid) {
-    update_surface_hitgroup_sbt(state, state.fluid_sbt_index, state.hitgroup_fluid_pg, state.fluid_mesh, fluid_color.x,
-                                fluid_color.y, fluid_color.z, fluid_metallic, fluid_roughness, fluid_opacity, fluid_ior,
-                                true, light_dir, light_r, light_g, light_b, light_strength);
+  for (size_t i = 0; i < state.fluid_meshes.size(); i++) {
+    if (i >= state.fluid_sbt_indices.size() || i >= state.fluid_layer_indices.size()) {
+      continue;
+    }
+    int sbt_index = state.fluid_sbt_indices[i];
+    int layer_idx = state.fluid_layer_indices[i];
+    if (sbt_index < 0 || layer_idx < 0 || layer_idx >= static_cast<int>(data_layers.size())) {
+      continue;
+    }
+    const DataLayer& layer = data_layers[static_cast<size_t>(layer_idx)];
+    update_surface_hitgroup_sbt(state, sbt_index, state.hitgroup_fluid_pg, state.fluid_meshes[i], layer.color.x,
+                                layer.color.y, layer.color.z, layer.metallic, layer.roughness, layer.opacity,
+                                layer.glass_ior, true, light_dir, light_r, light_g, light_b, light_strength);
   }
   if (state.ground_sbt_index >= 0 && ground_enabled) {
     update_ground_hitgroup_sbt(state, state.ground_sbt_index, ground_color, ground_metallic, ground_roughness,
@@ -1020,17 +1069,26 @@ static void update_scene_material_sbt(OptixState& state, const float3& light_dir
                                       const ImVec4& ground_color, float ground_metallic, float ground_roughness,
                                       float ground_opacity, const ImVec4& mask_color, float mask_metallic,
                                       float mask_roughness, float mask_opacity, float mask_ior,
-                                      const ImVec4& fluid_color, float fluid_metallic, float fluid_roughness,
-                                      float fluid_opacity, float fluid_ior) {
+                                      const std::vector<DataLayer>& data_layers) {
   if (state.mask_sbt_index >= 0 && state.mask_mesh.IsValid()) {
     update_surface_hitgroup_sbt(state, state.mask_sbt_index, state.hitgroup_mesh_pg, state.mask_mesh, mask_color.x,
                                 mask_color.y, mask_color.z, mask_metallic, mask_roughness, mask_opacity, mask_ior, true,
                                 light_dir, light_r, light_g, light_b, light_strength);
   }
-  if (state.fluid_sbt_index >= 0 && state.fluid_mesh.IsValid()) {
-    update_surface_hitgroup_sbt(state, state.fluid_sbt_index, state.hitgroup_fluid_pg, state.fluid_mesh, fluid_color.x,
-                                fluid_color.y, fluid_color.z, fluid_metallic, fluid_roughness, fluid_opacity, fluid_ior,
-                                true, light_dir, light_r, light_g, light_b, light_strength);
+  for (size_t i = 0; i < state.fluid_meshes.size(); i++) {
+    if (i >= state.fluid_sbt_indices.size() || i >= state.fluid_layer_indices.size()) {
+      continue;
+    }
+    int sbt_index = state.fluid_sbt_indices[i];
+    int layer_idx = state.fluid_layer_indices[i];
+    if (sbt_index < 0 || layer_idx < 0 || layer_idx >= static_cast<int>(data_layers.size()) ||
+        !state.fluid_meshes[i].IsValid()) {
+      continue;
+    }
+    const DataLayer& layer = data_layers[static_cast<size_t>(layer_idx)];
+    update_surface_hitgroup_sbt(state, sbt_index, state.hitgroup_fluid_pg, state.fluid_meshes[i], layer.color.x,
+                                layer.color.y, layer.color.z, layer.metallic, layer.roughness, layer.opacity,
+                                layer.glass_ior, true, light_dir, light_r, light_g, light_b, light_strength);
   }
   if (ground_enabled && state.ground_sbt_index >= 0) {
     update_ground_hitgroup_sbt(state, state.ground_sbt_index, ground_color, ground_metallic, ground_roughness,
@@ -1407,13 +1465,19 @@ static void cleanup_optix(OptixState& state) {
   if (state.d_gas_temp) cudaFree(reinterpret_cast<void*>(state.d_gas_temp));
   if (state.d_gas_output) cudaFree(reinterpret_cast<void*>(state.d_gas_output));
   free_gpu_mesh_buffers(state.mask_mesh);
-  free_gpu_mesh_buffers(state.fluid_mesh);
+  for (auto& mesh : state.fluid_meshes) {
+    free_gpu_mesh_buffers(mesh);
+  }
+  state.fluid_meshes.clear();
+  state.fluid_sbt_indices.clear();
+  state.fluid_layer_indices.clear();
   if (state.d_ground_vertices) cudaFree(reinterpret_cast<void*>(state.d_ground_vertices));
   if (state.d_ground_indices) cudaFree(reinterpret_cast<void*>(state.d_ground_indices));
   if (state.d_raygen_record) cudaFree(reinterpret_cast<void*>(state.d_raygen_record));
   if (state.d_miss_records) cudaFree(reinterpret_cast<void*>(state.d_miss_records));
   if (state.d_hitgroup_records) cudaFree(reinterpret_cast<void*>(state.d_hitgroup_records));
   if (state.pipeline) optixPipelineDestroy(state.pipeline);
+  if (state.hitgroup_shadow_pg) optixProgramGroupDestroy(state.hitgroup_shadow_pg);
   if (state.hitgroup_ground_pg) optixProgramGroupDestroy(state.hitgroup_ground_pg);
   if (state.hitgroup_fluid_pg) optixProgramGroupDestroy(state.hitgroup_fluid_pg);
   if (state.hitgroup_mesh_pg) optixProgramGroupDestroy(state.hitgroup_mesh_pg);
@@ -1465,7 +1529,6 @@ int main(int argc, char* argv[]) {
   LightingState lighting;
   MaskState mask;
   GroundState ground;
-  FluidState fluid;
   DatasetState dataset;
   RenderMiscState misc;
   RayTracingState rt;
@@ -1487,6 +1550,7 @@ int main(int argc, char* argv[]) {
   std::vector<std::string>& dataset_cell_names = dataset.cell_names;
   std::vector<std::string>& dataset_scalar_cell_names = dataset.scalar_cell_names;
   std::vector<DataLayer>& data_layers = dataset.layers;
+  std::vector<MeshCache>& data_layer_mesh_caches = dataset.layer_mesh_caches;
   int& dataset_loaded_field_vtk_index = dataset.loaded_field_vtk_index;
   bool& first_frame = dataset.first_frame;
 
@@ -1525,37 +1589,6 @@ int main(int argc, char* argv[]) {
   float& prev_ground_roughness = ground.prev_roughness;
   float& ground_opacity = ground.opacity;
   float& prev_ground_opacity = ground.prev_opacity;
-
-  bool& show_fluid = fluid.show;
-  bool& prev_show_fluid = fluid.prev_show;
-  int& fluid_field_index = fluid.field_index;
-  int& prev_fluid_field_index = fluid.prev_field_index;
-  float& fluid_density_threshold_min = fluid.density_threshold_min;
-  float& prev_fluid_density_threshold_min = fluid.prev_density_threshold_min;
-  float& fluid_density_threshold_max = fluid.density_threshold_max;
-  float& prev_fluid_density_threshold_max = fluid.prev_density_threshold_max;
-  int& fluid_flag = fluid.fluid_flag;
-  int& prev_fluid_flag = fluid.prev_fluid_flag;
-  ImVec4& fluid_color = fluid.color;
-  ImVec4& prev_fluid_color = fluid.prev_color;
-  float& fluid_metallic = fluid.metallic;
-  float& prev_fluid_metallic = fluid.prev_metallic;
-  float& fluid_roughness = fluid.roughness;
-  float& prev_fluid_roughness = fluid.prev_roughness;
-  float& fluid_opacity = fluid.opacity;
-  float& prev_fluid_opacity = fluid.prev_opacity;
-  float& fluid_glass_ior = fluid.glass_ior;
-  float& prev_fluid_glass_ior = fluid.prev_glass_ior;
-  int& fluid_interface_smooth_iterations = fluid.interface_smooth_iterations;
-  int& prev_fluid_interface_smooth_iterations = fluid.prev_interface_smooth_iterations;
-  float& fluid_interface_smooth_strength = fluid.interface_smooth_strength;
-  float& prev_fluid_interface_smooth_strength = fluid.prev_interface_smooth_strength;
-  bool& suppress_fluid_retry_after_error = fluid.suppress_retry_after_error;
-  std::string& failed_fluid_source_file = fluid.failed_source_file;
-  int& failed_fluid_density_field_index = fluid.failed_density_field_index;
-  int& failed_fluid_flag = fluid.failed_fluid_flag;
-  float& failed_fluid_density_threshold_min = fluid.failed_density_threshold_min;
-  float& failed_fluid_density_threshold_max = fluid.failed_density_threshold_max;
 
   bool& show_outlines = misc.show_outlines;
   ImVec4& outline_color = misc.outline_color;
@@ -1609,7 +1642,6 @@ int main(int argc, char* argv[]) {
   // Persistent mesh bounding box for outline drawing
   BBox mesh_bbox;
   MeshCache mask_mesh_cache;
-  MeshCache fluid_mesh_cache;
 
   // Host pixel buffer for copying from GPU
   std::vector<uchar4> host_pixels;
@@ -1743,15 +1775,7 @@ int main(int argc, char* argv[]) {
       dataset_scalar_cell_names.clear();
       dataset_loaded_field_vtk_index = -1;
       data_layers.clear();
-      show_fluid = false;
-      fluid_field_index = 0;
-      suppress_fluid_retry_after_error = false;
-      failed_fluid_source_file.clear();
-      failed_fluid_density_field_index = -1;
-      failed_fluid_flag = 0;
-      failed_fluid_density_threshold_min = 0.0f;
-      failed_fluid_density_threshold_max = 0.0f;
-      fluid_mesh_cache.Clear();
+      data_layer_mesh_caches.clear();
       mesh_loaded = false;
     }
     if (!vtk_files.empty()) {
@@ -1766,20 +1790,23 @@ int main(int argc, char* argv[]) {
       if (dataset_loaded_field_vtk_index != vtk_index) {
         try {
           if (load_dataset_field_lists(vtk_files[vtk_index], dataset_cell_names, dataset_scalar_cell_names)) {
-            sanitize_data_layers(data_layers, dataset_scalar_cell_names, fluid_field_index);
+            for (auto& layer_cache : data_layer_mesh_caches) {
+              layer_cache.Clear();
+            }
             dataset_loaded_field_vtk_index = vtk_index;
           } else {
             dataset_loaded_field_vtk_index = -1;
-            fluid_field_index = 0;
-            suppress_fluid_retry_after_error = false;
+            for (auto& layer_cache : data_layer_mesh_caches) {
+              layer_cache.Clear();
+            }
           }
         } catch (...) {
           dataset_cell_names.clear();
           dataset_scalar_cell_names.clear();
-          data_layers.clear();
           dataset_loaded_field_vtk_index = -1;
-          fluid_field_index = 0;
-          suppress_fluid_retry_after_error = false;
+          for (auto& layer_cache : data_layer_mesh_caches) {
+            layer_cache.Clear();
+          }
         }
       }
       ImGui::Spacing();
@@ -1830,15 +1857,10 @@ int main(int argc, char* argv[]) {
         mask_field_names.clear();
         mask_field_index = 0;
         mask_mesh_cache.Clear();
-        fluid_mesh_cache.Clear();
+        for (auto& layer_cache : data_layer_mesh_caches) {
+          layer_cache.Clear();
+        }
         mesh_loaded = false;
-        show_fluid = false;
-        suppress_fluid_retry_after_error = false;
-        failed_fluid_source_file.clear();
-        failed_fluid_density_field_index = -1;
-        failed_fluid_flag = 0;
-        failed_fluid_density_threshold_min = 0.0f;
-        failed_fluid_density_threshold_max = 0.0f;
       }
 
       if (!mask_file.empty()) {
@@ -1911,88 +1933,108 @@ int main(int argc, char* argv[]) {
           } else {
             for (const auto& field_name : dataset_scalar_cell_names) {
               if (ImGui::Selectable(field_name.c_str())) {
-                add_data_layer_if_missing(data_layers, field_name, fluid_field_index);
+                add_data_layer(data_layers, data_layer_mesh_caches, field_name);
               }
             }
           }
           ImGui::EndPopup();
         }
-        ImGui::SameLine();
-        if (ImGui::Button("Clear##data")) {
-          data_layers.clear();
-          fluid_field_index = 0;
-          show_fluid = false;
-        }
-
-        sanitize_data_layers(data_layers, dataset_scalar_cell_names, fluid_field_index);
+        sync_data_layer_caches(data_layers, data_layer_mesh_caches);
         if (data_layers.empty()) {
           ImGui::TextDisabled("Add a scalar cell array to enable fluid surface rendering.");
         } else {
-          ImGui::Checkbox("Show##fluid", &show_fluid);
-
-          ImGui::Text("Field");
-          ImGui::SameLine();
-          const char* field_preview = data_layers[fluid_field_index].name.c_str();
-          if (ImGui::BeginCombo("##fluid_field", field_preview)) {
-            for (int i = 0; i < static_cast<int>(data_layers.size()); i++) {
-              bool selected = (i == fluid_field_index);
-              if (ImGui::Selectable(data_layers[i].name.c_str(), selected)) fluid_field_index = i;
-              if (selected) ImGui::SetItemDefaultFocus();
+          for (size_t i = 0; i < data_layers.size();) {
+            DataLayer& layer = data_layers[i];
+            MeshCache& layer_cache = data_layer_mesh_caches[i];
+            ImGui::PushID(static_cast<int>(i));
+            ImGui::Spacing();
+            if (i > 0) {
+              ImGui::Separator();
+              ImGui::Spacing();
             }
-            ImGui::EndCombo();
+
+            ImGui::Text("Entry %d", static_cast<int>(i + 1));
+            ImGui::SameLine();
+            if (ImGui::Button("Clear")) {
+              data_layers.erase(data_layers.begin() + static_cast<long>(i));
+              data_layer_mesh_caches.erase(data_layer_mesh_caches.begin() + static_cast<long>(i));
+              mesh_loaded = false;
+              ImGui::PopID();
+              continue;
+            }
+
+            ImGui::Checkbox("Show", &layer.show);
+
+            ImGui::Text("Field");
+            ImGui::SameLine();
+            const char* field_preview = layer.name.empty() ? "<none>" : layer.name.c_str();
+            if (ImGui::BeginCombo("##field", field_preview)) {
+              for (const auto& field_name : dataset_scalar_cell_names) {
+                bool selected = (layer.name == field_name);
+                if (ImGui::Selectable(field_name.c_str(), selected)) {
+                  layer.name = field_name;
+                  layer_cache.Clear();
+                  layer.suppress_retry_after_error = false;
+                }
+                if (selected) ImGui::SetItemDefaultFocus();
+              }
+              ImGui::EndCombo();
+            }
+
+            bool selected_available = (find_field_index(dataset_scalar_cell_names, layer.name) >= 0);
+            if (!selected_available) {
+              ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1.0f), "Selected field is missing in current frame.");
+            }
+
+            ImGui::Text("Threshold Min");
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(-1);
+            ImGui::DragFloat("##threshold_min", &layer.threshold_min, 0.01f);
+            ImGui::Text("Threshold Max");
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(-1);
+            ImGui::DragFloat("##threshold_max", &layer.threshold_max, 0.01f);
+
+            ImGui::Text("Fluid Flag");
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(100.0f);
+            ImGui::InputInt("##fluid_flag", &layer.fluid_flag);
+
+            ImGui::Text("Color");
+            ImGui::ColorEdit3("##color", (float*)&layer.color);
+
+            ImGui::Text("Metallic");
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(-1);
+            ImGui::SliderFloat("##metallic", &layer.metallic, 0.0f, 1.0f);
+
+            ImGui::Text("Roughness");
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(-1);
+            ImGui::SliderFloat("##roughness", &layer.roughness, 0.0f, 1.0f);
+
+            ImGui::Text("Opacity");
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(-1);
+            ImGui::SliderFloat("##opacity", &layer.opacity, 0.0f, 1.0f);
+
+            ImGui::Text("Glass IOR");
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(-1);
+            ImGui::SliderFloat("##ior", &layer.glass_ior, 1.0f, 2.5f);
+
+            ImGui::Text("Boundary Smoothing");
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(-1);
+            ImGui::SliderInt("##smooth_iters", &layer.smooth_iterations, 0, 50);
+
+            ImGui::Text("Boundary Smooth Strength");
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(-1);
+            ImGui::SliderFloat("##smooth_strength", &layer.smooth_strength, 0.0f, 1.0f);
+            ImGui::PopID();
+            ++i;
           }
-
-          bool selected_available = (find_field_index(dataset_scalar_cell_names, data_layers[fluid_field_index].name) >= 0);
-          if (!selected_available) {
-            ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1.0f), "Selected field is missing in current frame.");
-          }
-
-          ImGui::Text("Threshold Min");
-          ImGui::SameLine();
-          ImGui::SetNextItemWidth(-1);
-          ImGui::DragFloat("##fluid_density_threshold_min", &fluid_density_threshold_min, 0.01f);
-          ImGui::Text("Threshold Max");
-          ImGui::SameLine();
-          ImGui::SetNextItemWidth(-1);
-          ImGui::DragFloat("##fluid_density_threshold_max", &fluid_density_threshold_max, 0.01f);
-
-          ImGui::Text("Fluid Flag");
-          ImGui::SameLine();
-          ImGui::SetNextItemWidth(100.0f);
-          ImGui::InputInt("##fluid_flag", &fluid_flag);
-
-          ImGui::Text("Color");
-          ImGui::ColorEdit3("##fluid_color", (float*)&fluid_color);
-
-          ImGui::Text("Metallic");
-          ImGui::SameLine();
-          ImGui::SetNextItemWidth(-1);
-          ImGui::SliderFloat("##fluid_metallic", &fluid_metallic, 0.0f, 1.0f);
-
-          ImGui::Text("Roughness");
-          ImGui::SameLine();
-          ImGui::SetNextItemWidth(-1);
-          ImGui::SliderFloat("##fluid_roughness", &fluid_roughness, 0.0f, 1.0f);
-
-          ImGui::Text("Opacity");
-          ImGui::SameLine();
-          ImGui::SetNextItemWidth(-1);
-          ImGui::SliderFloat("##fluid_opacity", &fluid_opacity, 0.0f, 1.0f);
-
-          ImGui::Text("Glass IOR");
-          ImGui::SameLine();
-          ImGui::SetNextItemWidth(-1);
-          ImGui::SliderFloat("##fluid_ior", &fluid_glass_ior, 1.0f, 2.5f);
-
-          ImGui::Text("Boundary Smoothing");
-          ImGui::SameLine();
-          ImGui::SetNextItemWidth(-1);
-          ImGui::SliderInt("##fluid_interface_smooth_iters", &fluid_interface_smooth_iterations, 0, 50);
-
-          ImGui::Text("Boundary Smooth Strength");
-          ImGui::SameLine();
-          ImGui::SetNextItemWidth(-1);
-          ImGui::SliderFloat("##fluid_interface_smooth_strength", &fluid_interface_smooth_strength, 0.0f, 1.0f);
         }
       }
     }
@@ -2013,25 +2055,18 @@ int main(int argc, char* argv[]) {
         dataset_scalar_cell_names.clear();
         dataset_loaded_field_vtk_index = -1;
         data_layers.clear();
-        fluid_field_index = 0;
-        suppress_fluid_retry_after_error = false;
-        failed_fluid_source_file.clear();
-        failed_fluid_density_field_index = -1;
-        failed_fluid_flag = 0;
-        failed_fluid_density_threshold_min = 0.0f;
-        failed_fluid_density_threshold_max = 0.0f;
+        data_layer_mesh_caches.clear();
         if (!vtk_files.empty()) {
           try {
             if (load_dataset_field_lists(vtk_files[vtk_index], dataset_cell_names, dataset_scalar_cell_names)) {
-              sanitize_data_layers(data_layers, dataset_scalar_cell_names, fluid_field_index);
               dataset_loaded_field_vtk_index = vtk_index;
             }
           } catch (...) {
             dataset_cell_names.clear();
             dataset_scalar_cell_names.clear();
             data_layers.clear();
+            data_layer_mesh_caches.clear();
             dataset_loaded_field_vtk_index = -1;
-            suppress_fluid_retry_after_error = false;
           }
         }
       }
@@ -2061,7 +2096,9 @@ int main(int argc, char* argv[]) {
             mask_field_names.clear();
             mask_field_index = 0;
             mask_mesh_cache.Clear();
-            fluid_mesh_cache.Clear();
+            for (auto& layer_cache : data_layer_mesh_caches) {
+              layer_cache.Clear();
+            }
             mesh_loaded = false;
             for (viskores::IdComponent i = 0; i < mask_dataset.GetNumberOfFields(); i++) {
               const auto& field = mask_dataset.GetField(i);
@@ -2116,185 +2153,178 @@ int main(int argc, char* argv[]) {
     bool has_mask_selection = !mask_file.empty() && !mask_field_names.empty() && mask_field_index >= 0 &&
                               mask_field_index < static_cast<int>(mask_field_names.size());
     std::string selected_mask_field = has_mask_selection ? mask_field_names[mask_field_index] : std::string();
-    bool has_added_field = !data_layers.empty() && fluid_field_index >= 0 &&
-                           fluid_field_index < static_cast<int>(data_layers.size());
-    std::string selected_density_field = has_added_field ? data_layers[fluid_field_index].name : std::string();
-    bool has_density_field = has_added_field &&
-                             (find_field_index(dataset_scalar_cell_names, selected_density_field) >= 0);
     std::string fluid_source_file = (!vtk_files.empty() && vtk_index >= 0 && vtk_index < static_cast<int>(vtk_files.size()))
                                         ? vtk_files[vtk_index]
                                         : std::string();
 
-    bool render_mask = show_mask && has_mask_selection;
-    bool render_fluid = show_fluid && has_mask_selection && has_density_field &&
-                        !fluid_source_file.empty();
-    bool render_any = render_mask || render_fluid;
-
-    if (!render_fluid) {
-      suppress_fluid_retry_after_error = false;
-    }
-    if (fluid_density_threshold_min > fluid_density_threshold_max) {
-      std::swap(fluid_density_threshold_min, fluid_density_threshold_max);
-    }
-    bool fluid_same_failed_request =
-        render_fluid && suppress_fluid_retry_after_error && failed_fluid_source_file == fluid_source_file &&
-        failed_fluid_density_field_index == fluid_field_index && failed_fluid_flag == fluid_flag &&
-        std::fabs(failed_fluid_density_threshold_min - fluid_density_threshold_min) <= 1e-5f &&
-        std::fabs(failed_fluid_density_threshold_max - fluid_density_threshold_max) <= 1e-5f;
-    if (render_fluid && suppress_fluid_retry_after_error && !fluid_same_failed_request) {
-      suppress_fluid_retry_after_error = false;
-      fluid_same_failed_request = false;
-    }
-
-    bool mask_cache_matches_selection = render_mask && mask_mesh_cache.valid && mask_mesh_cache.source_file == mask_file &&
+    bool wants_mask = show_mask && has_mask_selection;
+    bool mask_cache_matches_selection = wants_mask && mask_mesh_cache.valid && mask_mesh_cache.source_file == mask_file &&
                                         mask_mesh_cache.source_field == selected_mask_field &&
                                         mask_mesh_cache.source_solid_flag == solid_flag;
-    bool fluid_cache_matches_selection =
-        render_fluid && fluid_mesh_cache.valid && fluid_mesh_cache.source_file == fluid_source_file &&
-        fluid_mesh_cache.source_field == selected_density_field && fluid_mesh_cache.source_solid_flag == fluid_flag;
+    bool needs_mask_extract = wants_mask && (mask_selection_changed || !mask_cache_matches_selection);
 
-    bool fluid_selection_changed = render_fluid &&
-                                   (fluid_field_index != prev_fluid_field_index ||
-                                    fluid_flag != prev_fluid_flag ||
-                                    std::fabs(fluid_density_threshold_min - prev_fluid_density_threshold_min) > 1e-5f ||
-                                    std::fabs(fluid_density_threshold_max - prev_fluid_density_threshold_max) > 1e-5f ||
-                                    show_fluid != prev_show_fluid);
-    bool fluid_interface_smooth_changed =
-        render_fluid && ((fluid_interface_smooth_iterations != prev_fluid_interface_smooth_iterations) ||
-                         (std::fabs(fluid_interface_smooth_strength - prev_fluid_interface_smooth_strength) > 1e-4f));
+    struct LayerFrameState {
+      bool renderable = false;
+      bool same_failed_request = false;
+      bool cache_matches = false;
+      bool threshold_changed = false;
+      bool smoothing_changed = false;
+      bool visibility_changed = false;
+      bool material_changed = false;
+      bool needs_extract = false;
+    };
 
-    bool needs_mask_extract = render_mask && (mask_selection_changed || !mask_cache_matches_selection);
-    bool needs_fluid_extract =
-        render_fluid && !fluid_same_failed_request && (fluid_selection_changed || !fluid_cache_matches_selection);
-    bool needs_extract = needs_mask_extract || needs_fluid_extract;
+    sync_data_layer_caches(data_layers, data_layer_mesh_caches);
+    std::vector<LayerFrameState> layer_states(data_layers.size());
+    bool any_layer_extract = false;
+    bool any_layer_smooth_changed = false;
+    bool any_layer_visibility_changed = false;
 
-    bool visibility_changed = (show_mask != prev_show_mask) || (show_fluid != prev_show_fluid);
-    bool needs_mesh_rebuild_from_cache =
-        render_any && !needs_extract &&
-        ((render_mask && (mask_smooth_changed || transform_changed)) ||
-         (render_fluid && (fluid_interface_smooth_changed || transform_changed)) || visibility_changed || !mesh_loaded);
-    bool needs_full_rebuild = needs_extract || needs_mesh_rebuild_from_cache;
-    bool needs_gas_rebuild = render_any && mesh_loaded && !needs_full_rebuild && (ground_toggled || ground_offset_changed);
+    for (size_t i = 0; i < data_layers.size(); i++) {
+      DataLayer& layer = data_layers[i];
+      MeshCache& layer_cache = data_layer_mesh_caches[i];
+      LayerFrameState& state = layer_states[i];
 
-    prev_show_mask = show_mask;
-    prev_show_fluid = show_fluid;
-    prev_mask_field_index = mask_field_index;
-    prev_solid_flag = solid_flag;
-    prev_fluid_field_index = fluid_field_index;
-    prev_fluid_density_threshold_min = fluid_density_threshold_min;
-    prev_fluid_density_threshold_max = fluid_density_threshold_max;
-    prev_fluid_flag = fluid_flag;
-    prev_fluid_interface_smooth_iterations = fluid_interface_smooth_iterations;
-    prev_fluid_interface_smooth_strength = fluid_interface_smooth_strength;
-    prev_fluid_metallic = fluid_metallic;
-    prev_fluid_roughness = fluid_roughness;
-    prev_fluid_opacity = fluid_opacity;
-    prev_fluid_glass_ior = fluid_glass_ior;
-    prev_smooth_iterations = smooth_iterations;
-    prev_smooth_strength = smooth_strength;
-    prev_rotate_x_deg = rotate_x_deg;
-    prev_rotate_y_deg = rotate_y_deg;
-    prev_rotate_z_deg = rotate_z_deg;
-    prev_ground_enabled = ground_enabled;
-    prev_ground_y_offset = ground_y_offset;
+      if (layer.threshold_min > layer.threshold_max) {
+        std::swap(layer.threshold_min, layer.threshold_max);
+      }
 
-    if (needs_extract) {
+      bool has_density_field = (find_field_index(dataset_scalar_cell_names, layer.name) >= 0);
+      state.renderable = layer.show && has_mask_selection && has_density_field && !fluid_source_file.empty();
+      state.visibility_changed = (state.renderable != layer.prev_renderable);
+      state.threshold_changed = (std::fabs(layer.threshold_min - layer.prev_threshold_min) > 1e-5f) ||
+                                (std::fabs(layer.threshold_max - layer.prev_threshold_max) > 1e-5f);
+      state.smoothing_changed =
+          state.renderable && ((layer.smooth_iterations != layer.prev_smooth_iterations) ||
+                               (std::fabs(layer.smooth_strength - layer.prev_smooth_strength) > 1e-4f));
+      state.material_changed = state.renderable && (layer.color.x != layer.prev_color.x || layer.color.y != layer.prev_color.y ||
+                                                    layer.color.z != layer.prev_color.z ||
+                                                    std::fabs(layer.metallic - layer.prev_metallic) > 1e-5f ||
+                                                    std::fabs(layer.roughness - layer.prev_roughness) > 1e-5f ||
+                                                    std::fabs(layer.opacity - layer.prev_opacity) > 1e-5f ||
+                                                    std::fabs(layer.glass_ior - layer.prev_glass_ior) > 1e-5f);
+
+      state.same_failed_request =
+          state.renderable && layer.suppress_retry_after_error && layer.failed_source_file == fluid_source_file &&
+          layer.failed_mask_file == mask_file && layer.failed_mask_field == selected_mask_field &&
+          layer.failed_field_name == layer.name && layer.failed_fluid_flag == layer.fluid_flag &&
+          std::fabs(layer.failed_threshold_min - layer.threshold_min) <= 1e-5f &&
+          std::fabs(layer.failed_threshold_max - layer.threshold_max) <= 1e-5f;
+      if (state.renderable && layer.suppress_retry_after_error && !state.same_failed_request) {
+        layer.suppress_retry_after_error = false;
+        state.same_failed_request = false;
+      }
+
+      state.cache_matches = state.renderable && layer_cache.valid && layer_cache.source_file == fluid_source_file &&
+                            layer_cache.source_field == layer.name && layer_cache.source_solid_flag == layer.fluid_flag;
+      state.needs_extract = state.renderable && !state.same_failed_request && (!state.cache_matches || state.threshold_changed);
+
+      any_layer_extract = any_layer_extract || state.needs_extract;
+      any_layer_smooth_changed = any_layer_smooth_changed || state.smoothing_changed;
+      any_layer_visibility_changed = any_layer_visibility_changed || state.visibility_changed;
+    }
+
+    bool needs_extract = needs_mask_extract || any_layer_extract;
+    bool extraction_attempted = false;
+
+    if (needs_mask_extract) {
+      extraction_attempted = true;
       try {
-        if (needs_mask_extract) {
-          extract_mesh(mask_file, selected_mask_field, solid_flag, mask_mesh_cache);
-        }
-        if (needs_fluid_extract) {
-          extract_fluid_mesh(fluid_source_file, selected_density_field, fluid_density_threshold_min,
-                             fluid_density_threshold_max, mask_file, selected_mask_field, fluid_flag, fluid_mesh_cache);
-          suppress_fluid_retry_after_error = false;
-        }
-
-        BBox bbox;
-        rebuild_scene_from_caches(render_mask ? &mask_mesh_cache : nullptr, render_fluid ? &fluid_mesh_cache : nullptr,
-                                  optix_state, light_dir, light_color.x, light_color.y, light_color.z, light_strength,
-                                  ground_enabled, ground_color, ground_metallic, ground_roughness, ground_opacity,
-                                  ground_y_offset, rotate_x_deg, rotate_y_deg, rotate_z_deg, smooth_iterations,
-                                  smooth_strength, fluid_interface_smooth_iterations, fluid_interface_smooth_strength,
-                                  mask_color, mask_metallic, mask_roughness, mask_opacity, mask_glass_ior, fluid_color,
-                                  fluid_metallic, fluid_roughness, fluid_opacity, fluid_glass_ior, bbox);
-
-        mesh_loaded = true;
-        mesh_bbox = bbox;
-        viewport_needs_render = true;
-
-        float3 center =
-            make_float3((bbox.lo.x + bbox.hi.x) * 0.5f, (bbox.lo.y + bbox.hi.y) * 0.5f, (bbox.lo.z + bbox.hi.z) * 0.5f);
-        cam_target[0] = center.x;
-        cam_target[1] = center.y;
-        cam_target[2] = center.z;
-        float3 extent = make_float3(bbox.hi.x - bbox.lo.x, bbox.hi.y - bbox.lo.y, bbox.hi.z - bbox.lo.z);
-        float diag = std::sqrt(extent.x * extent.x + extent.y * extent.y + extent.z * extent.z);
-        cam_distance = diag * 1.5f;
-
-        prev_mask_color = mask_color;
-        prev_mask_metallic = mask_metallic;
-        prev_mask_roughness = mask_roughness;
-        prev_mask_opacity = mask_opacity;
-        prev_mask_glass_ior = mask_glass_ior;
-        prev_fluid_color = fluid_color;
-        prev_fluid_metallic = fluid_metallic;
-        prev_fluid_roughness = fluid_roughness;
-        prev_fluid_opacity = fluid_opacity;
-        prev_fluid_glass_ior = fluid_glass_ior;
-        prev_light_strength = light_strength;
-        prev_light_color = light_color;
-        prev_ground_color = ground_color;
-        prev_ground_metallic = ground_metallic;
-        prev_ground_roughness = ground_roughness;
-        prev_ground_opacity = ground_opacity;
+        extract_mesh(mask_file, selected_mask_field, solid_flag, mask_mesh_cache);
       } catch (const std::exception& e) {
         show_mask_error = true;
         mask_error_msg = std::string("Mesh extraction failed: ") + e.what();
-        if (needs_mask_extract) {
-          mask_mesh_cache.Clear();
-        }
-        if (needs_fluid_extract) {
-          fluid_mesh_cache.Clear();
-          suppress_fluid_retry_after_error = true;
-          failed_fluid_source_file = fluid_source_file;
-          failed_fluid_density_field_index = fluid_field_index;
-          failed_fluid_flag = fluid_flag;
-          failed_fluid_density_threshold_min = fluid_density_threshold_min;
-          failed_fluid_density_threshold_max = fluid_density_threshold_max;
-        }
-        mesh_loaded = false;
+        mask_mesh_cache.Clear();
       } catch (...) {
         show_mask_error = true;
         mask_error_msg = "Mesh extraction failed.";
-        if (needs_mask_extract) {
-          mask_mesh_cache.Clear();
-        }
-        if (needs_fluid_extract) {
-          fluid_mesh_cache.Clear();
-          suppress_fluid_retry_after_error = true;
-          failed_fluid_source_file = fluid_source_file;
-          failed_fluid_density_field_index = fluid_field_index;
-          failed_fluid_flag = fluid_flag;
-          failed_fluid_density_threshold_min = fluid_density_threshold_min;
-          failed_fluid_density_threshold_max = fluid_density_threshold_max;
-        }
-        mesh_loaded = false;
+        mask_mesh_cache.Clear();
       }
     }
 
-    if (needs_mesh_rebuild_from_cache) {
+    for (size_t i = 0; i < data_layers.size(); i++) {
+      if (!layer_states[i].needs_extract) {
+        continue;
+      }
+      extraction_attempted = true;
+      DataLayer& layer = data_layers[i];
+      MeshCache& layer_cache = data_layer_mesh_caches[i];
       try {
+        extract_fluid_mesh(fluid_source_file, layer.name, layer.threshold_min, layer.threshold_max, mask_file,
+                           selected_mask_field, layer.fluid_flag, layer_cache);
+        layer.suppress_retry_after_error = false;
+      } catch (const std::exception& e) {
+        show_mask_error = true;
+        mask_error_msg = std::string("Mesh extraction failed: ") + e.what();
+        layer_cache.Clear();
+        layer.suppress_retry_after_error = true;
+        layer.failed_source_file = fluid_source_file;
+        layer.failed_mask_file = mask_file;
+        layer.failed_mask_field = selected_mask_field;
+        layer.failed_field_name = layer.name;
+        layer.failed_fluid_flag = layer.fluid_flag;
+        layer.failed_threshold_min = layer.threshold_min;
+        layer.failed_threshold_max = layer.threshold_max;
+      } catch (...) {
+        show_mask_error = true;
+        mask_error_msg = "Mesh extraction failed.";
+        layer_cache.Clear();
+        layer.suppress_retry_after_error = true;
+        layer.failed_source_file = fluid_source_file;
+        layer.failed_mask_file = mask_file;
+        layer.failed_mask_field = selected_mask_field;
+        layer.failed_field_name = layer.name;
+        layer.failed_fluid_flag = layer.fluid_flag;
+        layer.failed_threshold_min = layer.threshold_min;
+        layer.failed_threshold_max = layer.threshold_max;
+      }
+    }
+
+    bool render_mask = wants_mask && mask_mesh_cache.valid;
+    std::vector<int> active_fluid_layer_indices;
+    active_fluid_layer_indices.reserve(data_layers.size());
+    for (size_t i = 0; i < data_layers.size(); i++) {
+      const LayerFrameState& layer_state = layer_states[i];
+      const MeshCache& layer_cache = data_layer_mesh_caches[i];
+      if (layer_state.renderable && !layer_state.same_failed_request && layer_cache.valid) {
+        active_fluid_layer_indices.push_back(static_cast<int>(i));
+      }
+    }
+    bool render_fluid = !active_fluid_layer_indices.empty();
+    bool render_any = render_mask || render_fluid;
+
+    bool visibility_changed = (show_mask != prev_show_mask) || any_layer_visibility_changed;
+    bool needs_mesh_rebuild_from_cache =
+        render_any && !needs_extract &&
+        ((render_mask && (mask_smooth_changed || transform_changed)) ||
+         (render_fluid && (any_layer_smooth_changed || transform_changed)) || visibility_changed || !mesh_loaded);
+    bool needs_full_rebuild = render_any && (extraction_attempted || needs_mesh_rebuild_from_cache);
+    bool needs_gas_rebuild = render_any && mesh_loaded && !needs_full_rebuild && (ground_toggled || ground_offset_changed);
+
+    if (needs_full_rebuild) {
+      try {
+        bool mesh_was_loaded = mesh_loaded;
         BBox bbox;
-        rebuild_scene_from_caches(render_mask ? &mask_mesh_cache : nullptr, render_fluid ? &fluid_mesh_cache : nullptr,
-                                  optix_state, light_dir, light_color.x, light_color.y, light_color.z, light_strength,
-                                  ground_enabled, ground_color, ground_metallic, ground_roughness, ground_opacity,
-                                  ground_y_offset, rotate_x_deg, rotate_y_deg, rotate_z_deg, smooth_iterations,
-                                  smooth_strength, fluid_interface_smooth_iterations, fluid_interface_smooth_strength,
-                                  mask_color, mask_metallic, mask_roughness, mask_opacity, mask_glass_ior, fluid_color,
-                                  fluid_metallic, fluid_roughness, fluid_opacity, fluid_glass_ior, bbox);
+        rebuild_scene_from_caches(render_mask ? &mask_mesh_cache : nullptr, active_fluid_layer_indices, data_layers,
+                                  data_layer_mesh_caches, optix_state, light_dir, light_color.x, light_color.y,
+                                  light_color.z, light_strength, ground_enabled, ground_color, ground_metallic,
+                                  ground_roughness, ground_opacity, ground_y_offset, rotate_x_deg, rotate_y_deg,
+                                  rotate_z_deg, smooth_iterations, smooth_strength, mask_color, mask_metallic,
+                                  mask_roughness, mask_opacity, mask_glass_ior, bbox);
         mesh_loaded = true;
         mesh_bbox = bbox;
         viewport_needs_render = true;
+
+        if (extraction_attempted || !mesh_was_loaded) {
+          float3 center =
+              make_float3((bbox.lo.x + bbox.hi.x) * 0.5f, (bbox.lo.y + bbox.hi.y) * 0.5f, (bbox.lo.z + bbox.hi.z) * 0.5f);
+          cam_target[0] = center.x;
+          cam_target[1] = center.y;
+          cam_target[2] = center.z;
+          float3 extent = make_float3(bbox.hi.x - bbox.lo.x, bbox.hi.y - bbox.lo.y, bbox.hi.z - bbox.lo.z);
+          float diag = std::sqrt(extent.x * extent.x + extent.y * extent.y + extent.z * extent.z);
+          cam_distance = diag * 1.5f;
+        }
       } catch (const std::exception& e) {
         show_mask_error = true;
         mask_error_msg = std::string("Mesh rebuild failed: ") + e.what();
@@ -2304,15 +2334,16 @@ int main(int argc, char* argv[]) {
         mask_error_msg = "Mesh rebuild failed.";
         mesh_loaded = false;
       }
+    } else if (!render_any) {
+      mesh_loaded = false;
     }
 
     if (needs_gas_rebuild && !needs_full_rebuild) {
-      rebuild_gas(optix_state, mesh_bbox, render_mask && mask_mesh_cache.valid, render_fluid && fluid_mesh_cache.valid,
+      rebuild_gas(optix_state, mesh_bbox, render_mask, static_cast<int>(active_fluid_layer_indices.size()),
                   ground_enabled, ground_y_offset);
       update_scene_material_sbt(optix_state, light_dir, light_color.x, light_color.y, light_color.z, light_strength,
                                 ground_enabled, ground_color, ground_metallic, ground_roughness, ground_opacity,
-                                mask_color, mask_metallic, mask_roughness, mask_opacity, mask_glass_ior, fluid_color,
-                                fluid_metallic, fluid_roughness, fluid_opacity, fluid_glass_ior);
+                                mask_color, mask_metallic, mask_roughness, mask_opacity, mask_glass_ior, data_layers);
       prev_ground_color = ground_color;
       prev_ground_metallic = ground_metallic;
       prev_ground_roughness = ground_roughness;
@@ -2338,26 +2369,29 @@ int main(int argc, char* argv[]) {
                             light_color.y != prev_light_color.y || light_color.z != prev_light_color.z);
       bool mask_mat_changed =
           render_mask && (mask_color.x != prev_mask_color.x || mask_color.y != prev_mask_color.y ||
-                          mask_color.z != prev_mask_color.z || mask_metallic != prev_mask_metallic ||
-                          mask_roughness != prev_mask_roughness || mask_opacity != prev_mask_opacity ||
+                          mask_color.z != prev_mask_color.z || std::fabs(mask_metallic - prev_mask_metallic) > 1e-5f ||
+                          std::fabs(mask_roughness - prev_mask_roughness) > 1e-5f ||
+                          std::fabs(mask_opacity - prev_mask_opacity) > 1e-5f ||
                           std::fabs(mask_glass_ior - prev_mask_glass_ior) > 1e-4f);
-      bool fluid_mat_changed = render_fluid && (fluid_color.x != prev_fluid_color.x ||
-                                                fluid_color.y != prev_fluid_color.y ||
-                                                fluid_color.z != prev_fluid_color.z ||
-                                                std::fabs(fluid_metallic - prev_fluid_metallic) > 1e-5f ||
-                                                std::fabs(fluid_roughness - prev_fluid_roughness) > 1e-5f ||
-                                                std::fabs(fluid_opacity - prev_fluid_opacity) > 1e-5f ||
-                                                std::fabs(fluid_glass_ior - prev_fluid_glass_ior) > 1e-5f);
+      bool fluid_mat_changed = false;
+      for (int layer_idx : active_fluid_layer_indices) {
+        if (layer_idx < 0 || layer_idx >= static_cast<int>(layer_states.size()) ||
+            layer_idx >= static_cast<int>(data_layers.size())) {
+          continue;
+        }
+        fluid_mat_changed = fluid_mat_changed || layer_states[static_cast<size_t>(layer_idx)].material_changed;
+      }
       bool ground_mat_changed = ground_enabled &&
                                 (ground_color.x != prev_ground_color.x || ground_color.y != prev_ground_color.y ||
-                                 ground_color.z != prev_ground_color.z || ground_metallic != prev_ground_metallic ||
-                                 ground_roughness != prev_ground_roughness || ground_opacity != prev_ground_opacity);
+                                 ground_color.z != prev_ground_color.z ||
+                                 std::fabs(ground_metallic - prev_ground_metallic) > 1e-5f ||
+                                 std::fabs(ground_roughness - prev_ground_roughness) > 1e-5f ||
+                                 std::fabs(ground_opacity - prev_ground_opacity) > 1e-5f);
 
       if (light_changed || mask_mat_changed || fluid_mat_changed || ground_mat_changed) {
         update_scene_material_sbt(optix_state, light_dir, light_color.x, light_color.y, light_color.z, light_strength,
                                   ground_enabled, ground_color, ground_metallic, ground_roughness, ground_opacity,
-                                  mask_color, mask_metallic, mask_roughness, mask_opacity, mask_glass_ior, fluid_color,
-                                  fluid_metallic, fluid_roughness, fluid_opacity, fluid_glass_ior);
+                                  mask_color, mask_metallic, mask_roughness, mask_opacity, mask_glass_ior, data_layers);
         viewport_needs_render = true;
 
         prev_mask_color = mask_color;
@@ -2365,11 +2399,6 @@ int main(int argc, char* argv[]) {
         prev_mask_roughness = mask_roughness;
         prev_mask_opacity = mask_opacity;
         prev_mask_glass_ior = mask_glass_ior;
-        prev_fluid_color = fluid_color;
-        prev_fluid_metallic = fluid_metallic;
-        prev_fluid_roughness = fluid_roughness;
-        prev_fluid_opacity = fluid_opacity;
-        prev_fluid_glass_ior = fluid_glass_ior;
         prev_light_strength = light_strength;
         prev_light_color = light_color;
         prev_ground_color = ground_color;
@@ -2385,6 +2414,32 @@ int main(int argc, char* argv[]) {
         viewport_needs_render = true;
         prev_shadows_enabled = shadows_enabled;
       }
+    }
+
+    prev_show_mask = show_mask;
+    prev_mask_field_index = mask_field_index;
+    prev_solid_flag = solid_flag;
+    prev_smooth_iterations = smooth_iterations;
+    prev_smooth_strength = smooth_strength;
+    prev_rotate_x_deg = rotate_x_deg;
+    prev_rotate_y_deg = rotate_y_deg;
+    prev_rotate_z_deg = rotate_z_deg;
+    prev_ground_enabled = ground_enabled;
+    prev_ground_y_offset = ground_y_offset;
+    for (size_t i = 0; i < data_layers.size(); i++) {
+      DataLayer& layer = data_layers[i];
+      layer.prev_show = layer.show;
+      layer.prev_threshold_min = layer.threshold_min;
+      layer.prev_threshold_max = layer.threshold_max;
+      layer.prev_fluid_flag = layer.fluid_flag;
+      layer.prev_color = layer.color;
+      layer.prev_metallic = layer.metallic;
+      layer.prev_roughness = layer.roughness;
+      layer.prev_opacity = layer.opacity;
+      layer.prev_glass_ior = layer.glass_ior;
+      layer.prev_smooth_iterations = layer.smooth_iterations;
+      layer.prev_smooth_strength = layer.smooth_strength;
+      layer.prev_renderable = (i < layer_states.size()) ? layer_states[i].renderable : false;
     }
     // Viewport window
     ImGuiWindowClass viewport_window_class;

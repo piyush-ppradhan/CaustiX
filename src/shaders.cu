@@ -104,8 +104,7 @@ static __forceinline__ __device__ float trace_shadow(float3 origin, float3 direc
              1e16f,    // tmax
              0.0f,     // rayTime
              OptixVisibilityMask(255),
-             OPTIX_RAY_FLAG_TERMINATE_ON_FIRST_HIT | OPTIX_RAY_FLAG_DISABLE_CLOSESTHIT |
-                 OPTIX_RAY_FLAG_DISABLE_ANYHIT,
+             OPTIX_RAY_FLAG_TERMINATE_ON_FIRST_HIT | OPTIX_RAY_FLAG_DISABLE_ANYHIT,
              RAY_TYPE_SHADOW,   // SBT offset (shadow ray type)
              RAY_TYPE_COUNT,    // SBT stride
              RAY_TYPE_SHADOW,   // missSBTIndex (shadow miss)
@@ -222,6 +221,23 @@ extern "C" __global__ void __miss__radiance() {
 extern "C" __global__ void __miss__shadow() {
   // No blocker found — ray escaped. Set payload to 1.0 (lit).
   optixSetPayload_0(__float_as_uint(1.0f));
+}
+
+extern "C" __global__ void __closesthit__shadow() {
+  HitGroupData* data = reinterpret_cast<HitGroupData*>(optixGetSbtDataPointer());
+  if (!data) {
+    optixSetPayload_0(__float_as_uint(0.0f));
+    return;
+  }
+
+  // Approximate colored transparency for shadow rays.
+  float opacity = clampf(data->opacity, 0.0f, 1.0f);
+  float transmittance = 1.0f - opacity;
+  float3 tint = make_float3(clampf(data->base_color.x, 0.0f, 1.0f), clampf(data->base_color.y, 0.0f, 1.0f),
+                            clampf(data->base_color.z, 0.0f, 1.0f));
+  float tint_luma = 0.2126f * tint.x + 0.7152f * tint.y + 0.0722f * tint.z;
+  float visibility = clampf(transmittance * tint_luma, 0.0f, 1.0f);
+  optixSetPayload_0(__float_as_uint(visibility));
 }
 
 #include "fluid_shading.cuh"
