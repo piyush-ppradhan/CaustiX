@@ -79,6 +79,7 @@ set(IMGUI_DIR ${CMAKE_SOURCE_DIR}/lib/imgui)
 
 add_executable(${CMAKE_PROJECT_NAME}
 	src/main.cpp
+	src/stb_image_write_impl.cpp
 	${IMGUI_DIR}/imgui.cpp
 	${IMGUI_DIR}/imgui_draw.cpp
 	${IMGUI_DIR}/imgui_tables.cpp
@@ -104,6 +105,7 @@ add_subdirectory(${CMAKE_SOURCE_DIR}/lib/SDL)
 
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
 	lib/SDL/include
+	${CMAKE_SOURCE_DIR}/lib/stb
 	${IMGUI_DIR}
 	${IMGUI_DIR}/backends
 	${CMAKE_SOURCE_DIR}/lib/ImGuiFileDialog

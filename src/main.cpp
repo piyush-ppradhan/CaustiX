@@ -27,6 +27,7 @@
 #include <cstdlib>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -37,21 +38,22 @@
 #include <limits>
 #include <sstream>
 #include <functional>
+#include "stb_image_write.h"
 #include "config.hpp"
 #include "optix_params.h"
 
 // --- Error checking macros ---
 
-#define CUDA_CHECK(call)                                                                                 \
-  do {                                                                                                   \
-    cudaError_t rc = call;                                                                               \
-    if (rc != cudaSuccess) {                                                                             \
-      std::ostringstream oss;                                                                            \
-      oss << "CUDA error " << cudaGetErrorName(rc) << ": " << cudaGetErrorString(rc) << " at "         \
-          << __FILE__ << ":" << __LINE__;                                                                \
-      std::cerr << oss.str() << "\n";                                                                    \
-      throw std::runtime_error(oss.str());                                                               \
-    }                                                                                                    \
+#define CUDA_CHECK(call)                                                                                          \
+  do {                                                                                                            \
+    cudaError_t rc = call;                                                                                        \
+    if (rc != cudaSuccess) {                                                                                      \
+      std::ostringstream oss;                                                                                     \
+      oss << "CUDA error " << cudaGetErrorName(rc) << ": " << cudaGetErrorString(rc) << " at " << __FILE__ << ":" \
+          << __LINE__;                                                                                            \
+      std::cerr << oss.str() << "\n";                                                                             \
+      throw std::runtime_error(oss.str());                                                                        \
+    }                                                                                                             \
   } while (0)
 
 #define OPTIX_CHECK(call)                                                            \
@@ -143,8 +145,10 @@ struct GpuMeshBuffers {
   unsigned int num_vertices = 0;
   unsigned int num_triangles = 0;
 
-  bool IsValid() const { return d_vertices != 0 && d_indices_buf != 0 && d_normals != 0 && d_indices != 0 &&
-                                num_vertices > 0 && num_triangles > 0; }
+  bool IsValid() const {
+    return d_vertices != 0 && d_indices_buf != 0 && d_normals != 0 && d_indices != 0 && num_vertices > 0 &&
+           num_triangles > 0;
+  }
 };
 
 struct MeshCache {
@@ -278,7 +282,7 @@ struct OptixState {
   OptixProgramGroup hitgroup_shadow_pg = nullptr;
   OptixShaderBindingTable sbt = {};
   CUdeviceptr d_raygen_record = 0;
-  CUdeviceptr d_miss_records = 0;      // 2 miss records
+  CUdeviceptr d_miss_records = 0;  // 2 miss records
   CUdeviceptr d_hitgroup_records = 0;
   int hitgroup_record_capacity = 0;
   int hitgroup_record_count = 0;
@@ -410,8 +414,8 @@ static void init_optix(OptixState& state, const std::string& ptx_path, const ImV
 
   // Pipeline
   const uint32_t max_trace_depth = 3;
-  OptixProgramGroup program_groups[] = {state.raygen_pg, state.miss_radiance_pg, state.miss_shadow_pg,
-                                        state.hitgroup_mesh_pg, state.hitgroup_fluid_pg, state.hitgroup_ground_pg,
+  OptixProgramGroup program_groups[] = {state.raygen_pg,         state.miss_radiance_pg,  state.miss_shadow_pg,
+                                        state.hitgroup_mesh_pg,  state.hitgroup_fluid_pg, state.hitgroup_ground_pg,
                                         state.hitgroup_shadow_pg};
 
   OptixPipelineLinkOptions link_options = {};
@@ -457,8 +461,8 @@ static void init_optix(OptixState& state, const std::string& ptx_path, const ImV
   for (int i = 0; i < 2; i++) {
     OPTIX_CHECK(optixSbtRecordPackHeader(state.hitgroup_mesh_pg, &hg_defaults[i]));
   }
-  CUDA_CHECK(cudaMemcpy(reinterpret_cast<void*>(state.d_hitgroup_records), hg_defaults,
-                        2 * sizeof(HitGroupSbtRecord), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(reinterpret_cast<void*>(state.d_hitgroup_records), hg_defaults, 2 * sizeof(HitGroupSbtRecord),
+                        cudaMemcpyHostToDevice));
   state.hitgroup_record_count = 2;  // default: one geometry x two ray types
 
   // Assemble SBT
@@ -924,8 +928,8 @@ static bool load_dataset_field_lists(const std::string& vtk_file, std::vector<st
 }
 
 static viskores::cont::ArrayHandle<int> cast_scalar_field_to_int32(const viskores::cont::Field& field,
-                                                                    viskores::Id expected_num_values,
-                                                                    const char* field_context) {
+                                                                   viskores::Id expected_num_values,
+                                                                   const char* field_context) {
   if (field.GetData().GetNumberOfComponentsFlat() != 1) {
     throw std::runtime_error(std::string(field_context) + " must be scalar (1 component).");
   }
@@ -993,8 +997,8 @@ static void build_render_mesh_from_cache(const MeshCache& mesh_cache, int smooth
 
 // --- Rebuild GAS (geometry acceleration structure) ---
 
-static void rebuild_gas(OptixState& state, const BBox& bbox, bool include_mask, int fluid_mesh_count, bool ground_enabled,
-                        float ground_y_offset) {
+static void rebuild_gas(OptixState& state, const BBox& bbox, bool include_mask, int fluid_mesh_count,
+                        bool ground_enabled, float ground_y_offset) {
   if (!include_mask && fluid_mesh_count <= 0) {
     throw std::runtime_error("Scene rebuild requires at least one surface geometry.");
   }
@@ -1126,16 +1130,13 @@ static void rebuild_gas(OptixState& state, const BBox& bbox, bool include_mask, 
   state.sbt.hitgroupRecordCount = state.hitgroup_record_count;
 }
 
-static void rebuild_scene_from_caches(const MeshCache* mask_cache, const std::vector<int>& fluid_layer_indices,
-                                      const std::vector<DataLayer>& data_layers,
-                                      const std::vector<MeshCache>& fluid_layer_caches, OptixState& state,
-                                      const float3& light_dir, float light_r, float light_g, float light_b,
-                                      float light_strength, bool ground_enabled, const ImVec4& ground_color,
-                                      float ground_metallic, float ground_roughness, float ground_opacity,
-                                      float ground_y_offset, float rotate_x_deg, float rotate_y_deg, float rotate_z_deg,
-                                      int mask_smooth_iters, float mask_smooth_lambda, const ImVec4& mask_color,
-                                      float mask_metallic, float mask_roughness, float mask_opacity, float mask_ior,
-                                      BBox& bbox) {
+static void rebuild_scene_from_caches(
+    const MeshCache* mask_cache, const std::vector<int>& fluid_layer_indices, const std::vector<DataLayer>& data_layers,
+    const std::vector<MeshCache>& fluid_layer_caches, OptixState& state, const float3& light_dir, float light_r,
+    float light_g, float light_b, float light_strength, bool ground_enabled, const ImVec4& ground_color,
+    float ground_metallic, float ground_roughness, float ground_opacity, float ground_y_offset, float rotate_x_deg,
+    float rotate_y_deg, float rotate_z_deg, int mask_smooth_iters, float mask_smooth_lambda, const ImVec4& mask_color,
+    float mask_metallic, float mask_roughness, float mask_opacity, float mask_ior, BBox& bbox) {
   bool include_mask = (mask_cache != nullptr && mask_cache->valid);
   int fluid_count = static_cast<int>(fluid_layer_indices.size());
   if (!include_mask && fluid_count <= 0) {
@@ -1253,6 +1254,112 @@ static void update_scene_material_sbt(OptixState& state, const float3& light_dir
   }
 }
 
+static void render_background_to_host(int width, int height, const ImVec4& bg_color, std::vector<uchar4>& host_pixels) {
+  host_pixels.resize(static_cast<size_t>(width) * static_cast<size_t>(height));
+  uchar4 bg = make_uchar4(static_cast<unsigned char>(bg_color.x * 255.0f + 0.5f),
+                          static_cast<unsigned char>(bg_color.y * 255.0f + 0.5f),
+                          static_cast<unsigned char>(bg_color.z * 255.0f + 0.5f), 255);
+  std::fill(host_pixels.begin(), host_pixels.end(), bg);
+}
+
+static void render_optix_frame(OptixState& optix_state, int width, int height, int rt_samples, int rt_bounces,
+                               float cam_yaw, float cam_pitch, float cam_distance, const float cam_target[3],
+                               float cam_fov, bool shadows_enabled, std::vector<uchar4>& host_pixels) {
+  // Compute camera eye from spherical coordinates
+  float yaw_rad = cam_yaw * 3.14159265f / 180.0f;
+  float pitch_rad = cam_pitch * 3.14159265f / 180.0f;
+  float3 eye = make_float3(cam_target[0] + cam_distance * std::cos(pitch_rad) * std::sin(yaw_rad),
+                           cam_target[1] + cam_distance * std::sin(pitch_rad),
+                           cam_target[2] + cam_distance * std::cos(pitch_rad) * std::cos(yaw_rad));
+  float3 target = make_float3(cam_target[0], cam_target[1], cam_target[2]);
+
+  // Compute camera frame vectors
+  float3 W = make_float3(target.x - eye.x, target.y - eye.y, target.z - eye.z);
+  float w_len = std::sqrt(W.x * W.x + W.y * W.y + W.z * W.z);
+  if (w_len > 1e-6f) {
+    W.x /= w_len;
+    W.y /= w_len;
+    W.z /= w_len;
+  }
+
+  float3 world_up = make_float3(0.0f, 1.0f, 0.0f);
+  float3 U = make_float3(W.y * world_up.z - W.z * world_up.y, W.z * world_up.x - W.x * world_up.z,
+                         W.x * world_up.y - W.y * world_up.x);
+  float u_len = std::sqrt(U.x * U.x + U.y * U.y + U.z * U.z);
+  if (u_len > 1e-6f) {
+    U.x /= u_len;
+    U.y /= u_len;
+    U.z /= u_len;
+  }
+
+  float3 V = make_float3(U.y * W.z - U.z * W.y, U.z * W.x - U.x * W.z, U.x * W.y - U.y * W.x);
+
+  float half_h = std::tan(cam_fov * 3.14159265f / 360.0f);
+  float aspect = static_cast<float>(width) / static_cast<float>(height);
+  float half_w = half_h * aspect;
+
+  float3 cam_u = make_float3(U.x * half_w, U.y * half_w, U.z * half_w);
+  float3 cam_v = make_float3(-V.x * half_h, -V.y * half_h, -V.z * half_h);
+
+  if (optix_state.img_w != width || optix_state.img_h != height) {
+    if (optix_state.d_image) {
+      CUDA_CHECK(cudaFree(reinterpret_cast<void*>(optix_state.d_image)));
+    }
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&optix_state.d_image),
+                          static_cast<size_t>(width) * static_cast<size_t>(height) * sizeof(uchar4)));
+    optix_state.img_w = width;
+    optix_state.img_h = height;
+  }
+  host_pixels.resize(static_cast<size_t>(width) * static_cast<size_t>(height));
+
+  Params launch_params = {};
+  launch_params.image = reinterpret_cast<uchar4*>(optix_state.d_image);
+  launch_params.image_width = width;
+  launch_params.image_height = height;
+  launch_params.samples_per_pixel = static_cast<unsigned int>(rt_samples);
+  launch_params.max_depth = static_cast<unsigned int>(rt_bounces);
+  launch_params.cam_eye = eye;
+  launch_params.cam_u = cam_u;
+  launch_params.cam_v = cam_v;
+  launch_params.cam_w = W;
+  launch_params.handle = optix_state.gas_handle;
+  launch_params.shadows_enabled = shadows_enabled ? 1 : 0;
+
+  CUDA_CHECK(cudaMemcpy(reinterpret_cast<void*>(optix_state.d_params), &launch_params, sizeof(Params),
+                        cudaMemcpyHostToDevice));
+  OPTIX_CHECK(
+      optixLaunch(optix_state.pipeline, 0, optix_state.d_params, sizeof(Params), &optix_state.sbt, width, height, 1));
+  CUDA_CHECK(cudaDeviceSynchronize());
+
+  CUDA_CHECK(cudaMemcpy(host_pixels.data(), reinterpret_cast<void*>(optix_state.d_image),
+                        static_cast<size_t>(width) * static_cast<size_t>(height) * sizeof(uchar4),
+                        cudaMemcpyDeviceToHost));
+}
+
+static std::string trim_copy(const std::string& value) {
+  size_t start = 0;
+  while (start < value.size() && std::isspace(static_cast<unsigned char>(value[start])) != 0) {
+    start++;
+  }
+  size_t end = value.size();
+  while (end > start && std::isspace(static_cast<unsigned char>(value[end - 1])) != 0) {
+    end--;
+  }
+  return value.substr(start, end - start);
+}
+
+static std::string strip_png_extension(const std::string& input_name) {
+  std::string name = input_name;
+  if (name.size() >= 4) {
+    std::string ext = name.substr(name.size() - 4);
+    std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (ext == ".png") {
+      name.resize(name.size() - 4);
+    }
+  }
+  return name;
+}
+
 static void extract_mesh(const std::string& mask_filepath, const std::string& field_name, int solid_val,
                          MeshCache& mesh_cache) {
   viskores::cont::DataSet ds = read_vtk_dataset_with_compat(mask_filepath);
@@ -1275,8 +1382,7 @@ static void extract_mesh(const std::string& mask_filepath, const std::string& fi
 
   auto& pointField = pointDS.GetPointField(field_name);
   viskores::cont::ArrayHandle<int> mask_int32 =
-      cast_scalar_field_to_int32(pointField, pointDS.GetNumberOfPoints(),
-                                 "Contour input mask field");
+      cast_scalar_field_to_int32(pointField, pointDS.GetNumberOfPoints(), "Contour input mask field");
   pointField.SetData(mask_int32);
 
   // Marching Cubes: extract smooth isosurface at the boundary of solid_val
@@ -1369,8 +1475,8 @@ static void extract_mesh(const std::string& mask_filepath, const std::string& fi
 
 static void extract_fluid_mesh(const std::string& density_filepath, const std::string& density_field_name,
                                float density_threshold_min, float density_threshold_max,
-                               const std::string& mask_filepath,
-                               const std::string& mask_field_name, int fluid_flag, MeshCache& mesh_cache) {
+                               const std::string& mask_filepath, const std::string& mask_field_name, int fluid_flag,
+                               MeshCache& mesh_cache) {
   viskores::cont::DataSet density_ds = read_vtk_dataset_with_compat(density_filepath);
   viskores::cont::DataSet mask_ds = density_ds;
   if (mask_filepath != density_filepath) {
@@ -1417,8 +1523,7 @@ static void extract_fluid_mesh(const std::string& density_filepath, const std::s
 
   auto& mask_point_field = mask_point_ds.GetPointField(mask_field_name);
   viskores::cont::ArrayHandle<int> mask_int32 =
-      cast_scalar_field_to_int32(mask_point_field, mask_point_ds.GetNumberOfPoints(),
-                                 "Mask field");
+      cast_scalar_field_to_int32(mask_point_field, mask_point_ds.GetNumberOfPoints(), "Mask field");
   mask_point_field.SetData(mask_int32);
 
   if (density_point_ds.GetNumberOfPoints() != mask_point_ds.GetNumberOfPoints()) {
@@ -1515,9 +1620,10 @@ static void extract_fluid_mesh(const std::string& density_filepath, const std::s
         viskores::Vec3f origin(static_cast<float>(bounds.X.Min) - sx, static_cast<float>(bounds.Y.Min) - sy,
                                static_cast<float>(bounds.Z.Min) - sz);
         viskores::Vec3f spacing(sx, sy, sz);
-        contour_input = viskores::cont::DataSetBuilderUniform::Create(viskores::Id3(px, py, pz), origin, spacing, "coords");
-        contour_input.AddField(viskores::cont::Field(density_field_name, viskores::cont::Field::Association::Points,
-                                                     padded_array));
+        contour_input =
+            viskores::cont::DataSetBuilderUniform::Create(viskores::Id3(px, py, pz), origin, spacing, "coords");
+        contour_input.AddField(
+            viskores::cont::Field(density_field_name, viskores::cont::Field::Association::Points, padded_array));
       }
     }
   }
@@ -1793,6 +1899,15 @@ int main(int argc, char* argv[]) {
 
   // Host pixel buffer for copying from GPU
   std::vector<uchar4> host_pixels;
+  std::string save_image_dir;
+  std::string save_image_error_msg;
+  std::array<char, 256> save_image_name_buf{};
+  save_image_name_buf.fill(0);
+  std::strncpy(save_image_name_buf.data(), "viewport", save_image_name_buf.size() - 1);
+  int save_image_width = 1920;
+  int save_image_height = 1080;
+  bool save_image_append_dataset_index = true;
+  bool show_save_image_settings_popup = false;
 
   bool running = true;
   while (running) {
@@ -1952,10 +2067,20 @@ int main(int argc, char* argv[]) {
       ImGui::Text("Jump");
       ImGui::SameLine();
       ImGui::SetNextItemWidth(100.0f);
-      if (input_int_commit_on_enter("##jump_to_file", jump_file_index_1based, 1,
-                                    static_cast<int>(vtk_files.size()))) {
+      if (input_int_commit_on_enter("##jump_to_file", jump_file_index_1based, 1, static_cast<int>(vtk_files.size()))) {
         vtk_index = std::clamp(jump_file_index_1based - 1, 0, static_cast<int>(vtk_files.size()) - 1);
         jump_file_index_1based = vtk_index + 1;
+      }
+      ImGui::Spacing();
+      if (ImGui::Button("Save Image")) {
+        IGFD::FileDialogConfig save_config;
+        if (!vtk_dir.empty()) {
+          save_config.path = vtk_dir;
+        } else if (const char* home = getenv("HOME")) {
+          save_config.path = home;
+        }
+        save_config.flags |= ImGuiFileDialogFlags_OptionalFileName;
+        ImGuiFileDialog::Instance()->OpenDialog("SaveImageDirDlg", "Choose Save Location", nullptr, save_config);
       }
       if (dataset_loaded_field_vtk_index != vtk_index) {
         try {
@@ -2215,7 +2340,8 @@ int main(int argc, char* argv[]) {
     }
     ImGui::End();
 
-    if (ImGuiFileDialog::Instance()->Display("OpenFileDlg")) {
+    if (ImGuiFileDialog::Instance()->Display("OpenFileDlg", ImGuiWindowFlags_None, ImVec2(840, 520),
+                                             ImVec2(1920, 1200))) {
       if (ImGuiFileDialog::Instance()->IsOk()) {
         vtk_dir = ImGuiFileDialog::Instance()->GetCurrentPath();
         vtk_files.clear();
@@ -2249,7 +2375,8 @@ int main(int argc, char* argv[]) {
       ImGuiFileDialog::Instance()->Close();
     }
 
-    if (ImGuiFileDialog::Instance()->Display("OpenMaskDlg")) {
+    if (ImGuiFileDialog::Instance()->Display("OpenMaskDlg", ImGuiWindowFlags_None, ImVec2(840, 520),
+                                             ImVec2(1920, 1200))) {
       if (ImGuiFileDialog::Instance()->IsOk()) {
         std::string selected_file = ImGuiFileDialog::Instance()->GetFilePathName();
 
@@ -2303,6 +2430,97 @@ int main(int argc, char* argv[]) {
       ImGuiFileDialog::Instance()->Close();
     }
 
+    if (ImGuiFileDialog::Instance()->Display("SaveImageDirDlg", ImGuiWindowFlags_None, ImVec2(840, 520),
+                                             ImVec2(1920, 1200))) {
+      if (ImGuiFileDialog::Instance()->IsOk()) {
+        save_image_dir = ImGuiFileDialog::Instance()->GetCurrentPath();
+        if (save_image_dir.empty()) {
+          if (!vtk_dir.empty()) {
+            save_image_dir = vtk_dir;
+          } else if (const char* home = getenv("HOME")) {
+            save_image_dir = home;
+          }
+        }
+        save_image_width = std::max(1, prev_vp_w > 0 ? prev_vp_w : width);
+        save_image_height = std::max(1, prev_vp_h > 0 ? prev_vp_h : height);
+        std::strncpy(save_image_name_buf.data(), "viewport", save_image_name_buf.size() - 1);
+        save_image_name_buf[save_image_name_buf.size() - 1] = '\0';
+        save_image_append_dataset_index = true;
+        save_image_error_msg.clear();
+        show_save_image_settings_popup = true;
+      }
+      ImGuiFileDialog::Instance()->Close();
+    }
+
+    if (show_save_image_settings_popup) {
+      ImGui::OpenPopup("Save View Image");
+      show_save_image_settings_popup = false;
+    }
+    if (ImGui::BeginPopupModal("Save View Image", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+      ImGui::TextWrapped("Location: %s", save_image_dir.c_str());
+      ImGui::Spacing();
+      ImGui::Text("Filename");
+      ImGui::SetNextItemWidth(300.0f);
+      ImGui::InputText("##save_image_filename", save_image_name_buf.data(), save_image_name_buf.size());
+      ImGui::Text("Width");
+      ImGui::SameLine();
+      ImGui::SetNextItemWidth(120.0f);
+      input_int_commit_on_enter("##save_image_width", save_image_width, 1, 16384);
+      ImGui::Text("Height");
+      ImGui::SameLine();
+      ImGui::SetNextItemWidth(120.0f);
+      input_int_commit_on_enter("##save_image_height", save_image_height, 1, 16384);
+      ImGui::Checkbox("Append Dataset Index", &save_image_append_dataset_index);
+
+      if (!save_image_error_msg.empty()) {
+        ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "%s", save_image_error_msg.c_str());
+      }
+
+      if (ImGui::Button("Save")) {
+        try {
+          std::string file_name = trim_copy(std::string(save_image_name_buf.data()));
+          file_name = strip_png_extension(file_name);
+          if (file_name.empty()) {
+            throw std::runtime_error("Filename cannot be empty.");
+          }
+          if (save_image_append_dataset_index) {
+            int frame_index_1based =
+                (!vtk_files.empty() ? std::clamp(vtk_index + 1, 1, static_cast<int>(vtk_files.size())) : 0);
+            char suffix[16];
+            std::snprintf(suffix, sizeof(suffix), "_%07d", frame_index_1based);
+            file_name += suffix;
+          }
+          std::filesystem::path out_path = std::filesystem::path(save_image_dir) / (file_name + ".png");
+
+          if (mesh_loaded && optix_state.gas_handle != 0) {
+            render_optix_frame(optix_state, save_image_width, save_image_height, rt_samples, rt_bounces, cam_yaw,
+                               cam_pitch, cam_distance, cam_target, cam_fov, shadows_enabled, host_pixels);
+          } else {
+            render_background_to_host(save_image_width, save_image_height, bg_color, host_pixels);
+          }
+
+          int write_ok = stbi_write_png(out_path.string().c_str(), save_image_width, save_image_height, 4,
+                                        host_pixels.data(), save_image_width * static_cast<int>(sizeof(uchar4)));
+          if (write_ok == 0) {
+            throw std::runtime_error("Failed to write PNG.");
+          }
+          save_image_error_msg.clear();
+          ImGui::CloseCurrentPopup();
+          viewport_needs_render = true;
+        } catch (const std::exception& e) {
+          save_image_error_msg = e.what();
+        } catch (...) {
+          save_image_error_msg = "Failed to save image.";
+        }
+      }
+      ImGui::SameLine();
+      if (ImGui::Button("Cancel")) {
+        save_image_error_msg.clear();
+        ImGui::CloseCurrentPopup();
+      }
+      ImGui::EndPopup();
+    }
+
     if (show_mask_error) {
       ImGui::OpenPopup("Mask Error");
       show_mask_error = false;
@@ -2316,7 +2534,8 @@ int main(int argc, char* argv[]) {
     }
 
     // Detect mesh extraction triggers (full rebuild) vs smoothing-only cache rebuild.
-    bool mask_selection_changed = show_mask && (mask_field_index != prev_mask_field_index || solid_flag != prev_solid_flag);
+    bool mask_selection_changed =
+        show_mask && (mask_field_index != prev_mask_field_index || solid_flag != prev_solid_flag);
     bool mask_smooth_changed =
         (smooth_iterations != prev_smooth_iterations) || (std::fabs(smooth_strength - prev_smooth_strength) > 1e-4f);
     bool transform_changed = (std::fabs(rotate_x_deg - prev_rotate_x_deg) > 1e-4f) ||
@@ -2328,14 +2547,14 @@ int main(int argc, char* argv[]) {
     bool has_mask_selection = !mask_file.empty() && !mask_field_names.empty() && mask_field_index >= 0 &&
                               mask_field_index < static_cast<int>(mask_field_names.size());
     std::string selected_mask_field = has_mask_selection ? mask_field_names[mask_field_index] : std::string();
-    std::string fluid_source_file = (!vtk_files.empty() && vtk_index >= 0 && vtk_index < static_cast<int>(vtk_files.size()))
-                                        ? vtk_files[vtk_index]
-                                        : std::string();
+    std::string fluid_source_file =
+        (!vtk_files.empty() && vtk_index >= 0 && vtk_index < static_cast<int>(vtk_files.size())) ? vtk_files[vtk_index]
+                                                                                                 : std::string();
 
     bool wants_mask = show_mask && has_mask_selection;
-    bool mask_cache_matches_selection = wants_mask && mask_mesh_cache.valid && mask_mesh_cache.source_file == mask_file &&
-                                        mask_mesh_cache.source_field == selected_mask_field &&
-                                        mask_mesh_cache.source_solid_flag == solid_flag;
+    bool mask_cache_matches_selection =
+        wants_mask && mask_mesh_cache.valid && mask_mesh_cache.source_file == mask_file &&
+        mask_mesh_cache.source_field == selected_mask_field && mask_mesh_cache.source_solid_flag == solid_flag;
     bool needs_mask_extract = wants_mask && (mask_selection_changed || !mask_cache_matches_selection);
 
     struct LayerFrameState {
@@ -2373,12 +2592,13 @@ int main(int argc, char* argv[]) {
       state.smoothing_changed =
           state.renderable && ((layer.smooth_iterations != layer.prev_smooth_iterations) ||
                                (std::fabs(layer.smooth_strength - layer.prev_smooth_strength) > 1e-4f));
-      state.material_changed = state.renderable && (layer.color.x != layer.prev_color.x || layer.color.y != layer.prev_color.y ||
-                                                    layer.color.z != layer.prev_color.z ||
-                                                    std::fabs(layer.metallic - layer.prev_metallic) > 1e-5f ||
-                                                    std::fabs(layer.roughness - layer.prev_roughness) > 1e-5f ||
-                                                    std::fabs(layer.opacity - layer.prev_opacity) > 1e-5f ||
-                                                    std::fabs(layer.glass_ior - layer.prev_glass_ior) > 1e-5f);
+      state.material_changed =
+          state.renderable &&
+          (layer.color.x != layer.prev_color.x || layer.color.y != layer.prev_color.y ||
+           layer.color.z != layer.prev_color.z || std::fabs(layer.metallic - layer.prev_metallic) > 1e-5f ||
+           std::fabs(layer.roughness - layer.prev_roughness) > 1e-5f ||
+           std::fabs(layer.opacity - layer.prev_opacity) > 1e-5f ||
+           std::fabs(layer.glass_ior - layer.prev_glass_ior) > 1e-5f);
 
       state.same_failed_request =
           state.renderable && layer.suppress_retry_after_error && layer.failed_source_file == fluid_source_file &&
@@ -2393,7 +2613,8 @@ int main(int argc, char* argv[]) {
 
       state.cache_matches = state.renderable && layer_cache.valid && layer_cache.source_file == fluid_source_file &&
                             layer_cache.source_field == layer.name && layer_cache.source_solid_flag == layer.fluid_flag;
-      state.needs_extract = state.renderable && !state.same_failed_request && (!state.cache_matches || state.threshold_changed);
+      state.needs_extract =
+          state.renderable && !state.same_failed_request && (!state.cache_matches || state.threshold_changed);
 
       any_layer_extract = any_layer_extract || state.needs_extract;
       any_layer_smooth_changed = any_layer_smooth_changed || state.smoothing_changed;
@@ -2475,7 +2696,8 @@ int main(int argc, char* argv[]) {
         ((render_mask && (mask_smooth_changed || transform_changed)) ||
          (render_fluid && (any_layer_smooth_changed || transform_changed)) || visibility_changed || !mesh_loaded);
     bool needs_full_rebuild = render_any && (extraction_attempted || needs_mesh_rebuild_from_cache);
-    bool needs_gas_rebuild = render_any && mesh_loaded && !needs_full_rebuild && (ground_toggled || ground_offset_changed);
+    bool needs_gas_rebuild =
+        render_any && mesh_loaded && !needs_full_rebuild && (ground_toggled || ground_offset_changed);
 
     if (needs_full_rebuild) {
       try {
@@ -2491,9 +2713,9 @@ int main(int argc, char* argv[]) {
         mesh_bbox = bbox;
         viewport_needs_render = true;
 
-        if (extraction_attempted || !mesh_was_loaded) {
-          float3 center =
-              make_float3((bbox.lo.x + bbox.hi.x) * 0.5f, (bbox.lo.y + bbox.hi.y) * 0.5f, (bbox.lo.z + bbox.hi.z) * 0.5f);
+        if (!mesh_was_loaded) {
+          float3 center = make_float3((bbox.lo.x + bbox.hi.x) * 0.5f, (bbox.lo.y + bbox.hi.y) * 0.5f,
+                                      (bbox.lo.z + bbox.hi.z) * 0.5f);
           cam_target[0] = center.x;
           cam_target[1] = center.y;
           cam_target[2] = center.z;
@@ -2557,12 +2779,12 @@ int main(int argc, char* argv[]) {
         }
         fluid_mat_changed = fluid_mat_changed || layer_states[static_cast<size_t>(layer_idx)].material_changed;
       }
-      bool ground_mat_changed = ground_enabled &&
-                                (ground_color.x != prev_ground_color.x || ground_color.y != prev_ground_color.y ||
-                                 ground_color.z != prev_ground_color.z ||
-                                 std::fabs(ground_metallic - prev_ground_metallic) > 1e-5f ||
-                                 std::fabs(ground_roughness - prev_ground_roughness) > 1e-5f ||
-                                 std::fabs(ground_opacity - prev_ground_opacity) > 1e-5f);
+      bool ground_mat_changed =
+          ground_enabled &&
+          (ground_color.x != prev_ground_color.x || ground_color.y != prev_ground_color.y ||
+           ground_color.z != prev_ground_color.z || std::fabs(ground_metallic - prev_ground_metallic) > 1e-5f ||
+           std::fabs(ground_roughness - prev_ground_roughness) > 1e-5f ||
+           std::fabs(ground_opacity - prev_ground_opacity) > 1e-5f);
 
       if (light_changed || mask_mat_changed || fluid_mat_changed || ground_mat_changed) {
         update_scene_material_sbt(optix_state, light_dir, light_color.x, light_color.y, light_color.z, light_strength,
@@ -2701,84 +2923,8 @@ int main(int argc, char* argv[]) {
     if (render_any && mesh_loaded && viewport_needs_render) {
       viewport_needs_render = false;
       try {
-        // Compute camera eye from spherical coordinates
-        float yaw_rad = cam_yaw * 3.14159265f / 180.0f;
-        float pitch_rad = cam_pitch * 3.14159265f / 180.0f;
-        float3 eye = make_float3(cam_target[0] + cam_distance * std::cos(pitch_rad) * std::sin(yaw_rad),
-                                 cam_target[1] + cam_distance * std::sin(pitch_rad),
-                                 cam_target[2] + cam_distance * std::cos(pitch_rad) * std::cos(yaw_rad));
-        float3 target = make_float3(cam_target[0], cam_target[1], cam_target[2]);
-
-        // Compute camera frame vectors
-        float3 W = make_float3(target.x - eye.x, target.y - eye.y, target.z - eye.z);
-        float w_len = std::sqrt(W.x * W.x + W.y * W.y + W.z * W.z);
-        if (w_len > 1e-6f) {
-          W.x /= w_len;
-          W.y /= w_len;
-          W.z /= w_len;
-        }
-
-        float3 world_up = make_float3(0.0f, 1.0f, 0.0f);
-        // U = cross(W, world_up)
-        float3 U = make_float3(W.y * world_up.z - W.z * world_up.y, W.z * world_up.x - W.x * world_up.z,
-                               W.x * world_up.y - W.y * world_up.x);
-        float u_len = std::sqrt(U.x * U.x + U.y * U.y + U.z * U.z);
-        if (u_len > 1e-6f) {
-          U.x /= u_len;
-          U.y /= u_len;
-          U.z /= u_len;
-        }
-
-        // V = cross(U, W)
-        float3 V = make_float3(U.y * W.z - U.z * W.y, U.z * W.x - U.x * W.z, U.x * W.y - U.y * W.x);
-
-        // Scale U and V by FOV
-        float half_h = std::tan(cam_fov * 3.14159265f / 360.0f);
-        float aspect = (float)vp_w / (float)vp_h;
-        float half_w = half_h * aspect;
-
-        float3 cam_u = make_float3(U.x * half_w, U.y * half_w, U.z * half_w);
-        // Negate V so that y=0 (d.y=-1) maps to camera UP, matching screen convention
-        float3 cam_v = make_float3(-V.x * half_h, -V.y * half_h, -V.z * half_h);
-
-        // Resize device image buffer if needed
-        if (optix_state.img_w != vp_w || optix_state.img_h != vp_h) {
-          if (optix_state.d_image) {
-            cudaFree(reinterpret_cast<void*>(optix_state.d_image));
-          }
-          CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&optix_state.d_image), vp_w * vp_h * sizeof(uchar4)));
-          optix_state.img_w = vp_w;
-          optix_state.img_h = vp_h;
-          host_pixels.resize(vp_w * vp_h);
-        }
-
-        // Fill launch params
-        Params launch_params = {};
-        launch_params.image = reinterpret_cast<uchar4*>(optix_state.d_image);
-        launch_params.image_width = vp_w;
-        launch_params.image_height = vp_h;
-        launch_params.samples_per_pixel = static_cast<unsigned int>(rt_samples);
-        launch_params.max_depth = static_cast<unsigned int>(rt_bounces);
-        launch_params.cam_eye = eye;
-        launch_params.cam_u = cam_u;
-        launch_params.cam_v = cam_v;
-        launch_params.cam_w = W;
-        launch_params.handle = optix_state.gas_handle;
-
-        // Fill shadow toggle
-        launch_params.shadows_enabled = shadows_enabled ? 1 : 0;
-
-        CUDA_CHECK(cudaMemcpy(reinterpret_cast<void*>(optix_state.d_params), &launch_params, sizeof(Params),
-                              cudaMemcpyHostToDevice));
-
-        // Launch ray tracing
-        OPTIX_CHECK(optixLaunch(optix_state.pipeline, 0, optix_state.d_params, sizeof(Params), &optix_state.sbt, vp_w,
-                                vp_h, 1));
-        CUDA_CHECK(cudaDeviceSynchronize());
-
-        // Copy result to host
-        CUDA_CHECK(cudaMemcpy(host_pixels.data(), reinterpret_cast<void*>(optix_state.d_image),
-                              vp_w * vp_h * sizeof(uchar4), cudaMemcpyDeviceToHost));
+        render_optix_frame(optix_state, vp_w, vp_h, rt_samples, rt_bounces, cam_yaw, cam_pitch, cam_distance,
+                           cam_target, cam_fov, shadows_enabled, host_pixels);
 
         // Upload to SDL texture
         void* tex_pixels = nullptr;
@@ -2799,10 +2945,7 @@ int main(int argc, char* argv[]) {
       viewport_needs_render = false;
 
       // Fill viewport with background color (no OptiX)
-      host_pixels.resize(vp_w * vp_h);
-      uchar4 bg = make_uchar4((unsigned char)(bg_color.x * 255.0f + 0.5f), (unsigned char)(bg_color.y * 255.0f + 0.5f),
-                              (unsigned char)(bg_color.z * 255.0f + 0.5f), 255);
-      std::fill(host_pixels.begin(), host_pixels.end(), bg);
+      render_background_to_host(vp_w, vp_h, bg_color, host_pixels);
 
       void* tex_pixels = nullptr;
       int tex_pitch = 0;

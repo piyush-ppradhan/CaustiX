@@ -11,3 +11,6 @@
 [submodule "lib/viskores"]
 	path = lib/viskores
 	url = https://github.com/Viskores/viskores
+[submodule "lib/stb"]
+	path = lib/stb
+	url = https://github.com/nothings/stb
