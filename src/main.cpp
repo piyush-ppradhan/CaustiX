@@ -790,6 +790,30 @@ static bool load_dataset_field_lists(const std::string& vtk_file, std::vector<st
   return true;
 }
 
+static viskores::cont::ArrayHandle<int> cast_scalar_field_to_int32(const viskores::cont::Field& field,
+                                                                    viskores::Id expected_num_values,
+                                                                    const char* field_context) {
+  if (field.GetData().GetNumberOfComponentsFlat() != 1) {
+    throw std::runtime_error(std::string(field_context) + " must be scalar (1 component).");
+  }
+
+  viskores::cont::UnknownArrayHandle scalar_data = field.GetDataAsDefaultFloat();
+  if (scalar_data.GetNumberOfComponentsFlat() != 1 || scalar_data.GetNumberOfValues() != expected_num_values) {
+    throw std::runtime_error(std::string(field_context) + " size does not match point count.");
+  }
+
+  auto scalar_array = scalar_data.AsArrayHandle<viskores::cont::ArrayHandle<float>>();
+  auto scalar_portal = scalar_array.ReadPortal();
+
+  viskores::cont::ArrayHandle<int> out_int32;
+  out_int32.Allocate(expected_num_values);
+  auto out_portal = out_int32.WritePortal();
+  for (viskores::Id i = 0; i < expected_num_values; i++) {
+    out_portal.Set(i, static_cast<int>(std::llround(scalar_portal.Get(i))));
+  }
+  return out_int32;
+}
+
 static void sync_data_layer_caches(std::vector<DataLayer>& layers, std::vector<MeshCache>& layer_mesh_caches) {
   if (layer_mesh_caches.size() < layers.size()) {
     layer_mesh_caches.resize(layers.size());
@@ -1117,17 +1141,11 @@ static void extract_mesh(const std::string& mask_filepath, const std::string& fi
     throw std::runtime_error("Selected mask field must be a point or cell field.");
   }
 
-  // Force the active point field into a scalar float-compatible array using Viskores'
-  // built-in conversion path for unknown/runtime field storage.
   auto& pointField = pointDS.GetPointField(field_name);
-  if (pointField.GetData().GetNumberOfComponentsFlat() != 1) {
-    throw std::runtime_error("Contour input field must remain scalar after cell-to-point conversion.");
-  }
-  viskores::cont::UnknownArrayHandle scalarData = pointField.GetDataAsDefaultFloat();
-  if (scalarData.GetNumberOfComponentsFlat() != 1 || scalarData.GetNumberOfValues() != pointDS.GetNumberOfPoints()) {
-    throw std::runtime_error("Contour input field size does not match point count.");
-  }
-  pointField.SetData(scalarData);
+  viskores::cont::ArrayHandle<int> mask_int32 =
+      cast_scalar_field_to_int32(pointField, pointDS.GetNumberOfPoints(),
+                                 "Contour input mask field");
+  pointField.SetData(mask_int32);
 
   // Marching Cubes: extract smooth isosurface at the boundary of solid_val
   viskores::filter::contour::Contour contour;
@@ -1268,11 +1286,10 @@ static void extract_fluid_mesh(const std::string& density_filepath, const std::s
   density_point_field.SetData(density_scalar);
 
   auto& mask_point_field = mask_point_ds.GetPointField(mask_field_name);
-  viskores::cont::UnknownArrayHandle mask_scalar = mask_point_field.GetDataAsDefaultFloat();
-  if (mask_scalar.GetNumberOfComponentsFlat() != 1 || mask_scalar.GetNumberOfValues() != mask_point_ds.GetNumberOfPoints()) {
-    throw std::runtime_error("Mask field size does not match point count.");
-  }
-  mask_point_field.SetData(mask_scalar);
+  viskores::cont::ArrayHandle<int> mask_int32 =
+      cast_scalar_field_to_int32(mask_point_field, mask_point_ds.GetNumberOfPoints(),
+                                 "Mask field");
+  mask_point_field.SetData(mask_int32);
 
   if (density_point_ds.GetNumberOfPoints() != mask_point_ds.GetNumberOfPoints()) {
     throw std::runtime_error("Density and mask datasets must share the same point count.");
@@ -1280,7 +1297,7 @@ static void extract_fluid_mesh(const std::string& density_filepath, const std::s
 
   viskores::Id num_points = density_point_ds.GetNumberOfPoints();
   auto density_array = density_point_field.GetData().AsArrayHandle<viskores::cont::ArrayHandle<float>>();
-  auto mask_array = mask_point_field.GetData().AsArrayHandle<viskores::cont::ArrayHandle<float>>();
+  auto mask_array = mask_point_field.GetData().AsArrayHandle<viskores::cont::ArrayHandle<int>>();
   auto density_portal = density_array.ReadPortal();
   auto mask_portal = mask_array.ReadPortal();
 
@@ -1290,7 +1307,7 @@ static void extract_fluid_mesh(const std::string& density_filepath, const std::s
   bool found_fluid_flag = false;
   bool found_in_range = false;
   for (viskores::Id i = 0; i < num_points; i++) {
-    int mask_value = static_cast<int>(std::llround(mask_portal.Get(i)));
+    int mask_value = mask_portal.Get(i);
     if (mask_value == fluid_flag) {
       found_fluid_flag = true;
       float d = density_portal.Get(i);
@@ -1308,7 +1325,7 @@ static void extract_fluid_mesh(const std::string& density_filepath, const std::s
   std::vector<float> filtered_density(static_cast<size_t>(num_points), 0.0f);
 
   for (viskores::Id i = 0; i < num_points; i++) {
-    int mask_value = static_cast<int>(std::llround(mask_portal.Get(i)));
+    int mask_value = mask_portal.Get(i);
     if (mask_value == fluid_flag) {
       float d = density_portal.Get(i);
       if (d >= threshold_min && d <= threshold_max) {
