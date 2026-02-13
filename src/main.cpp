@@ -21,12 +21,16 @@
 #include <optix_stubs.h>
 #include <cuda_runtime.h>
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cstdint>
+#include <cstdlib>
 #include <cmath>
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <unordered_map>
 #include <vector>
 #include <iostream>
 #include <stdexcept>
@@ -63,6 +67,8 @@
 
 static char optix_log[2048];
 static size_t optix_log_size = sizeof(optix_log);
+static constexpr float kDefaultDataThresholdMin = 0.5f;
+static constexpr float kDefaultDataThresholdMax = 1.0f;
 
 #define OPTIX_CHECK_LOG(call)                                    \
   do {                                                           \
@@ -93,9 +99,9 @@ struct DataLayer {
   std::string name;
   bool show = true;
   bool prev_show = show;
-  float threshold_min = 0.5f;
+  float threshold_min = kDefaultDataThresholdMin;
   float prev_threshold_min = threshold_min;
-  float threshold_max = 1.0f;
+  float threshold_max = kDefaultDataThresholdMax;
   float prev_threshold_max = threshold_max;
   int fluid_flag = 0;
   int prev_fluid_flag = fluid_flag;
@@ -217,6 +223,7 @@ struct DatasetState {
   std::string vtk_dir;
   std::vector<std::string> vtk_files;
   int vtk_index = 0;
+  int jump_file_index_1based = 1;
   std::vector<std::string> cell_names;
   std::vector<std::string> scalar_cell_names;
   std::vector<DataLayer> layers;
@@ -762,6 +769,75 @@ static int find_field_index(const std::vector<std::string>& field_names, const s
     }
   }
   return -1;
+}
+
+struct DeferredNumericInputState {
+  std::array<char, 64> buffer = {};
+  bool initialized = false;
+  bool was_active = false;
+};
+
+static std::unordered_map<ImGuiID, DeferredNumericInputState> g_deferred_numeric_input_states;
+
+static void sync_deferred_input_buffer(DeferredNumericInputState& state, const char* fmt, double value) {
+  std::snprintf(state.buffer.data(), state.buffer.size(), fmt, value);
+  state.initialized = true;
+}
+
+static bool input_int_commit_on_enter(const char* label, int& value, int min_value, int max_value) {
+  ImGuiID id = ImGui::GetID(label);
+  auto& state = g_deferred_numeric_input_states[id];
+  if (!state.initialized || !state.was_active) {
+    sync_deferred_input_buffer(state, "%.0f", static_cast<double>(value));
+  }
+
+  bool submitted = ImGui::InputText(label, state.buffer.data(), state.buffer.size(),
+                                    ImGuiInputTextFlags_CharsDecimal | ImGuiInputTextFlags_EnterReturnsTrue);
+  bool is_active = ImGui::IsItemActive();
+  bool committed = false;
+  if (submitted) {
+    char* end_ptr = nullptr;
+    long parsed = std::strtol(state.buffer.data(), &end_ptr, 10);
+    if (end_ptr != state.buffer.data()) {
+      parsed = std::clamp(parsed, static_cast<long>(min_value), static_cast<long>(max_value));
+      value = static_cast<int>(parsed);
+      committed = true;
+    }
+    sync_deferred_input_buffer(state, "%.0f", static_cast<double>(value));
+  } else if (!is_active && state.was_active) {
+    sync_deferred_input_buffer(state, "%.0f", static_cast<double>(value));
+  }
+
+  state.was_active = is_active;
+  return committed;
+}
+
+static bool input_float_commit_on_enter(const char* label, float& value, float min_value, float max_value) {
+  ImGuiID id = ImGui::GetID(label);
+  auto& state = g_deferred_numeric_input_states[id];
+  if (!state.initialized || !state.was_active) {
+    sync_deferred_input_buffer(state, "%.6f", static_cast<double>(value));
+  }
+
+  bool submitted = ImGui::InputText(label, state.buffer.data(), state.buffer.size(),
+                                    ImGuiInputTextFlags_CharsScientific | ImGuiInputTextFlags_EnterReturnsTrue);
+  bool is_active = ImGui::IsItemActive();
+  bool committed = false;
+  if (submitted) {
+    char* end_ptr = nullptr;
+    float parsed = std::strtof(state.buffer.data(), &end_ptr);
+    if (end_ptr != state.buffer.data()) {
+      parsed = std::clamp(parsed, min_value, max_value);
+      value = parsed;
+      committed = true;
+    }
+    sync_deferred_input_buffer(state, "%.6f", static_cast<double>(value));
+  } else if (!is_active && state.was_active) {
+    sync_deferred_input_buffer(state, "%.6f", static_cast<double>(value));
+  }
+
+  state.was_active = is_active;
+  return committed;
 }
 
 static bool replace_all_padded(std::string& text, const std::string& token, const std::string& replacement) {
@@ -1618,6 +1694,7 @@ int main(int argc, char* argv[]) {
   std::string& vtk_dir = dataset.vtk_dir;
   std::vector<std::string>& vtk_files = dataset.vtk_files;
   int& vtk_index = dataset.vtk_index;
+  int& jump_file_index_1based = dataset.jump_file_index_1based;
   std::vector<std::string>& dataset_cell_names = dataset.cell_names;
   std::vector<std::string>& dataset_scalar_cell_names = dataset.scalar_cell_names;
   std::vector<DataLayer>& data_layers = dataset.layers;
@@ -1771,7 +1848,8 @@ int main(int argc, char* argv[]) {
     ImGui::Spacing();
     ImGui::Text("Strength");
     ImGui::SameLine();
-    ImGui::InputFloat("##strength", &light_strength);
+    ImGui::SetNextItemWidth(100.0f);
+    input_float_commit_on_enter("##strength", light_strength, 0.0f, 1000000.0f);
     ImGui::Text("Color");
     ImGui::ColorEdit3("##light_color", (float*)&light_color);
     ImGui::Spacing();
@@ -1784,13 +1862,11 @@ int main(int argc, char* argv[]) {
     ImGui::Text("Bounces");
     ImGui::SameLine();
     ImGui::SetNextItemWidth(80);
-    ImGui::InputInt("##rt_bounces", &rt_bounces);
-    rt_bounces = std::max(1, std::min(16, rt_bounces));
+    input_int_commit_on_enter("##rt_bounces", rt_bounces, 1, 16);
     ImGui::Text("Samples");
     ImGui::SameLine();
     ImGui::SetNextItemWidth(80);
-    ImGui::InputInt("##rt_samples", &rt_samples);
-    rt_samples = std::max(1, std::min(64, rt_samples));
+    input_int_commit_on_enter("##rt_samples", rt_samples, 1, 64);
 
     // Ground Plane section
     ImGui::Spacing();
@@ -1805,21 +1881,21 @@ int main(int argc, char* argv[]) {
       ImGui::Text("Y Offset");
       ImGui::SameLine();
       ImGui::SetNextItemWidth(-1);
-      ImGui::DragFloat("##ground_y_offset", &ground_y_offset, 0.01f);
+      input_float_commit_on_enter("##ground_y_offset", ground_y_offset, -1000000.0f, 1000000.0f);
       ImGui::Text("Color");
       ImGui::ColorEdit3("##ground_color", (float*)&ground_color);
       ImGui::Text("Metallic");
       ImGui::SameLine();
       ImGui::SetNextItemWidth(-1);
-      ImGui::SliderFloat("##ground_metallic", &ground_metallic, 0.0f, 1.0f);
+      ImGui::SliderFloat("##ground_metallic", &ground_metallic, 0.0f, 1.0f, "%.3f", ImGuiSliderFlags_NoInput);
       ImGui::Text("Roughness");
       ImGui::SameLine();
       ImGui::SetNextItemWidth(-1);
-      ImGui::SliderFloat("##ground_roughness", &ground_roughness, 0.0f, 1.0f);
+      ImGui::SliderFloat("##ground_roughness", &ground_roughness, 0.0f, 1.0f, "%.3f", ImGuiSliderFlags_NoInput);
       ImGui::Text("Opacity");
       ImGui::SameLine();
       ImGui::SetNextItemWidth(-1);
-      ImGui::SliderFloat("##ground_opacity", &ground_opacity, 0.0f, 1.0f);
+      ImGui::SliderFloat("##ground_opacity", &ground_opacity, 0.0f, 1.0f, "%.3f", ImGuiSliderFlags_NoInput);
     }
 
     ImGui::End();
@@ -1842,6 +1918,7 @@ int main(int argc, char* argv[]) {
       vtk_dir.clear();
       vtk_files.clear();
       vtk_index = 0;
+      jump_file_index_1based = 1;
       dataset_cell_names.clear();
       dataset_scalar_cell_names.clear();
       dataset_loaded_field_vtk_index = -1;
@@ -1851,13 +1928,35 @@ int main(int argc, char* argv[]) {
     }
     if (!vtk_files.empty()) {
       ImGui::Spacing();
-      if (ImGui::Button("Begin")) vtk_index = 0;
+      if (ImGui::Button("Begin")) {
+        vtk_index = 0;
+        jump_file_index_1based = 1;
+      }
       ImGui::SameLine();
-      if (ImGui::Button("Prev") && vtk_index > 0) vtk_index--;
+      if (ImGui::Button("Prev") && vtk_index > 0) {
+        vtk_index--;
+        jump_file_index_1based = vtk_index + 1;
+      }
       ImGui::SameLine();
-      if (ImGui::Button("Next") && vtk_index < (int)vtk_files.size() - 1) vtk_index++;
+      if (ImGui::Button("Next") && vtk_index < (int)vtk_files.size() - 1) {
+        vtk_index++;
+        jump_file_index_1based = vtk_index + 1;
+      }
       ImGui::SameLine();
-      if (ImGui::Button("End")) vtk_index = (int)vtk_files.size() - 1;
+      if (ImGui::Button("End")) {
+        vtk_index = (int)vtk_files.size() - 1;
+        jump_file_index_1based = vtk_index + 1;
+      }
+      ImGui::Text("Files: %d", static_cast<int>(vtk_files.size()));
+      ImGui::SameLine();
+      ImGui::Text("Jump");
+      ImGui::SameLine();
+      ImGui::SetNextItemWidth(100.0f);
+      if (input_int_commit_on_enter("##jump_to_file", jump_file_index_1based, 1,
+                                    static_cast<int>(vtk_files.size()))) {
+        vtk_index = std::clamp(jump_file_index_1based - 1, 0, static_cast<int>(vtk_files.size()) - 1);
+        jump_file_index_1based = vtk_index + 1;
+      }
       if (dataset_loaded_field_vtk_index != vtk_index) {
         try {
           if (load_dataset_field_lists(vtk_files[vtk_index], dataset_cell_names, dataset_scalar_cell_names)) {
@@ -1900,15 +1999,15 @@ int main(int argc, char* argv[]) {
       ImGui::Text("Rotate X");
       ImGui::SameLine();
       ImGui::SetNextItemWidth(-1);
-      ImGui::DragFloat("##rotate_x", &rotate_x_deg, 0.5f);
+      input_float_commit_on_enter("##rotate_x", rotate_x_deg, -360000.0f, 360000.0f);
       ImGui::Text("Rotate Y");
       ImGui::SameLine();
       ImGui::SetNextItemWidth(-1);
-      ImGui::DragFloat("##rotate_y", &rotate_y_deg, 0.5f);
+      input_float_commit_on_enter("##rotate_y", rotate_y_deg, -360000.0f, 360000.0f);
       ImGui::Text("Rotate Z");
       ImGui::SameLine();
       ImGui::SetNextItemWidth(-1);
-      ImGui::DragFloat("##rotate_z", &rotate_z_deg, 0.5f);
+      input_float_commit_on_enter("##rotate_z", rotate_z_deg, -360000.0f, 360000.0f);
       ImGui::Spacing();
       ImGui::Separator();
       ImGui::PushFont(bold_font);
@@ -1954,7 +2053,7 @@ int main(int argc, char* argv[]) {
         ImGui::Text("Solid Flag");
         ImGui::SameLine();
         ImGui::SetNextItemWidth(80);
-        ImGui::InputInt("##solid_flag", &solid_flag);
+        input_int_commit_on_enter("##solid_flag", solid_flag, -1000000, 1000000);
         ImGui::Spacing();
         ImGui::Checkbox("Show##mask", &show_mask);
 
@@ -1965,27 +2064,27 @@ int main(int argc, char* argv[]) {
           ImGui::Text("Metallic");
           ImGui::SameLine();
           ImGui::SetNextItemWidth(-1);
-          ImGui::SliderFloat("##mask_metallic", &mask_metallic, 0.0f, 1.0f);
+          ImGui::SliderFloat("##mask_metallic", &mask_metallic, 0.0f, 1.0f, "%.3f", ImGuiSliderFlags_NoInput);
           ImGui::Text("Roughness");
           ImGui::SameLine();
           ImGui::SetNextItemWidth(-1);
-          ImGui::SliderFloat("##mask_roughness", &mask_roughness, 0.0f, 1.0f);
+          ImGui::SliderFloat("##mask_roughness", &mask_roughness, 0.0f, 1.0f, "%.3f", ImGuiSliderFlags_NoInput);
           ImGui::Text("Opacity");
           ImGui::SameLine();
           ImGui::SetNextItemWidth(-1);
-          ImGui::SliderFloat("##mask_opacity", &mask_opacity, 0.0f, 1.0f);
+          ImGui::SliderFloat("##mask_opacity", &mask_opacity, 0.0f, 1.0f, "%.3f", ImGuiSliderFlags_NoInput);
           ImGui::Text("Glass IOR");
           ImGui::SameLine();
           ImGui::SetNextItemWidth(-1);
-          ImGui::SliderFloat("##mask_ior", &mask_glass_ior, 1.0f, 2.5f);
+          ImGui::SliderFloat("##mask_ior", &mask_glass_ior, 1.0f, 2.5f, "%.3f", ImGuiSliderFlags_NoInput);
           ImGui::Text("Smoothing");
           ImGui::SameLine();
           ImGui::SetNextItemWidth(-1);
-          ImGui::SliderInt("##smooth_iters", &smooth_iterations, 0, 50);
+          ImGui::SliderInt("##smooth_iters", &smooth_iterations, 0, 50, "%d", ImGuiSliderFlags_NoInput);
           ImGui::Text("Smooth Strength");
           ImGui::SameLine();
           ImGui::SetNextItemWidth(-1);
-          ImGui::SliderFloat("##smooth_strength", &smooth_strength, 0.0f, 1.0f);
+          ImGui::SliderFloat("##smooth_strength", &smooth_strength, 0.0f, 1.0f, "%.3f", ImGuiSliderFlags_NoInput);
         }
 
         ImGui::Spacing();
@@ -2060,16 +2159,20 @@ int main(int argc, char* argv[]) {
             ImGui::Text("Threshold Min");
             ImGui::SameLine();
             ImGui::SetNextItemWidth(-1);
-            ImGui::DragFloat("##threshold_min", &layer.threshold_min, 0.01f);
+            input_float_commit_on_enter("##threshold_min", layer.threshold_min, -1000000.0f, 1000000.0f);
             ImGui::Text("Threshold Max");
             ImGui::SameLine();
             ImGui::SetNextItemWidth(-1);
-            ImGui::DragFloat("##threshold_max", &layer.threshold_max, 0.01f);
+            input_float_commit_on_enter("##threshold_max", layer.threshold_max, -1000000.0f, 1000000.0f);
+            if (layer.threshold_max < layer.threshold_min) {
+              layer.threshold_min = kDefaultDataThresholdMin;
+              layer.threshold_max = kDefaultDataThresholdMax;
+            }
 
             ImGui::Text("Fluid Flag");
             ImGui::SameLine();
             ImGui::SetNextItemWidth(100.0f);
-            ImGui::InputInt("##fluid_flag", &layer.fluid_flag);
+            input_int_commit_on_enter("##fluid_flag", layer.fluid_flag, -1000000, 1000000);
 
             ImGui::Text("Color");
             ImGui::ColorEdit3("##color", (float*)&layer.color);
@@ -2077,32 +2180,33 @@ int main(int argc, char* argv[]) {
             ImGui::Text("Metallic");
             ImGui::SameLine();
             ImGui::SetNextItemWidth(-1);
-            ImGui::SliderFloat("##metallic", &layer.metallic, 0.0f, 1.0f);
+            ImGui::SliderFloat("##metallic", &layer.metallic, 0.0f, 1.0f, "%.3f", ImGuiSliderFlags_NoInput);
 
             ImGui::Text("Roughness");
             ImGui::SameLine();
             ImGui::SetNextItemWidth(-1);
-            ImGui::SliderFloat("##roughness", &layer.roughness, 0.0f, 1.0f);
+            ImGui::SliderFloat("##roughness", &layer.roughness, 0.0f, 1.0f, "%.3f", ImGuiSliderFlags_NoInput);
 
             ImGui::Text("Opacity");
             ImGui::SameLine();
             ImGui::SetNextItemWidth(-1);
-            ImGui::SliderFloat("##opacity", &layer.opacity, 0.0f, 1.0f);
+            ImGui::SliderFloat("##opacity", &layer.opacity, 0.0f, 1.0f, "%.3f", ImGuiSliderFlags_NoInput);
 
             ImGui::Text("Glass IOR");
             ImGui::SameLine();
             ImGui::SetNextItemWidth(-1);
-            ImGui::SliderFloat("##ior", &layer.glass_ior, 1.0f, 2.5f);
+            ImGui::SliderFloat("##ior", &layer.glass_ior, 1.0f, 2.5f, "%.3f", ImGuiSliderFlags_NoInput);
 
             ImGui::Text("Boundary Smoothing");
             ImGui::SameLine();
             ImGui::SetNextItemWidth(-1);
-            ImGui::SliderInt("##smooth_iters", &layer.smooth_iterations, 0, 50);
+            ImGui::SliderInt("##smooth_iters", &layer.smooth_iterations, 0, 50, "%d", ImGuiSliderFlags_NoInput);
 
             ImGui::Text("Boundary Smooth Strength");
             ImGui::SameLine();
             ImGui::SetNextItemWidth(-1);
-            ImGui::SliderFloat("##smooth_strength", &layer.smooth_strength, 0.0f, 1.0f);
+            ImGui::SliderFloat("##smooth_strength", &layer.smooth_strength, 0.0f, 1.0f, "%.3f",
+                               ImGuiSliderFlags_NoInput);
             ImGui::PopID();
             ++i;
           }
@@ -2122,6 +2226,7 @@ int main(int argc, char* argv[]) {
         }
         std::sort(vtk_files.begin(), vtk_files.end());
         vtk_index = 0;
+        jump_file_index_1based = 1;
         dataset_cell_names.clear();
         dataset_scalar_cell_names.clear();
         dataset_loaded_field_vtk_index = -1;
@@ -2256,7 +2361,8 @@ int main(int argc, char* argv[]) {
       LayerFrameState& state = layer_states[i];
 
       if (layer.threshold_min > layer.threshold_max) {
-        std::swap(layer.threshold_min, layer.threshold_max);
+        layer.threshold_min = kDefaultDataThresholdMin;
+        layer.threshold_max = kDefaultDataThresholdMax;
       }
 
       bool has_density_field = (find_field_index(dataset_scalar_cell_names, layer.name) >= 0);
