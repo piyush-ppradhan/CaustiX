@@ -32,6 +32,7 @@
 #include <stdexcept>
 #include <limits>
 #include <sstream>
+#include <functional>
 #include "config.hpp"
 #include "optix_params.h"
 
@@ -763,6 +764,63 @@ static int find_field_index(const std::vector<std::string>& field_names, const s
   return -1;
 }
 
+static bool replace_all_padded(std::string& text, const std::string& token, const std::string& replacement) {
+  if (replacement.size() > token.size()) {
+    return false;
+  }
+  bool changed = false;
+  std::string padded = replacement + std::string(token.size() - replacement.size(), ' ');
+  size_t pos = 0;
+  while ((pos = text.find(token, pos)) != std::string::npos) {
+    text.replace(pos, token.size(), padded);
+    pos += padded.size();
+    changed = true;
+  }
+  return changed;
+}
+
+static bool normalize_legacy_vtk_binary(std::string& bytes) {
+  bool changed = false;
+  changed = replace_all_padded(bytes, "vtk DataFile Version 5.1", "vtk DataFile Version 4.2") || changed;
+  changed = replace_all_padded(bytes, "signed_char", "char") || changed;
+  changed = replace_all_padded(bytes, "vtktypeint64", "long") || changed;
+  changed = replace_all_padded(bytes, "vtktypeint32", "int") || changed;
+  changed = replace_all_padded(bytes, "vtktypeuint8", "unsigned_char") || changed;
+  return changed;
+}
+
+static viskores::cont::DataSet read_vtk_dataset_with_compat(const std::string& vtk_file) {
+  viskores::io::VTKDataSetReader reader(vtk_file);
+  try {
+    return reader.ReadDataSet();
+  } catch (const viskores::io::ErrorIO&) {
+    std::ifstream in(vtk_file, std::ios::binary);
+    if (!in.is_open()) {
+      throw;
+    }
+    std::string bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    if (bytes.empty()) {
+      throw;
+    }
+    if (!normalize_legacy_vtk_binary(bytes)) {
+      throw;
+    }
+
+    std::filesystem::path temp_path = std::filesystem::path("/tmp") /
+                                      ("caustix_compat_" + std::to_string(std::hash<std::string>{}(vtk_file)) + ".vtk");
+    {
+      std::ofstream out(temp_path, std::ios::binary | std::ios::trunc);
+      out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+      if (!out.good()) {
+        throw;
+      }
+    }
+
+    viskores::io::VTKDataSetReader compat_reader(temp_path.string());
+    return compat_reader.ReadDataSet();
+  }
+}
+
 static bool load_dataset_field_lists(const std::string& vtk_file, std::vector<std::string>& all_field_names,
                                      std::vector<std::string>& scalar_cell_field_names) {
   all_field_names.clear();
@@ -771,8 +829,7 @@ static bool load_dataset_field_lists(const std::string& vtk_file, std::vector<st
     return false;
   }
 
-  viskores::io::VTKDataSetReader reader(vtk_file);
-  viskores::cont::DataSet ds = reader.ReadDataSet();
+  viskores::cont::DataSet ds = read_vtk_dataset_with_compat(vtk_file);
 
   for (viskores::IdComponent i = 0; i < ds.GetNumberOfFields(); i++) {
     const auto& field = ds.GetField(i);
@@ -1122,8 +1179,7 @@ static void update_scene_material_sbt(OptixState& state, const float3& light_dir
 
 static void extract_mesh(const std::string& mask_filepath, const std::string& field_name, int solid_val,
                          MeshCache& mesh_cache) {
-  viskores::io::VTKDataSetReader reader(mask_filepath);
-  viskores::cont::DataSet ds = reader.ReadDataSet();
+  viskores::cont::DataSet ds = read_vtk_dataset_with_compat(mask_filepath);
 
   auto selectedField = ds.GetField(field_name);
   if (selectedField.GetData().GetNumberOfComponentsFlat() != 1) {
@@ -1239,12 +1295,10 @@ static void extract_fluid_mesh(const std::string& density_filepath, const std::s
                                float density_threshold_min, float density_threshold_max,
                                const std::string& mask_filepath,
                                const std::string& mask_field_name, int fluid_flag, MeshCache& mesh_cache) {
-  viskores::io::VTKDataSetReader density_reader(density_filepath);
-  viskores::cont::DataSet density_ds = density_reader.ReadDataSet();
+  viskores::cont::DataSet density_ds = read_vtk_dataset_with_compat(density_filepath);
   viskores::cont::DataSet mask_ds = density_ds;
   if (mask_filepath != density_filepath) {
-    viskores::io::VTKDataSetReader mask_reader(mask_filepath);
-    mask_ds = mask_reader.ReadDataSet();
+    mask_ds = read_vtk_dataset_with_compat(mask_filepath);
   }
 
   viskores::cont::Field density_field;
@@ -2095,8 +2149,7 @@ int main(int argc, char* argv[]) {
         std::string selected_file = ImGuiFileDialog::Instance()->GetFilePathName();
 
         try {
-          viskores::io::VTKDataSetReader reader(selected_file);
-          viskores::cont::DataSet mask_dataset = reader.ReadDataSet();
+          viskores::cont::DataSet mask_dataset = read_vtk_dataset_with_compat(selected_file);
 
           bool is_3d = true;
           auto cellSet = mask_dataset.GetCellSet();
