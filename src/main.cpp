@@ -925,8 +925,17 @@ static viskores::cont::DataSet read_vtk_dataset_with_compat(const std::string& v
       }
     }
 
-    viskores::io::VTKDataSetReader compat_reader(temp_path.string());
-    return compat_reader.ReadDataSet();
+    try {
+      viskores::io::VTKDataSetReader compat_reader(temp_path.string());
+      viskores::cont::DataSet converted = compat_reader.ReadDataSet();
+      std::error_code remove_ec;
+      std::filesystem::remove(temp_path, remove_ec);
+      return converted;
+    } catch (...) {
+      std::error_code remove_ec;
+      std::filesystem::remove(temp_path, remove_ec);
+      throw;
+    }
   }
 }
 
