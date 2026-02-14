@@ -268,6 +268,35 @@ struct CameraState {
   int prev_vp_h = 0;
 };
 
+enum class AnimationExportPhase { SetFrame, WaitSceneReady, RenderAndSave };
+
+struct AnimationExportState {
+  bool show_config_popup = false;
+  bool reopen_config_after_folder_dialog = false;
+  bool running = false;
+  bool cancel_requested = false;
+  bool finished = false;
+  bool canceled = false;
+  bool failed = false;
+  std::string error_message;
+  std::string output_dir;
+  std::array<char, 256> base_name{};
+  int width = 1920;
+  int height = 1080;
+  int start_timestep = 1;
+  int end_timestep = 1;
+  int step_size = 1;
+  std::vector<int> frame_indices;
+  size_t next_frame_cursor = 0;
+  int saved_frames = 0;
+  int wait_iterations = 0;
+  int current_target_vtk_index = -1;
+  int restore_vtk_index = -1;
+  int restore_jump_index = 1;
+  AnimationExportPhase phase = AnimationExportPhase::SetFrame;
+  std::vector<uchar4> export_pixels;
+};
+
 struct OptixState {
   OptixDeviceContext context = nullptr;
   OptixModule module = nullptr;
@@ -1336,6 +1365,141 @@ static void render_optix_frame(OptixState& optix_state, int width, int height, i
                         cudaMemcpyDeviceToHost));
 }
 
+static void draw_disc_pixel(std::vector<uchar4>& host_pixels, int width, int height, int px, int py, int radius,
+                            const uchar4& color) {
+  if (radius <= 0) {
+    if (px >= 0 && px < width && py >= 0 && py < height) {
+      host_pixels[static_cast<size_t>(py) * static_cast<size_t>(width) + static_cast<size_t>(px)] = color;
+    }
+    return;
+  }
+
+  for (int dy = -radius; dy <= radius; dy++) {
+    for (int dx = -radius; dx <= radius; dx++) {
+      if (dx * dx + dy * dy > radius * radius) {
+        continue;
+      }
+      int x = px + dx;
+      int y = py + dy;
+      if (x >= 0 && x < width && y >= 0 && y < height) {
+        host_pixels[static_cast<size_t>(y) * static_cast<size_t>(width) + static_cast<size_t>(x)] = color;
+      }
+    }
+  }
+}
+
+static void draw_line_host(std::vector<uchar4>& host_pixels, int width, int height, float x0, float y0, float x1,
+                           float y1, int thickness, const uchar4& color) {
+  float dx = x1 - x0;
+  float dy = y1 - y0;
+  int steps = static_cast<int>(std::ceil(std::max(std::fabs(dx), std::fabs(dy))));
+  if (steps <= 0) {
+    draw_disc_pixel(host_pixels, width, height, static_cast<int>(std::lround(x0)), static_cast<int>(std::lround(y0)),
+                    std::max(0, thickness / 2), color);
+    return;
+  }
+  int radius = std::max(0, thickness / 2);
+  for (int i = 0; i <= steps; i++) {
+    float t = static_cast<float>(i) / static_cast<float>(steps);
+    int px = static_cast<int>(std::lround(x0 + dx * t));
+    int py = static_cast<int>(std::lround(y0 + dy * t));
+    draw_disc_pixel(host_pixels, width, height, px, py, radius, color);
+  }
+}
+
+static void overlay_bbox_outline_on_host(std::vector<uchar4>& host_pixels, int width, int height, const BBox& bbox,
+                                         float cam_yaw, float cam_pitch, float cam_distance, const float cam_target[3],
+                                         float cam_fov, const ImVec4& outline_color, float outline_thickness) {
+  if (host_pixels.size() < static_cast<size_t>(width) * static_cast<size_t>(height) || width <= 0 || height <= 0) {
+    return;
+  }
+
+  float yaw_rad = cam_yaw * 3.14159265f / 180.0f;
+  float pitch_rad = cam_pitch * 3.14159265f / 180.0f;
+  float3 eye = make_float3(cam_target[0] + cam_distance * std::cos(pitch_rad) * std::sin(yaw_rad),
+                           cam_target[1] + cam_distance * std::sin(pitch_rad),
+                           cam_target[2] + cam_distance * std::cos(pitch_rad) * std::cos(yaw_rad));
+  float3 target = make_float3(cam_target[0], cam_target[1], cam_target[2]);
+
+  float3 fwd = make_float3(target.x - eye.x, target.y - eye.y, target.z - eye.z);
+  float fwd_len = std::sqrt(fwd.x * fwd.x + fwd.y * fwd.y + fwd.z * fwd.z);
+  if (fwd_len <= 1e-6f) {
+    return;
+  }
+  fwd.x /= fwd_len;
+  fwd.y /= fwd_len;
+  fwd.z /= fwd_len;
+
+  float3 world_up = make_float3(0.0f, 1.0f, 0.0f);
+  float3 cam_right = make_float3(fwd.y * world_up.z - fwd.z * world_up.y, fwd.z * world_up.x - fwd.x * world_up.z,
+                                 fwd.x * world_up.y - fwd.y * world_up.x);
+  float right_len = std::sqrt(cam_right.x * cam_right.x + cam_right.y * cam_right.y + cam_right.z * cam_right.z);
+  if (right_len <= 1e-6f) {
+    return;
+  }
+  cam_right.x /= right_len;
+  cam_right.y /= right_len;
+  cam_right.z /= right_len;
+
+  float3 cam_up =
+      make_float3(cam_right.y * fwd.z - cam_right.z * fwd.y, cam_right.z * fwd.x - cam_right.x * fwd.z,
+                  cam_right.x * fwd.y - cam_right.y * fwd.x);
+  float up_len = std::sqrt(cam_up.x * cam_up.x + cam_up.y * cam_up.y + cam_up.z * cam_up.z);
+  if (up_len <= 1e-6f) {
+    return;
+  }
+  cam_up.x /= up_len;
+  cam_up.y /= up_len;
+  cam_up.z /= up_len;
+
+  float half_h = std::tan(cam_fov * 3.14159265f / 360.0f);
+  float half_w = half_h * (static_cast<float>(width) / static_cast<float>(height));
+  if (half_h <= 1e-6f || half_w <= 1e-6f) {
+    return;
+  }
+
+  auto project = [&](const float3& p, bool& behind, float& sx, float& sy) {
+    float3 v = make_float3(p.x - eye.x, p.y - eye.y, p.z - eye.z);
+    float cz = v.x * fwd.x + v.y * fwd.y + v.z * fwd.z;
+    if (cz <= 0.001f) {
+      behind = true;
+      sx = 0.0f;
+      sy = 0.0f;
+      return;
+    }
+    float cx = v.x * cam_right.x + v.y * cam_right.y + v.z * cam_right.z;
+    float cy = v.x * cam_up.x + v.y * cam_up.y + v.z * cam_up.z;
+    float ndc_x = cx / (cz * half_w);
+    float ndc_y = cy / (cz * half_h);
+    sx = (ndc_x * 0.5f + 0.5f) * static_cast<float>(width);
+    sy = (0.5f - ndc_y * 0.5f) * static_cast<float>(height);
+    behind = false;
+  };
+
+  float3 lo = bbox.lo;
+  float3 hi = bbox.hi;
+  float3 corners[8] = {{lo.x, lo.y, lo.z}, {hi.x, lo.y, lo.z}, {hi.x, hi.y, lo.z}, {lo.x, hi.y, lo.z},
+                       {lo.x, lo.y, hi.z}, {hi.x, lo.y, hi.z}, {hi.x, hi.y, hi.z}, {lo.x, hi.y, hi.z}};
+  int edges[12][2] = {{0, 1}, {1, 2}, {2, 3}, {3, 0}, {4, 5}, {5, 6},
+                      {6, 7}, {7, 4}, {0, 4}, {1, 5}, {2, 6}, {3, 7}};
+
+  uchar4 color = make_uchar4(static_cast<unsigned char>(std::clamp(outline_color.x, 0.0f, 1.0f) * 255.0f + 0.5f),
+                             static_cast<unsigned char>(std::clamp(outline_color.y, 0.0f, 1.0f) * 255.0f + 0.5f),
+                             static_cast<unsigned char>(std::clamp(outline_color.z, 0.0f, 1.0f) * 255.0f + 0.5f), 255);
+  int thickness = std::max(1, static_cast<int>(std::lround(outline_thickness)));
+
+  for (int e = 0; e < 12; e++) {
+    bool b0 = false;
+    bool b1 = false;
+    float x0 = 0.0f, y0 = 0.0f, x1 = 0.0f, y1 = 0.0f;
+    project(corners[edges[e][0]], b0, x0, y0);
+    project(corners[edges[e][1]], b1, x1, y1);
+    if (!b0 && !b1) {
+      draw_line_host(host_pixels, width, height, x0, y0, x1, y1, thickness, color);
+    }
+  }
+}
+
 static std::string trim_copy(const std::string& value) {
   size_t start = 0;
   while (start < value.size() && std::isspace(static_cast<unsigned char>(value[start])) != 0) {
@@ -1358,6 +1522,32 @@ static std::string strip_png_extension(const std::string& input_name) {
     }
   }
   return name;
+}
+
+static bool build_animation_frame_sequence(int& start_timestep, int& end_timestep, int& step_size, int file_count,
+                                           std::vector<int>& frame_indices, std::string& error_message) {
+  frame_indices.clear();
+  error_message.clear();
+  if (file_count <= 0) {
+    error_message = "No dataset files are loaded.";
+    return false;
+  }
+
+  start_timestep = std::clamp(start_timestep, 1, file_count);
+  end_timestep = std::clamp(end_timestep, 1, file_count);
+  step_size = std::max(1, step_size);
+  if (start_timestep > end_timestep) {
+    std::swap(start_timestep, end_timestep);
+  }
+
+  for (int t = start_timestep; t <= end_timestep; t += step_size) {
+    frame_indices.push_back(t - 1);  // 0-based vtk index
+  }
+  if (frame_indices.empty()) {
+    error_message = "No frames selected for export.";
+    return false;
+  }
+  return true;
 }
 
 static void extract_mesh(const std::string& mask_filepath, const std::string& field_name, int solid_val,
@@ -1908,6 +2098,9 @@ int main(int argc, char* argv[]) {
   int save_image_height = 1080;
   bool save_image_append_dataset_index = true;
   bool show_save_image_settings_popup = false;
+  AnimationExportState animation_export;
+  animation_export.base_name.fill(0);
+  std::strncpy(animation_export.base_name.data(), "frame", animation_export.base_name.size() - 1);
 
   bool running = true;
   while (running) {
@@ -2081,6 +2274,71 @@ int main(int argc, char* argv[]) {
         }
         save_config.flags |= ImGuiFileDialogFlags_OptionalFileName;
         ImGuiFileDialog::Instance()->OpenDialog("SaveImageDirDlg", "Choose Save Location", nullptr, save_config);
+      }
+      ImGui::SameLine();
+      if (ImGui::Button("Save Animation")) {
+        animation_export.error_message.clear();
+        animation_export.failed = false;
+        animation_export.finished = false;
+        animation_export.canceled = false;
+        animation_export.reopen_config_after_folder_dialog = false;
+        animation_export.cancel_requested = false;
+        animation_export.running = false;
+        animation_export.show_config_popup = true;
+        animation_export.start_timestep = 1;
+        animation_export.end_timestep = static_cast<int>(vtk_files.size());
+        animation_export.step_size = 1;
+        animation_export.width = std::max(1, prev_vp_w > 0 ? prev_vp_w : width);
+        animation_export.height = std::max(1, prev_vp_h > 0 ? prev_vp_h : height);
+        if (animation_export.output_dir.empty()) {
+          if (!vtk_dir.empty()) {
+            animation_export.output_dir = vtk_dir;
+          } else if (const char* home = getenv("HOME")) {
+            animation_export.output_dir = home;
+          }
+        }
+      }
+
+      if (animation_export.running || animation_export.finished || animation_export.canceled || animation_export.failed) {
+        ImGui::Spacing();
+        float progress = 0.0f;
+        if (!animation_export.frame_indices.empty()) {
+          progress = static_cast<float>(animation_export.saved_frames) /
+                     static_cast<float>(animation_export.frame_indices.size());
+        }
+        ImGui::Text("Animation Export");
+        ImGui::ProgressBar(progress, ImVec2(-1.0f, 0.0f));
+        if (animation_export.running) {
+          int total = static_cast<int>(animation_export.frame_indices.size());
+          int current = std::min(total, animation_export.saved_frames + 1);
+          ImGui::Text("Frame %d / %d", current, total);
+          if (ImGui::Button("Cancel Export")) {
+            animation_export.cancel_requested = true;
+          }
+        } else if (animation_export.finished) {
+          ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "Export finished: %d frames",
+                             animation_export.saved_frames);
+          if (ImGui::Button("Close Export Status")) {
+            animation_export.finished = false;
+            animation_export.canceled = false;
+            animation_export.error_message.clear();
+          }
+        } else if (animation_export.canceled) {
+          ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f), "Export canceled after %d frames",
+                             animation_export.saved_frames);
+          if (ImGui::Button("Close Export Status")) {
+            animation_export.canceled = false;
+            animation_export.error_message.clear();
+          }
+        } else if (animation_export.failed) {
+          ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "Export failed: %s",
+                             animation_export.error_message.c_str());
+          if (ImGui::Button("Close Export Status")) {
+            animation_export.failed = false;
+            animation_export.canceled = false;
+            animation_export.error_message.clear();
+          }
+        }
       }
       if (dataset_loaded_field_vtk_index != vtk_index) {
         try {
@@ -2452,6 +2710,25 @@ int main(int argc, char* argv[]) {
       ImGuiFileDialog::Instance()->Close();
     }
 
+    if (ImGuiFileDialog::Instance()->Display("AnimExportFolderDlg", ImGuiWindowFlags_None, ImVec2(840, 520),
+                                             ImVec2(1920, 1200))) {
+      if (ImGuiFileDialog::Instance()->IsOk()) {
+        animation_export.output_dir = ImGuiFileDialog::Instance()->GetCurrentPath();
+        if (animation_export.output_dir.empty()) {
+          if (!vtk_dir.empty()) {
+            animation_export.output_dir = vtk_dir;
+          } else if (const char* home = getenv("HOME")) {
+            animation_export.output_dir = home;
+          }
+        }
+      }
+      if (animation_export.reopen_config_after_folder_dialog) {
+        animation_export.reopen_config_after_folder_dialog = false;
+        animation_export.show_config_popup = true;
+      }
+      ImGuiFileDialog::Instance()->Close();
+    }
+
     if (show_save_image_settings_popup) {
       ImGui::OpenPopup("Save View Image");
       show_save_image_settings_popup = false;
@@ -2498,6 +2775,11 @@ int main(int argc, char* argv[]) {
           } else {
             render_background_to_host(save_image_width, save_image_height, bg_color, host_pixels);
           }
+          if (show_outlines && mesh_loaded) {
+            overlay_bbox_outline_on_host(host_pixels, save_image_width, save_image_height, mesh_bbox, cam_yaw,
+                                         cam_pitch, cam_distance, cam_target, cam_fov, outline_color,
+                                         outline_thickness);
+          }
 
           int write_ok = stbi_write_png(out_path.string().c_str(), save_image_width, save_image_height, 4,
                                         host_pixels.data(), save_image_width * static_cast<int>(sizeof(uchar4)));
@@ -2516,6 +2798,113 @@ int main(int argc, char* argv[]) {
       ImGui::SameLine();
       if (ImGui::Button("Cancel")) {
         save_image_error_msg.clear();
+        ImGui::CloseCurrentPopup();
+      }
+      ImGui::EndPopup();
+    }
+
+    if (animation_export.show_config_popup) {
+      ImGui::OpenPopup("Save Animation");
+      animation_export.show_config_popup = false;
+    }
+    if (ImGui::BeginPopupModal("Save Animation", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+      ImGui::Text("Save Folder");
+      ImGui::TextWrapped("%s", animation_export.output_dir.c_str());
+      if (ImGui::Button("Browse##anim_folder")) {
+        IGFD::FileDialogConfig anim_config;
+        if (!animation_export.output_dir.empty()) {
+          anim_config.path = animation_export.output_dir;
+        } else if (!vtk_dir.empty()) {
+          anim_config.path = vtk_dir;
+        } else if (const char* home = getenv("HOME")) {
+          anim_config.path = home;
+        }
+        anim_config.flags |= ImGuiFileDialogFlags_OptionalFileName;
+        animation_export.reopen_config_after_folder_dialog = true;
+        ImGui::CloseCurrentPopup();
+        ImGuiFileDialog::Instance()->OpenDialog("AnimExportFolderDlg", "Choose Animation Folder", nullptr, anim_config);
+      }
+
+      ImGui::Spacing();
+      ImGui::Text("Base Name");
+      ImGui::SetNextItemWidth(300.0f);
+      ImGui::InputText("##anim_base_name", animation_export.base_name.data(), animation_export.base_name.size());
+
+      ImGui::Text("Width");
+      ImGui::SameLine();
+      ImGui::SetNextItemWidth(120.0f);
+      input_int_commit_on_enter("##anim_width", animation_export.width, 1, 16384);
+
+      ImGui::Text("Height");
+      ImGui::SameLine();
+      ImGui::SetNextItemWidth(120.0f);
+      input_int_commit_on_enter("##anim_height", animation_export.height, 1, 16384);
+
+      int file_count = static_cast<int>(vtk_files.size());
+      ImGui::Text("Start Timestep");
+      ImGui::SameLine();
+      ImGui::SetNextItemWidth(120.0f);
+      input_int_commit_on_enter("##anim_start", animation_export.start_timestep, 1, std::max(1, file_count));
+
+      ImGui::Text("End Timestep");
+      ImGui::SameLine();
+      ImGui::SetNextItemWidth(120.0f);
+      input_int_commit_on_enter("##anim_end", animation_export.end_timestep, 1, std::max(1, file_count));
+
+      ImGui::Text("Step Size");
+      ImGui::SameLine();
+      ImGui::SetNextItemWidth(120.0f);
+      input_int_commit_on_enter("##anim_step", animation_export.step_size, 1, 1000000);
+
+      if (!animation_export.error_message.empty()) {
+        ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "%s", animation_export.error_message.c_str());
+      }
+
+      if (ImGui::Button("Start Export")) {
+        std::string base_name = trim_copy(std::string(animation_export.base_name.data()));
+        base_name = strip_png_extension(base_name);
+        base_name = std::filesystem::path(base_name).filename().string();
+        if (base_name.empty()) {
+          animation_export.error_message = "Base name cannot be empty.";
+        } else if (animation_export.output_dir.empty()) {
+          animation_export.error_message = "Save folder cannot be empty.";
+        } else if (vtk_files.empty()) {
+          animation_export.error_message = "No dataset files are loaded.";
+        } else if (!build_animation_frame_sequence(animation_export.start_timestep, animation_export.end_timestep,
+                                                   animation_export.step_size, file_count,
+                                                   animation_export.frame_indices, animation_export.error_message)) {
+          // error set by helper
+        } else {
+          std::error_code mkdir_ec;
+          std::filesystem::create_directories(animation_export.output_dir, mkdir_ec);
+          if (mkdir_ec) {
+            animation_export.error_message = "Failed to create save folder: " + mkdir_ec.message();
+          } else {
+            animation_export.error_message.clear();
+            std::strncpy(animation_export.base_name.data(), base_name.c_str(), animation_export.base_name.size() - 1);
+            animation_export.base_name[animation_export.base_name.size() - 1] = '\0';
+            animation_export.running = true;
+            animation_export.cancel_requested = false;
+            animation_export.finished = false;
+            animation_export.canceled = false;
+            animation_export.reopen_config_after_folder_dialog = false;
+            animation_export.failed = false;
+            animation_export.saved_frames = 0;
+            animation_export.next_frame_cursor = 0;
+            animation_export.wait_iterations = 0;
+            animation_export.current_target_vtk_index = -1;
+            animation_export.phase = AnimationExportPhase::SetFrame;
+            animation_export.restore_vtk_index = vtk_index;
+            animation_export.restore_jump_index = jump_file_index_1based;
+            ImGui::CloseCurrentPopup();
+          }
+        }
+      }
+      ImGui::SameLine();
+      if (ImGui::Button("Cancel")) {
+        animation_export.error_message.clear();
+        animation_export.reopen_config_after_folder_dialog = false;
+        ImGuiFileDialog::Instance()->Close();
         ImGui::CloseCurrentPopup();
       }
       ImGui::EndPopup();
@@ -2954,6 +3343,131 @@ int main(int argc, char* argv[]) {
           memcpy((uint8_t*)tex_pixels + y * tex_pitch, host_pixels.data() + y * vp_w, vp_w * sizeof(uchar4));
         }
         SDL_UnlockTexture(viewport_tex);
+      }
+    }
+
+    if (animation_export.running) {
+      auto finish_animation_export = [&](bool success, bool canceled, const std::string& error_message_text) {
+        animation_export.running = false;
+        animation_export.cancel_requested = false;
+        animation_export.finished = success;
+        animation_export.canceled = canceled;
+        animation_export.failed = (!success && !canceled);
+        animation_export.error_message = error_message_text;
+        animation_export.phase = AnimationExportPhase::SetFrame;
+        animation_export.current_target_vtk_index = -1;
+        animation_export.wait_iterations = 0;
+
+        if (!vtk_files.empty()) {
+          int restore_index = animation_export.restore_vtk_index;
+          if (restore_index < 0 || restore_index >= static_cast<int>(vtk_files.size())) {
+            restore_index = animation_export.restore_jump_index - 1;
+          }
+          restore_index = std::clamp(restore_index, 0, static_cast<int>(vtk_files.size()) - 1);
+          vtk_index = restore_index;
+          jump_file_index_1based = restore_index + 1;
+          viewport_needs_render = true;
+        }
+      };
+
+      if (animation_export.cancel_requested) {
+        finish_animation_export(false, true, "");
+      } else if (animation_export.next_frame_cursor >= animation_export.frame_indices.size()) {
+        finish_animation_export(true, false, "");
+      } else {
+        switch (animation_export.phase) {
+          case AnimationExportPhase::SetFrame: {
+            if (vtk_files.empty()) {
+              finish_animation_export(false, false, "No dataset files are loaded.");
+              break;
+            }
+            int target_index = std::clamp(animation_export.frame_indices[animation_export.next_frame_cursor], 0,
+                                          static_cast<int>(vtk_files.size()) - 1);
+            animation_export.current_target_vtk_index = target_index;
+            vtk_index = target_index;
+            jump_file_index_1based = target_index + 1;
+            animation_export.wait_iterations = 0;
+            animation_export.phase = AnimationExportPhase::WaitSceneReady;
+            viewport_needs_render = true;
+            break;
+          }
+          case AnimationExportPhase::WaitSceneReady: {
+            if (animation_export.current_target_vtk_index < 0) {
+              animation_export.phase = AnimationExportPhase::SetFrame;
+              break;
+            }
+            if (vtk_index != animation_export.current_target_vtk_index) {
+              vtk_index = animation_export.current_target_vtk_index;
+              jump_file_index_1based = vtk_index + 1;
+              viewport_needs_render = true;
+              animation_export.wait_iterations = 0;
+              break;
+            }
+            if (viewport_needs_render) {
+              animation_export.wait_iterations++;
+              if (animation_export.wait_iterations > 600) {
+                finish_animation_export(false, false, "Timed out waiting for frame render.");
+              }
+              break;
+            }
+            if (render_any && !mesh_loaded) {
+              finish_animation_export(false, false, "Frame mesh is not available for export.");
+              break;
+            }
+            animation_export.phase = AnimationExportPhase::RenderAndSave;
+            break;
+          }
+          case AnimationExportPhase::RenderAndSave: {
+            try {
+              std::string base_name = trim_copy(std::string(animation_export.base_name.data()));
+              base_name = strip_png_extension(base_name);
+              base_name = std::filesystem::path(base_name).filename().string();
+              if (base_name.empty()) {
+                throw std::runtime_error("Base name cannot be empty.");
+              }
+
+              int timestep_1based = std::max(1, animation_export.current_target_vtk_index + 1);
+              char suffix[16];
+              std::snprintf(suffix, sizeof(suffix), "_%07d", timestep_1based);
+              std::filesystem::path out_path =
+                  std::filesystem::path(animation_export.output_dir) / (base_name + suffix + ".png");
+
+              if (render_any && mesh_loaded && optix_state.gas_handle != 0) {
+                render_optix_frame(optix_state, animation_export.width, animation_export.height, rt_samples, rt_bounces,
+                                   cam_yaw, cam_pitch, cam_distance, cam_target, cam_fov, shadows_enabled,
+                                   animation_export.export_pixels);
+              } else {
+                render_background_to_host(animation_export.width, animation_export.height, bg_color,
+                                          animation_export.export_pixels);
+              }
+              if (show_outlines && mesh_loaded) {
+                overlay_bbox_outline_on_host(animation_export.export_pixels, animation_export.width,
+                                             animation_export.height, mesh_bbox, cam_yaw, cam_pitch, cam_distance,
+                                             cam_target, cam_fov, outline_color, outline_thickness);
+              }
+
+              int write_ok = stbi_write_png(
+                  out_path.string().c_str(), animation_export.width, animation_export.height, 4,
+                  animation_export.export_pixels.data(), animation_export.width * static_cast<int>(sizeof(uchar4)));
+              if (write_ok == 0) {
+                throw std::runtime_error("Failed to write PNG: " + out_path.string());
+              }
+
+              animation_export.saved_frames++;
+              animation_export.next_frame_cursor++;
+              animation_export.phase = AnimationExportPhase::SetFrame;
+
+              if (animation_export.next_frame_cursor >= animation_export.frame_indices.size()) {
+                finish_animation_export(true, false, "");
+              }
+            } catch (const std::exception& e) {
+              finish_animation_export(false, false, e.what());
+            } catch (...) {
+              finish_animation_export(false, false, "Unknown animation export error.");
+            }
+            break;
+          }
+        }
       }
     }
 
