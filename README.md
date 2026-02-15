@@ -3,6 +3,10 @@
 CaustiX is a GPU ray-traced visualization app for VTK datasets.
 It extracts and renders surfaces from scalar fields for both solid masks and fluid regions.
 
+<p align="center">
+  <img src="assets/3D_evaporation.gif" alt="" width="600">
+</p>
+
 ## Features
 
 - VTK dataset loading and frame navigation
