@@ -189,6 +189,12 @@ struct GeometryLayer {
   float prev_rotate_y_deg = rotate_y_deg;
   float rotate_z_deg = 0.0f;
   float prev_rotate_z_deg = rotate_z_deg;
+  float translate_x = 0.0f;
+  float prev_translate_x = translate_x;
+  float translate_y = 0.0f;
+  float prev_translate_y = translate_y;
+  float translate_z = 0.0f;
+  float prev_translate_z = translate_z;
   ImVec4 color = ImVec4(0.8f, 0.8f, 0.8f, 1.0f);
   ImVec4 prev_color = color;
   float metallic = 0.0f;
@@ -1186,8 +1192,9 @@ static void build_render_mesh_from_cache(const MeshCache& mesh_cache, int smooth
 }
 
 static void build_render_geometry_from_cache(const MeshCache& mesh_cache, float scale, float local_rotate_x_deg,
-                                             float local_rotate_y_deg, float local_rotate_z_deg, float rotate_x_deg,
-                                             float rotate_y_deg, float rotate_z_deg, std::vector<float3>& out_positions,
+                                             float local_rotate_y_deg, float local_rotate_z_deg, float translate_x,
+                                             float translate_y, float translate_z, float rotate_x_deg, float rotate_y_deg,
+                                             float rotate_z_deg, std::vector<float3>& out_positions,
                                              std::vector<float3>& out_normals, BBox& out_bbox) {
   if (!mesh_cache.valid || mesh_cache.base_positions.empty() || mesh_cache.indices.empty()) {
     throw std::runtime_error("Cached geometry mesh is not available.");
@@ -1206,7 +1213,13 @@ static void build_render_geometry_from_cache(const MeshCache& mesh_cache, float 
     p.z *= safe_scale;
   }
 
+  // Apply local rotation around the geometry's original (untranslated) position.
   apply_geometry_rotation(out_positions, out_normals, local_rotate_x_deg, local_rotate_y_deg, local_rotate_z_deg);
+  for (auto& p : out_positions) {
+    p.x += translate_x;
+    p.y += translate_y;
+    p.z += translate_z;
+  }
   apply_geometry_rotation(out_positions, out_normals, rotate_x_deg, rotate_y_deg, rotate_z_deg);
   compute_bbox(out_positions, out_bbox);
 }
@@ -1448,7 +1461,8 @@ static void rebuild_scene_from_caches(
     std::vector<float3> normals;
     BBox geometry_bbox;
     build_render_geometry_from_cache(geometry.mesh_cache, geometry.scale, geometry.rotate_x_deg, geometry.rotate_y_deg,
-                                     geometry.rotate_z_deg, rotate_x_deg, rotate_y_deg, rotate_z_deg, positions, normals,
+                                     geometry.rotate_z_deg, geometry.translate_x, geometry.translate_y,
+                                     geometry.translate_z, rotate_x_deg, rotate_y_deg, rotate_z_deg, positions, normals,
                                      geometry_bbox);
     state.geometry_meshes.emplace_back();
     upload_mesh_buffers_to_gpu(positions, normals, geometry.mesh_cache.indices, state.geometry_meshes.back());
@@ -2836,6 +2850,18 @@ int main(int argc, char* argv[]) {
 		            ImGui::SameLine();
 		            ImGui::SetNextItemWidth(140.0f);
 		            input_float_commit_on_enter("##geometry_rotate_z", geometry.rotate_z_deg, -360000.0f, 360000.0f);
+		            ImGui::Text("Translate X");
+		            ImGui::SameLine();
+		            ImGui::SetNextItemWidth(140.0f);
+		            input_float_commit_on_enter("##geometry_translate_x", geometry.translate_x, -1000000.0f, 1000000.0f);
+		            ImGui::Text("Translate Y");
+		            ImGui::SameLine();
+		            ImGui::SetNextItemWidth(140.0f);
+		            input_float_commit_on_enter("##geometry_translate_y", geometry.translate_y, -1000000.0f, 1000000.0f);
+		            ImGui::Text("Translate Z");
+		            ImGui::SameLine();
+		            ImGui::SetNextItemWidth(140.0f);
+		            input_float_commit_on_enter("##geometry_translate_z", geometry.translate_z, -1000000.0f, 1000000.0f);
 		            ImGui::Text("Color");
 		            ImGui::ColorEdit3("##geometry_color", (float*)&geometry.color);
 	            ImGui::Text("Metallic");
@@ -3447,11 +3473,14 @@ int main(int argc, char* argv[]) {
       GeometryFrameState& state = geometry_states[i];
       state.renderable = geometry.show && geometry.mesh_cache.valid;
       state.visibility_changed = (state.renderable != geometry.prev_renderable);
-      state.transform_changed = state.renderable &&
-                                (std::fabs(geometry.scale - geometry.prev_scale) > 1e-6f ||
-                                 std::fabs(geometry.rotate_x_deg - geometry.prev_rotate_x_deg) > 1e-4f ||
-                                 std::fabs(geometry.rotate_y_deg - geometry.prev_rotate_y_deg) > 1e-4f ||
-                                 std::fabs(geometry.rotate_z_deg - geometry.prev_rotate_z_deg) > 1e-4f);
+	      state.transform_changed = state.renderable &&
+	                                (std::fabs(geometry.scale - geometry.prev_scale) > 1e-6f ||
+	                                 std::fabs(geometry.rotate_x_deg - geometry.prev_rotate_x_deg) > 1e-4f ||
+	                                 std::fabs(geometry.rotate_y_deg - geometry.prev_rotate_y_deg) > 1e-4f ||
+	                                 std::fabs(geometry.rotate_z_deg - geometry.prev_rotate_z_deg) > 1e-4f ||
+	                                 std::fabs(geometry.translate_x - geometry.prev_translate_x) > 1e-5f ||
+	                                 std::fabs(geometry.translate_y - geometry.prev_translate_y) > 1e-5f ||
+	                                 std::fabs(geometry.translate_z - geometry.prev_translate_z) > 1e-5f);
       state.material_changed =
           state.renderable &&
           (geometry.color.x != geometry.prev_color.x || geometry.color.y != geometry.prev_color.y ||
@@ -3705,11 +3734,14 @@ int main(int argc, char* argv[]) {
     for (size_t i = 0; i < geometry_layers.size(); i++) {
       GeometryLayer& geometry = geometry_layers[i];
       geometry.prev_show = geometry.show;
-      geometry.prev_scale = geometry.scale;
-      geometry.prev_rotate_x_deg = geometry.rotate_x_deg;
-      geometry.prev_rotate_y_deg = geometry.rotate_y_deg;
-      geometry.prev_rotate_z_deg = geometry.rotate_z_deg;
-      geometry.prev_color = geometry.color;
+	      geometry.prev_scale = geometry.scale;
+	      geometry.prev_rotate_x_deg = geometry.rotate_x_deg;
+	      geometry.prev_rotate_y_deg = geometry.rotate_y_deg;
+	      geometry.prev_rotate_z_deg = geometry.rotate_z_deg;
+	      geometry.prev_translate_x = geometry.translate_x;
+	      geometry.prev_translate_y = geometry.translate_y;
+	      geometry.prev_translate_z = geometry.translate_z;
+	      geometry.prev_color = geometry.color;
       geometry.prev_metallic = geometry.metallic;
       geometry.prev_roughness = geometry.roughness;
       geometry.prev_opacity = geometry.opacity;
