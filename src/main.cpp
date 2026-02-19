@@ -5,6 +5,9 @@
 #include <imgui_impl_sdl3.h>
 #include <imgui_impl_sdlrenderer3.h>
 #include <ImGuiFileDialog.h>
+#include <assimp/Importer.hpp>
+#include <assimp/postprocess.h>
+#include <assimp/scene.h>
 #include <viskores/io/VTKDataSetReader.h>
 #include <viskores/cont/DataSet.h>
 #include <viskores/cont/Field.h>
@@ -171,6 +174,33 @@ struct MeshCache {
   }
 };
 
+struct GeometryLayer {
+  std::string file_path;
+  std::string display_name;
+  MeshCache mesh_cache;
+  bool show = true;
+  bool prev_show = show;
+  bool prev_renderable = false;
+  float scale = 1.0f;
+  float prev_scale = scale;
+  float rotate_x_deg = 0.0f;
+  float prev_rotate_x_deg = rotate_x_deg;
+  float rotate_y_deg = 0.0f;
+  float prev_rotate_y_deg = rotate_y_deg;
+  float rotate_z_deg = 0.0f;
+  float prev_rotate_z_deg = rotate_z_deg;
+  ImVec4 color = ImVec4(0.8f, 0.8f, 0.8f, 1.0f);
+  ImVec4 prev_color = color;
+  float metallic = 0.0f;
+  float prev_metallic = metallic;
+  float roughness = 0.3f;
+  float prev_roughness = roughness;
+  float opacity = 1.0f;
+  float prev_opacity = opacity;
+  float glass_ior = 1.45f;
+  float prev_glass_ior = glass_ior;
+};
+
 struct LightingState {
   ImVec4 bg_color = ImVec4(1.0f, 1.0f, 1.0f, 1.0f);
   ImVec4 prev_bg_color = bg_color;
@@ -232,6 +262,7 @@ struct DatasetState {
   std::vector<std::string> scalar_cell_names;
   std::vector<DataLayer> layers;
   std::vector<MeshCache> layer_mesh_caches;
+  std::vector<GeometryLayer> geometry_layers;
   int loaded_field_vtk_index = -1;
   bool first_frame = true;
 };
@@ -326,6 +357,9 @@ struct OptixState {
   size_t gas_output_capacity = 0;
   GpuMeshBuffers mask_mesh;
   std::vector<GpuMeshBuffers> fluid_meshes;
+  std::vector<GpuMeshBuffers> geometry_meshes;
+  std::vector<int> geometry_sbt_indices;
+  std::vector<int> geometry_layer_indices;
   CUdeviceptr d_ground_vertices = 0;
   CUdeviceptr d_ground_indices = 0;
   CUdeviceptr d_image = 0;
@@ -1005,6 +1039,124 @@ static void add_data_layer(std::vector<DataLayer>& layers, std::vector<MeshCache
   layer_mesh_caches.emplace_back();
 }
 
+static void recompute_vertex_normals(const std::vector<float3>& positions, const std::vector<uint3>& indices,
+                                     std::vector<float3>& normals) {
+  normals.assign(positions.size(), make_float3(0.0f, 0.0f, 0.0f));
+  for (const auto& tri : indices) {
+    if (tri.x >= positions.size() || tri.y >= positions.size() || tri.z >= positions.size()) {
+      continue;
+    }
+    const float3& p0 = positions[tri.x];
+    const float3& p1 = positions[tri.y];
+    const float3& p2 = positions[tri.z];
+    float3 e1 = make_float3(p1.x - p0.x, p1.y - p0.y, p1.z - p0.z);
+    float3 e2 = make_float3(p2.x - p0.x, p2.y - p0.y, p2.z - p0.z);
+    float3 fn = make_float3(e1.y * e2.z - e1.z * e2.y, e1.z * e2.x - e1.x * e2.z, e1.x * e2.y - e1.y * e2.x);
+    normals[tri.x].x += fn.x;
+    normals[tri.x].y += fn.y;
+    normals[tri.x].z += fn.z;
+    normals[tri.y].x += fn.x;
+    normals[tri.y].y += fn.y;
+    normals[tri.y].z += fn.z;
+    normals[tri.z].x += fn.x;
+    normals[tri.z].y += fn.y;
+    normals[tri.z].z += fn.z;
+  }
+
+  for (auto& n : normals) {
+    float len = std::sqrt(n.x * n.x + n.y * n.y + n.z * n.z);
+    if (len > 1e-12f) {
+      n.x /= len;
+      n.y /= len;
+      n.z /= len;
+    } else {
+      n = make_float3(0.0f, 1.0f, 0.0f);
+    }
+  }
+}
+
+static void load_geometry_mesh_assimp(const std::string& geometry_file, MeshCache& mesh_cache) {
+  Assimp::Importer importer;
+  unsigned int flags = aiProcess_Triangulate | aiProcess_JoinIdenticalVertices | aiProcess_PreTransformVertices |
+                       aiProcess_GenSmoothNormals | aiProcess_ImproveCacheLocality | aiProcess_RemoveRedundantMaterials |
+                       aiProcess_SortByPType | aiProcess_FindInvalidData | aiProcess_OptimizeMeshes |
+                       aiProcess_OptimizeGraph;
+
+  const aiScene* scene = importer.ReadFile(geometry_file, flags);
+  if (scene == nullptr || (scene->mFlags & AI_SCENE_FLAGS_INCOMPLETE) != 0 || scene->mRootNode == nullptr) {
+    std::string err = importer.GetErrorString();
+    if (err.empty()) {
+      err = "Unknown assimp import error.";
+    }
+    throw std::runtime_error("Failed to import geometry: " + err);
+  }
+
+  std::vector<float3> positions;
+  std::vector<float3> normals;
+  std::vector<uint3> indices;
+  bool has_valid_normals = true;
+
+  for (unsigned int mesh_idx = 0; mesh_idx < scene->mNumMeshes; mesh_idx++) {
+    const aiMesh* mesh = scene->mMeshes[mesh_idx];
+    if (mesh == nullptr || mesh->mNumVertices == 0 || mesh->mNumFaces == 0) {
+      continue;
+    }
+
+    size_t vertex_offset = positions.size();
+    bool mesh_has_normals = mesh->HasNormals();
+    has_valid_normals = has_valid_normals && mesh_has_normals;
+
+    for (unsigned int v = 0; v < mesh->mNumVertices; v++) {
+      const aiVector3D& p = mesh->mVertices[v];
+      positions.push_back(make_float3(p.x, p.y, p.z));
+      if (mesh_has_normals) {
+        aiVector3D n = mesh->mNormals[v];
+        float len = std::sqrt(n.x * n.x + n.y * n.y + n.z * n.z);
+        if (len > 1e-12f) {
+          n.x /= len;
+          n.y /= len;
+          n.z /= len;
+        } else {
+          n = aiVector3D(0.0f, 1.0f, 0.0f);
+        }
+        normals.push_back(make_float3(n.x, n.y, n.z));
+      } else {
+        normals.push_back(make_float3(0.0f, 1.0f, 0.0f));
+      }
+    }
+
+    for (unsigned int f = 0; f < mesh->mNumFaces; f++) {
+      const aiFace& face = mesh->mFaces[f];
+      if (face.mNumIndices != 3) {
+        continue;
+      }
+      if (face.mIndices[0] >= mesh->mNumVertices || face.mIndices[1] >= mesh->mNumVertices ||
+          face.mIndices[2] >= mesh->mNumVertices) {
+        continue;
+      }
+      indices.push_back(make_uint3(static_cast<unsigned int>(vertex_offset) + face.mIndices[0],
+                                   static_cast<unsigned int>(vertex_offset) + face.mIndices[1],
+                                   static_cast<unsigned int>(vertex_offset) + face.mIndices[2]));
+    }
+  }
+
+  if (positions.empty() || indices.empty()) {
+    throw std::runtime_error("Imported geometry has no triangle mesh data.");
+  }
+
+  if (!has_valid_normals || normals.size() != positions.size()) {
+    recompute_vertex_normals(positions, indices, normals);
+  }
+
+  mesh_cache.source_file = geometry_file;
+  mesh_cache.source_field = "__assimp_geometry__";
+  mesh_cache.source_solid_flag = 0;
+  mesh_cache.base_positions = std::move(positions);
+  mesh_cache.base_normals = std::move(normals);
+  mesh_cache.indices = std::move(indices);
+  mesh_cache.valid = true;
+}
+
 static BBox merge_bbox(const BBox& a, const BBox& b) {
   BBox out;
   out.lo = make_float3(std::min(a.lo.x, b.lo.x), std::min(a.lo.y, b.lo.y), std::min(a.lo.z, b.lo.z));
@@ -1033,11 +1185,37 @@ static void build_render_mesh_from_cache(const MeshCache& mesh_cache, int smooth
   compute_bbox(out_positions, out_bbox);
 }
 
+static void build_render_geometry_from_cache(const MeshCache& mesh_cache, float scale, float local_rotate_x_deg,
+                                             float local_rotate_y_deg, float local_rotate_z_deg, float rotate_x_deg,
+                                             float rotate_y_deg, float rotate_z_deg, std::vector<float3>& out_positions,
+                                             std::vector<float3>& out_normals, BBox& out_bbox) {
+  if (!mesh_cache.valid || mesh_cache.base_positions.empty() || mesh_cache.indices.empty()) {
+    throw std::runtime_error("Cached geometry mesh is not available.");
+  }
+
+  float safe_scale = std::max(1e-6f, scale);
+  out_positions = mesh_cache.base_positions;
+  out_normals = mesh_cache.base_normals;
+  if (out_normals.size() != out_positions.size()) {
+    out_normals.assign(out_positions.size(), make_float3(0.0f, 1.0f, 0.0f));
+  }
+
+  for (auto& p : out_positions) {
+    p.x *= safe_scale;
+    p.y *= safe_scale;
+    p.z *= safe_scale;
+  }
+
+  apply_geometry_rotation(out_positions, out_normals, local_rotate_x_deg, local_rotate_y_deg, local_rotate_z_deg);
+  apply_geometry_rotation(out_positions, out_normals, rotate_x_deg, rotate_y_deg, rotate_z_deg);
+  compute_bbox(out_positions, out_bbox);
+}
+
 // --- Rebuild GAS (geometry acceleration structure) ---
 
 static void rebuild_gas(OptixState& state, const BBox& bbox, bool include_mask, int fluid_mesh_count,
-                        bool ground_enabled, float ground_y_offset) {
-  if (!include_mask && fluid_mesh_count <= 0) {
+                        int geometry_mesh_count, bool ground_enabled, float ground_y_offset) {
+  if (!include_mask && fluid_mesh_count <= 0 && geometry_mesh_count <= 0) {
     throw std::runtime_error("Scene rebuild requires at least one surface geometry.");
   }
 
@@ -1075,7 +1253,8 @@ static void rebuild_gas(OptixState& state, const BBox& bbox, bool include_mask, 
   accel_options.buildFlags = OPTIX_BUILD_FLAG_PREFER_FAST_TRACE;
   accel_options.operation = OPTIX_BUILD_OPERATION_BUILD;
 
-  int num_inputs_expected = (include_mask ? 1 : 0) + std::max(0, fluid_mesh_count) + (ground_enabled ? 1 : 0);
+  int num_inputs_expected =
+      (include_mask ? 1 : 0) + std::max(0, fluid_mesh_count) + std::max(0, geometry_mesh_count) + (ground_enabled ? 1 : 0);
   std::vector<uint32_t> flags(static_cast<size_t>(num_inputs_expected), OPTIX_GEOMETRY_FLAG_NONE);
   std::vector<CUdeviceptr> vertex_buffers(static_cast<size_t>(num_inputs_expected), 0);
   std::vector<OptixBuildInput> build_inputs(static_cast<size_t>(num_inputs_expected));
@@ -1083,6 +1262,7 @@ static void rebuild_gas(OptixState& state, const BBox& bbox, bool include_mask, 
 
   state.mask_sbt_index = -1;
   state.fluid_sbt_indices.assign(static_cast<size_t>(std::max(0, fluid_mesh_count)), -1);
+  state.geometry_sbt_indices.assign(static_cast<size_t>(std::max(0, geometry_mesh_count)), -1);
   state.ground_sbt_index = -1;
 
   if (include_mask) {
@@ -1114,6 +1294,25 @@ static void rebuild_gas(OptixState& state, const BBox& bbox, bool include_mask, 
     build_inputs[num_inputs].triangleArray.indexFormat = OPTIX_INDICES_FORMAT_UNSIGNED_INT3;
     build_inputs[num_inputs].triangleArray.numIndexTriplets = fluid_mesh.num_triangles;
     build_inputs[num_inputs].triangleArray.indexBuffer = fluid_mesh.d_indices_buf;
+    build_inputs[num_inputs].triangleArray.flags = &flags[static_cast<size_t>(num_inputs)];
+    build_inputs[num_inputs].triangleArray.numSbtRecords = 1;
+    num_inputs++;
+  }
+
+  for (int i = 0; i < geometry_mesh_count; i++) {
+    if (i >= static_cast<int>(state.geometry_meshes.size()) || !state.geometry_meshes[static_cast<size_t>(i)].IsValid()) {
+      continue;
+    }
+    const GpuMeshBuffers& geometry_mesh = state.geometry_meshes[static_cast<size_t>(i)];
+    state.geometry_sbt_indices[static_cast<size_t>(i)] = num_inputs;
+    vertex_buffers[num_inputs] = geometry_mesh.d_vertices;
+    build_inputs[num_inputs].type = OPTIX_BUILD_INPUT_TYPE_TRIANGLES;
+    build_inputs[num_inputs].triangleArray.vertexFormat = OPTIX_VERTEX_FORMAT_FLOAT3;
+    build_inputs[num_inputs].triangleArray.numVertices = geometry_mesh.num_vertices;
+    build_inputs[num_inputs].triangleArray.vertexBuffers = &vertex_buffers[num_inputs];
+    build_inputs[num_inputs].triangleArray.indexFormat = OPTIX_INDICES_FORMAT_UNSIGNED_INT3;
+    build_inputs[num_inputs].triangleArray.numIndexTriplets = geometry_mesh.num_triangles;
+    build_inputs[num_inputs].triangleArray.indexBuffer = geometry_mesh.d_indices_buf;
     build_inputs[num_inputs].triangleArray.flags = &flags[static_cast<size_t>(num_inputs)];
     build_inputs[num_inputs].triangleArray.numSbtRecords = 1;
     num_inputs++;
@@ -1170,15 +1369,17 @@ static void rebuild_gas(OptixState& state, const BBox& bbox, bool include_mask, 
 
 static void rebuild_scene_from_caches(
     const MeshCache* mask_cache, const std::vector<int>& fluid_layer_indices, const std::vector<DataLayer>& data_layers,
-    const std::vector<MeshCache>& fluid_layer_caches, OptixState& state, const float3& light_dir, float light_r,
+    const std::vector<MeshCache>& fluid_layer_caches, const std::vector<int>& geometry_layer_indices,
+    const std::vector<GeometryLayer>& geometry_layers, OptixState& state, const float3& light_dir, float light_r,
     float light_g, float light_b, float light_strength, bool ground_enabled, const ImVec4& ground_color,
     float ground_metallic, float ground_roughness, float ground_opacity, float ground_y_offset, float rotate_x_deg,
     float rotate_y_deg, float rotate_z_deg, int mask_smooth_iters, float mask_smooth_lambda, const ImVec4& mask_color,
     float mask_metallic, float mask_roughness, float mask_opacity, float mask_ior, BBox& bbox) {
   bool include_mask = (mask_cache != nullptr && mask_cache->valid);
   int fluid_count = static_cast<int>(fluid_layer_indices.size());
-  if (!include_mask && fluid_count <= 0) {
-    throw std::runtime_error("No renderable mask/fluid mesh is available.");
+  int geometry_count = static_cast<int>(geometry_layer_indices.size());
+  if (!include_mask && fluid_count <= 0 && geometry_count <= 0) {
+    throw std::runtime_error("No renderable mask/fluid/geometry mesh is available.");
   }
 
   BBox scene_bbox;
@@ -1204,6 +1405,13 @@ static void rebuild_scene_from_caches(
   state.fluid_layer_indices.clear();
   state.fluid_meshes.reserve(static_cast<size_t>(fluid_count));
   state.fluid_layer_indices.reserve(static_cast<size_t>(fluid_count));
+  for (auto& mesh : state.geometry_meshes) {
+    free_gpu_mesh_buffers(mesh);
+  }
+  state.geometry_meshes.clear();
+  state.geometry_layer_indices.clear();
+  state.geometry_meshes.reserve(static_cast<size_t>(geometry_count));
+  state.geometry_layer_indices.reserve(static_cast<size_t>(geometry_count));
 
   for (int layer_idx : fluid_layer_indices) {
     if (layer_idx < 0 || layer_idx >= static_cast<int>(data_layers.size()) ||
@@ -1228,12 +1436,35 @@ static void rebuild_scene_from_caches(
   }
 
   fluid_count = static_cast<int>(state.fluid_meshes.size());
-  if (!include_mask && fluid_count <= 0) {
-    throw std::runtime_error("No renderable mask/fluid mesh is available.");
+  for (int geometry_idx : geometry_layer_indices) {
+    if (geometry_idx < 0 || geometry_idx >= static_cast<int>(geometry_layers.size())) {
+      continue;
+    }
+    const GeometryLayer& geometry = geometry_layers[static_cast<size_t>(geometry_idx)];
+    if (!geometry.mesh_cache.valid) {
+      continue;
+    }
+    std::vector<float3> positions;
+    std::vector<float3> normals;
+    BBox geometry_bbox;
+    build_render_geometry_from_cache(geometry.mesh_cache, geometry.scale, geometry.rotate_x_deg, geometry.rotate_y_deg,
+                                     geometry.rotate_z_deg, rotate_x_deg, rotate_y_deg, rotate_z_deg, positions, normals,
+                                     geometry_bbox);
+    state.geometry_meshes.emplace_back();
+    upload_mesh_buffers_to_gpu(positions, normals, geometry.mesh_cache.indices, state.geometry_meshes.back());
+    state.geometry_layer_indices.push_back(geometry_idx);
+    scene_bbox = has_bbox ? merge_bbox(scene_bbox, geometry_bbox) : geometry_bbox;
+    has_bbox = true;
+  }
+
+  fluid_count = static_cast<int>(state.fluid_meshes.size());
+  geometry_count = static_cast<int>(state.geometry_meshes.size());
+  if (!include_mask && fluid_count <= 0 && geometry_count <= 0) {
+    throw std::runtime_error("No renderable mask/fluid/geometry mesh is available.");
   }
 
   bbox = scene_bbox;
-  rebuild_gas(state, bbox, include_mask, fluid_count, ground_enabled, ground_y_offset);
+  rebuild_gas(state, bbox, include_mask, fluid_count, geometry_count, ground_enabled, ground_y_offset);
 
   if (state.mask_sbt_index >= 0 && include_mask) {
     update_surface_hitgroup_sbt(state, state.mask_sbt_index, state.hitgroup_mesh_pg, state.mask_mesh, mask_color.x,
@@ -1254,6 +1485,21 @@ static void rebuild_scene_from_caches(
                                 layer.color.y, layer.color.z, layer.metallic, layer.roughness, layer.opacity,
                                 layer.glass_ior, true, light_dir, light_r, light_g, light_b, light_strength);
   }
+  for (size_t i = 0; i < state.geometry_meshes.size(); i++) {
+    if (i >= state.geometry_sbt_indices.size() || i >= state.geometry_layer_indices.size()) {
+      continue;
+    }
+    int sbt_index = state.geometry_sbt_indices[i];
+    int layer_idx = state.geometry_layer_indices[i];
+    if (sbt_index < 0 || layer_idx < 0 || layer_idx >= static_cast<int>(geometry_layers.size())) {
+      continue;
+    }
+    const GeometryLayer& geometry = geometry_layers[static_cast<size_t>(layer_idx)];
+    update_surface_hitgroup_sbt(state, sbt_index, state.hitgroup_mesh_pg, state.geometry_meshes[i], geometry.color.x,
+                                geometry.color.y, geometry.color.z, geometry.metallic, geometry.roughness,
+                                geometry.opacity, geometry.glass_ior, true, light_dir, light_r, light_g, light_b,
+                                light_strength);
+  }
   if (state.ground_sbt_index >= 0 && ground_enabled) {
     update_ground_hitgroup_sbt(state, state.ground_sbt_index, ground_color, ground_metallic, ground_roughness,
                                ground_opacity, light_dir, light_r, light_g, light_b, light_strength);
@@ -1265,7 +1511,8 @@ static void update_scene_material_sbt(OptixState& state, const float3& light_dir
                                       const ImVec4& ground_color, float ground_metallic, float ground_roughness,
                                       float ground_opacity, const ImVec4& mask_color, float mask_metallic,
                                       float mask_roughness, float mask_opacity, float mask_ior,
-                                      const std::vector<DataLayer>& data_layers) {
+                                      const std::vector<DataLayer>& data_layers,
+                                      const std::vector<GeometryLayer>& geometry_layers) {
   if (state.mask_sbt_index >= 0 && state.mask_mesh.IsValid()) {
     update_surface_hitgroup_sbt(state, state.mask_sbt_index, state.hitgroup_mesh_pg, state.mask_mesh, mask_color.x,
                                 mask_color.y, mask_color.z, mask_metallic, mask_roughness, mask_opacity, mask_ior, true,
@@ -1285,6 +1532,22 @@ static void update_scene_material_sbt(OptixState& state, const float3& light_dir
     update_surface_hitgroup_sbt(state, sbt_index, state.hitgroup_fluid_pg, state.fluid_meshes[i], layer.color.x,
                                 layer.color.y, layer.color.z, layer.metallic, layer.roughness, layer.opacity,
                                 layer.glass_ior, true, light_dir, light_r, light_g, light_b, light_strength);
+  }
+  for (size_t i = 0; i < state.geometry_meshes.size(); i++) {
+    if (i >= state.geometry_sbt_indices.size() || i >= state.geometry_layer_indices.size()) {
+      continue;
+    }
+    int sbt_index = state.geometry_sbt_indices[i];
+    int layer_idx = state.geometry_layer_indices[i];
+    if (sbt_index < 0 || layer_idx < 0 || layer_idx >= static_cast<int>(geometry_layers.size()) ||
+        !state.geometry_meshes[i].IsValid()) {
+      continue;
+    }
+    const GeometryLayer& geometry = geometry_layers[static_cast<size_t>(layer_idx)];
+    update_surface_hitgroup_sbt(state, sbt_index, state.hitgroup_mesh_pg, state.geometry_meshes[i], geometry.color.x,
+                                geometry.color.y, geometry.color.z, geometry.metallic, geometry.roughness,
+                                geometry.opacity, geometry.glass_ior, true, light_dir, light_r, light_g, light_b,
+                                light_strength);
   }
   if (ground_enabled && state.ground_sbt_index >= 0) {
     update_ground_hitgroup_sbt(state, state.ground_sbt_index, ground_color, ground_metallic, ground_roughness,
@@ -1921,8 +2184,14 @@ static void cleanup_optix(OptixState& state) {
     free_gpu_mesh_buffers(mesh);
   }
   state.fluid_meshes.clear();
+  for (auto& mesh : state.geometry_meshes) {
+    free_gpu_mesh_buffers(mesh);
+  }
+  state.geometry_meshes.clear();
   state.fluid_sbt_indices.clear();
   state.fluid_layer_indices.clear();
+  state.geometry_sbt_indices.clear();
+  state.geometry_layer_indices.clear();
   if (state.d_ground_vertices) cudaFree(reinterpret_cast<void*>(state.d_ground_vertices));
   if (state.d_ground_indices) cudaFree(reinterpret_cast<void*>(state.d_ground_indices));
   if (state.d_raygen_record) cudaFree(reinterpret_cast<void*>(state.d_raygen_record));
@@ -2004,6 +2273,7 @@ int main(int argc, char* argv[]) {
   std::vector<std::string>& dataset_scalar_cell_names = dataset.scalar_cell_names;
   std::vector<DataLayer>& data_layers = dataset.layers;
   std::vector<MeshCache>& data_layer_mesh_caches = dataset.layer_mesh_caches;
+  std::vector<GeometryLayer>& geometry_layers = dataset.geometry_layers;
   int& dataset_loaded_field_vtk_index = dataset.loaded_field_vtk_index;
   bool& first_frame = dataset.first_frame;
 
@@ -2425,12 +2695,106 @@ int main(int argc, char* argv[]) {
         mesh_loaded = false;
       }
 
-      if (!mask_file.empty()) {
-        ImGui::TextWrapped("%s", std::filesystem::path(mask_file).filename().string().c_str());
-      }
-      if (!mask_field_names.empty()) {
-        ImGui::Spacing();
-        ImGui::Text("Field");
+	      if (!mask_file.empty()) {
+	        ImGui::TextWrapped("%s", std::filesystem::path(mask_file).filename().string().c_str());
+	      }
+
+	      ImGui::Spacing();
+	      ImGui::Separator();
+	      ImGui::Spacing();
+	      ImGui::PushFont(bold_font);
+	      ImGui::Text("Render:Geometry");
+	      ImGui::PopFont();
+	      ImGui::Spacing();
+	      if (ImGui::Button("Add Geometry")) {
+	        IGFD::FileDialogConfig geometry_config;
+	        if (!vtk_dir.empty()) {
+	          geometry_config.path = vtk_dir;
+	        } else if (const char* home = getenv("HOME")) {
+	          geometry_config.path = home;
+	        }
+	        ImGuiFileDialog::Instance()->OpenDialog("OpenGeometryDlg", "Open Geometry",
+	                                                ".obj,.stl,.ply,.fbx,.gltf,.glb,.off,.3ds", geometry_config);
+	      }
+	      if (geometry_layers.empty()) {
+	        ImGui::TextDisabled("No geometry entries.");
+	      } else {
+	        for (size_t i = 0; i < geometry_layers.size();) {
+	          GeometryLayer& geometry = geometry_layers[i];
+	          ImGui::PushID(static_cast<int>(i));
+	          ImGui::Spacing();
+	          if (i > 0) {
+	            ImGui::Separator();
+	            ImGui::Spacing();
+	          }
+
+	          ImGui::TextWrapped("%s", geometry.display_name.c_str());
+	          ImGui::Checkbox("Show##geometry", &geometry.show);
+	          ImGui::SameLine();
+	          if (ImGui::Button("Config")) {
+	            ImGui::OpenPopup("GeometryConfig");
+	          }
+	          ImGui::SameLine();
+	          if (ImGui::Button("Clear##geometry")) {
+	            geometry_layers.erase(geometry_layers.begin() + static_cast<long>(i));
+	            mesh_loaded = false;
+	            ImGui::PopID();
+	            continue;
+	          }
+
+	          if (ImGui::BeginPopup("GeometryConfig")) {
+	            ImGui::TextWrapped("%s", geometry.file_path.c_str());
+	            ImGui::Text("Scale");
+	            ImGui::SameLine();
+	            ImGui::SetNextItemWidth(140.0f);
+	            input_float_commit_on_enter("##geometry_scale", geometry.scale, 0.0001f, 1000000.0f);
+	            ImGui::Text("Rotate X");
+	            ImGui::SameLine();
+	            ImGui::SetNextItemWidth(140.0f);
+	            input_float_commit_on_enter("##geometry_rotate_x", geometry.rotate_x_deg, -360000.0f, 360000.0f);
+	            ImGui::Text("Rotate Y");
+	            ImGui::SameLine();
+	            ImGui::SetNextItemWidth(140.0f);
+	            input_float_commit_on_enter("##geometry_rotate_y", geometry.rotate_y_deg, -360000.0f, 360000.0f);
+	            ImGui::Text("Rotate Z");
+	            ImGui::SameLine();
+	            ImGui::SetNextItemWidth(140.0f);
+	            input_float_commit_on_enter("##geometry_rotate_z", geometry.rotate_z_deg, -360000.0f, 360000.0f);
+	            ImGui::Text("Color");
+	            ImGui::ColorEdit3("##geometry_color", (float*)&geometry.color);
+	            ImGui::Text("Metallic");
+	            ImGui::SameLine();
+	            ImGui::SetNextItemWidth(-1);
+	            ImGui::SliderFloat("##geometry_metallic", &geometry.metallic, 0.0f, 1.0f, "%.3f",
+	                               ImGuiSliderFlags_NoInput);
+	            ImGui::Text("Roughness");
+	            ImGui::SameLine();
+	            ImGui::SetNextItemWidth(-1);
+	            ImGui::SliderFloat("##geometry_roughness", &geometry.roughness, 0.0f, 1.0f, "%.3f",
+	                               ImGuiSliderFlags_NoInput);
+	            ImGui::Text("Opacity");
+	            ImGui::SameLine();
+	            ImGui::SetNextItemWidth(-1);
+	            ImGui::SliderFloat("##geometry_opacity", &geometry.opacity, 0.0f, 1.0f, "%.3f",
+	                               ImGuiSliderFlags_NoInput);
+	            ImGui::Text("Glass IOR");
+	            ImGui::SameLine();
+	            ImGui::SetNextItemWidth(-1);
+	            ImGui::SliderFloat("##geometry_ior", &geometry.glass_ior, 1.0f, 2.5f, "%.3f",
+	                               ImGuiSliderFlags_NoInput);
+	            if (ImGui::Button("Close##geometry_config")) {
+	              ImGui::CloseCurrentPopup();
+	            }
+	            ImGui::EndPopup();
+	          }
+
+	          ImGui::PopID();
+	          ++i;
+	        }
+	      }
+	      if (!mask_field_names.empty()) {
+	        ImGui::Spacing();
+	        ImGui::Text("Field");
         ImGui::SameLine();
         const char* preview = mask_field_names[mask_field_index].c_str();
         if (ImGui::BeginCombo("##mask_field", preview)) {
@@ -2449,7 +2813,7 @@ int main(int argc, char* argv[]) {
         ImGui::Spacing();
         ImGui::Checkbox("Show##mask", &show_mask);
 
-        if (show_mask) {
+	        if (show_mask) {
           ImGui::Spacing();
           ImGui::Text("Color");
           ImGui::ColorEdit3("##mask_color", (float*)&mask_color);
@@ -2476,15 +2840,15 @@ int main(int argc, char* argv[]) {
           ImGui::Text("Smooth Strength");
           ImGui::SameLine();
           ImGui::SetNextItemWidth(-1);
-          ImGui::SliderFloat("##smooth_strength", &smooth_strength, 0.0f, 1.0f, "%.3f", ImGuiSliderFlags_NoInput);
-        }
+	          ImGui::SliderFloat("##smooth_strength", &smooth_strength, 0.0f, 1.0f, "%.3f", ImGuiSliderFlags_NoInput);
+	        }
 
-        ImGui::Spacing();
-        ImGui::Separator();
-        ImGui::Spacing();
-        ImGui::PushFont(bold_font);
-        ImGui::Text("Render:Data");
-        ImGui::PopFont();
+	        ImGui::Spacing();
+	        ImGui::Separator();
+	        ImGui::Spacing();
+	        ImGui::PushFont(bold_font);
+	        ImGui::Text("Render:Data");
+	        ImGui::PopFont();
         ImGui::Spacing();
         if (ImGui::Button("Add##data")) {
           ImGui::OpenPopup("AddDataLayer");
@@ -2692,6 +3056,28 @@ int main(int argc, char* argv[]) {
         } catch (...) {
           show_mask_error = true;
           mask_error_msg = "Failed to read file as a VTK dataset.";
+        }
+      }
+      ImGuiFileDialog::Instance()->Close();
+    }
+
+    if (ImGuiFileDialog::Instance()->Display("OpenGeometryDlg", ImGuiWindowFlags_None, ImVec2(840, 520),
+                                             ImVec2(1920, 1200))) {
+      if (ImGuiFileDialog::Instance()->IsOk()) {
+        std::string geometry_file = ImGuiFileDialog::Instance()->GetFilePathName();
+        try {
+          GeometryLayer geometry;
+          geometry.file_path = geometry_file;
+          geometry.display_name = std::filesystem::path(geometry_file).filename().string();
+          load_geometry_mesh_assimp(geometry_file, geometry.mesh_cache);
+          geometry_layers.push_back(std::move(geometry));
+          mesh_loaded = false;
+        } catch (const std::exception& e) {
+          show_mask_error = true;
+          mask_error_msg = std::string("Geometry import failed: ") + e.what();
+        } catch (...) {
+          show_mask_error = true;
+          mask_error_msg = "Geometry import failed.";
         }
       }
       ImGuiFileDialog::Instance()->Close();
@@ -2966,11 +3352,21 @@ int main(int argc, char* argv[]) {
       bool needs_extract = false;
     };
 
+    struct GeometryFrameState {
+      bool renderable = false;
+      bool visibility_changed = false;
+      bool transform_changed = false;
+      bool material_changed = false;
+    };
+
     sync_data_layer_caches(data_layers, data_layer_mesh_caches);
     std::vector<LayerFrameState> layer_states(data_layers.size());
+    std::vector<GeometryFrameState> geometry_states(geometry_layers.size());
     bool any_layer_extract = false;
     bool any_layer_smooth_changed = false;
     bool any_layer_visibility_changed = false;
+    bool any_geometry_transform_changed = false;
+    bool any_geometry_visibility_changed = false;
 
     for (size_t i = 0; i < data_layers.size(); i++) {
       DataLayer& layer = data_layers[i];
@@ -3017,6 +3413,28 @@ int main(int argc, char* argv[]) {
       any_layer_extract = any_layer_extract || state.needs_extract;
       any_layer_smooth_changed = any_layer_smooth_changed || state.smoothing_changed;
       any_layer_visibility_changed = any_layer_visibility_changed || state.visibility_changed;
+    }
+
+    for (size_t i = 0; i < geometry_layers.size(); i++) {
+      GeometryLayer& geometry = geometry_layers[i];
+      GeometryFrameState& state = geometry_states[i];
+      state.renderable = geometry.show && geometry.mesh_cache.valid;
+      state.visibility_changed = (state.renderable != geometry.prev_renderable);
+      state.transform_changed = state.renderable &&
+                                (std::fabs(geometry.scale - geometry.prev_scale) > 1e-6f ||
+                                 std::fabs(geometry.rotate_x_deg - geometry.prev_rotate_x_deg) > 1e-4f ||
+                                 std::fabs(geometry.rotate_y_deg - geometry.prev_rotate_y_deg) > 1e-4f ||
+                                 std::fabs(geometry.rotate_z_deg - geometry.prev_rotate_z_deg) > 1e-4f);
+      state.material_changed =
+          state.renderable &&
+          (geometry.color.x != geometry.prev_color.x || geometry.color.y != geometry.prev_color.y ||
+           geometry.color.z != geometry.prev_color.z || std::fabs(geometry.metallic - geometry.prev_metallic) > 1e-5f ||
+           std::fabs(geometry.roughness - geometry.prev_roughness) > 1e-5f ||
+           std::fabs(geometry.opacity - geometry.prev_opacity) > 1e-5f ||
+           std::fabs(geometry.glass_ior - geometry.prev_glass_ior) > 1e-5f);
+
+      any_geometry_transform_changed = any_geometry_transform_changed || state.transform_changed;
+      any_geometry_visibility_changed = any_geometry_visibility_changed || state.visibility_changed;
     }
 
     bool needs_extract = needs_mask_extract || any_layer_extract;
@@ -3085,14 +3503,23 @@ int main(int argc, char* argv[]) {
         active_fluid_layer_indices.push_back(static_cast<int>(i));
       }
     }
+    std::vector<int> active_geometry_layer_indices;
+    active_geometry_layer_indices.reserve(geometry_layers.size());
+    for (size_t i = 0; i < geometry_layers.size(); i++) {
+      if (i < geometry_states.size() && geometry_states[i].renderable) {
+        active_geometry_layer_indices.push_back(static_cast<int>(i));
+      }
+    }
     bool render_fluid = !active_fluid_layer_indices.empty();
-    bool render_any = render_mask || render_fluid;
+    bool render_geometry = !active_geometry_layer_indices.empty();
+    bool render_any = render_mask || render_fluid || render_geometry;
 
-    bool visibility_changed = (show_mask != prev_show_mask) || any_layer_visibility_changed;
+    bool visibility_changed = (show_mask != prev_show_mask) || any_layer_visibility_changed || any_geometry_visibility_changed;
     bool needs_mesh_rebuild_from_cache =
         render_any && !needs_extract &&
         ((render_mask && (mask_smooth_changed || transform_changed)) ||
-         (render_fluid && (any_layer_smooth_changed || transform_changed)) || visibility_changed || !mesh_loaded);
+         (render_fluid && (any_layer_smooth_changed || transform_changed)) ||
+         (render_geometry && (any_geometry_transform_changed || transform_changed)) || visibility_changed || !mesh_loaded);
     bool needs_full_rebuild = render_any && (extraction_attempted || needs_mesh_rebuild_from_cache);
     bool needs_gas_rebuild =
         render_any && mesh_loaded && !needs_full_rebuild && (ground_toggled || ground_offset_changed);
@@ -3102,11 +3529,12 @@ int main(int argc, char* argv[]) {
         bool mesh_was_loaded = mesh_loaded;
         BBox bbox;
         rebuild_scene_from_caches(render_mask ? &mask_mesh_cache : nullptr, active_fluid_layer_indices, data_layers,
-                                  data_layer_mesh_caches, optix_state, light_dir, light_color.x, light_color.y,
-                                  light_color.z, light_strength, ground_enabled, ground_color, ground_metallic,
-                                  ground_roughness, ground_opacity, ground_y_offset, rotate_x_deg, rotate_y_deg,
-                                  rotate_z_deg, smooth_iterations, smooth_strength, mask_color, mask_metallic,
-                                  mask_roughness, mask_opacity, mask_glass_ior, bbox);
+                                  data_layer_mesh_caches, active_geometry_layer_indices, geometry_layers, optix_state,
+                                  light_dir, light_color.x, light_color.y, light_color.z, light_strength,
+                                  ground_enabled, ground_color, ground_metallic, ground_roughness, ground_opacity,
+                                  ground_y_offset, rotate_x_deg, rotate_y_deg, rotate_z_deg, smooth_iterations,
+                                  smooth_strength, mask_color, mask_metallic, mask_roughness, mask_opacity,
+                                  mask_glass_ior, bbox);
         mesh_loaded = true;
         mesh_bbox = bbox;
         viewport_needs_render = true;
@@ -3136,10 +3564,11 @@ int main(int argc, char* argv[]) {
 
     if (needs_gas_rebuild && !needs_full_rebuild) {
       rebuild_gas(optix_state, mesh_bbox, render_mask, static_cast<int>(active_fluid_layer_indices.size()),
-                  ground_enabled, ground_y_offset);
+                  static_cast<int>(active_geometry_layer_indices.size()), ground_enabled, ground_y_offset);
       update_scene_material_sbt(optix_state, light_dir, light_color.x, light_color.y, light_color.z, light_strength,
                                 ground_enabled, ground_color, ground_metallic, ground_roughness, ground_opacity,
-                                mask_color, mask_metallic, mask_roughness, mask_opacity, mask_glass_ior, data_layers);
+                                mask_color, mask_metallic, mask_roughness, mask_opacity, mask_glass_ior, data_layers,
+                                geometry_layers);
       prev_ground_color = ground_color;
       prev_ground_metallic = ground_metallic;
       prev_ground_roughness = ground_roughness;
@@ -3177,6 +3606,14 @@ int main(int argc, char* argv[]) {
         }
         fluid_mat_changed = fluid_mat_changed || layer_states[static_cast<size_t>(layer_idx)].material_changed;
       }
+      bool geometry_mat_changed = false;
+      for (int geometry_idx : active_geometry_layer_indices) {
+        if (geometry_idx < 0 || geometry_idx >= static_cast<int>(geometry_states.size()) ||
+            geometry_idx >= static_cast<int>(geometry_layers.size())) {
+          continue;
+        }
+        geometry_mat_changed = geometry_mat_changed || geometry_states[static_cast<size_t>(geometry_idx)].material_changed;
+      }
       bool ground_mat_changed =
           ground_enabled &&
           (ground_color.x != prev_ground_color.x || ground_color.y != prev_ground_color.y ||
@@ -3184,10 +3621,11 @@ int main(int argc, char* argv[]) {
            std::fabs(ground_roughness - prev_ground_roughness) > 1e-5f ||
            std::fabs(ground_opacity - prev_ground_opacity) > 1e-5f);
 
-      if (light_changed || mask_mat_changed || fluid_mat_changed || ground_mat_changed) {
+      if (light_changed || mask_mat_changed || fluid_mat_changed || geometry_mat_changed || ground_mat_changed) {
         update_scene_material_sbt(optix_state, light_dir, light_color.x, light_color.y, light_color.z, light_strength,
                                   ground_enabled, ground_color, ground_metallic, ground_roughness, ground_opacity,
-                                  mask_color, mask_metallic, mask_roughness, mask_opacity, mask_glass_ior, data_layers);
+                                  mask_color, mask_metallic, mask_roughness, mask_opacity, mask_glass_ior, data_layers,
+                                  geometry_layers);
         viewport_needs_render = true;
 
         prev_mask_color = mask_color;
@@ -3236,6 +3674,20 @@ int main(int argc, char* argv[]) {
       layer.prev_smooth_iterations = layer.smooth_iterations;
       layer.prev_smooth_strength = layer.smooth_strength;
       layer.prev_renderable = (i < layer_states.size()) ? layer_states[i].renderable : false;
+    }
+    for (size_t i = 0; i < geometry_layers.size(); i++) {
+      GeometryLayer& geometry = geometry_layers[i];
+      geometry.prev_show = geometry.show;
+      geometry.prev_scale = geometry.scale;
+      geometry.prev_rotate_x_deg = geometry.rotate_x_deg;
+      geometry.prev_rotate_y_deg = geometry.rotate_y_deg;
+      geometry.prev_rotate_z_deg = geometry.rotate_z_deg;
+      geometry.prev_color = geometry.color;
+      geometry.prev_metallic = geometry.metallic;
+      geometry.prev_roughness = geometry.roughness;
+      geometry.prev_opacity = geometry.opacity;
+      geometry.prev_glass_ior = geometry.glass_ior;
+      geometry.prev_renderable = (i < geometry_states.size()) ? geometry_states[i].renderable : false;
     }
     // Viewport window
     ImGuiWindowClass viewport_window_class;

@@ -15,6 +15,7 @@ It extracts and renders surfaces from scalar fields for both solid masks and flu
   - dataset frame selected in `Render > Dataset`
   - mask-based fluid gating via `Fluid Flag`
   - lower/upper scalar threshold (`Threshold Min`, `Threshold Max`)
+- Geometry import via Assimp (`OBJ/STL/PLY/FBX/glTF`) with per-entry transform/material
 - Independent smoothing controls for mask and fluid surfaces
 - Surface material controls for mask/fluid/ground:
   - color, metallic, roughness, opacity
@@ -60,6 +61,8 @@ Outputs:
    - set `Fluid Flag` (default `0`)
 5. Tune fluid material (`Color`, `Metallic`, `Roughness`, `Opacity`, `Glass IOR`) and fluid boundary smoothing.
 6. Use `Begin/Prev/Next/End` under `Render > Dataset` to change the active frame.
+7. In `Render:Geometry`, click `Add Geometry`, then use each entry's `Config` button to tune
+   scale/rotation/material.
 
 ## UI Summary
 
@@ -85,6 +88,14 @@ Outputs:
 - Material: `Color`, `Metallic`, `Roughness`, `Opacity`, `Glass IOR`
 - Smoothing: `Boundary Smoothing`, `Boundary Smooth Strength`
 
+### Render:Geometry
+
+- `Add Geometry`
+- Per-entry:
+  - `Show`
+  - `Config` (scale, local rotation, color, metallic, roughness, opacity, glass IOR)
+  - `Clear`
+
 ## Notes
 
 - Fluid extraction uses the mask field selected in `Render:Mask`.
@@ -105,6 +116,12 @@ Outputs:
   - reduce `Samples`
   - reduce smoothing iterations
   - reduce viewport size
+
+## Performance Notes
+
+- Assimp is built with only required importers enabled:
+  - `OBJ`, `STL`, `PLY`, `FBX`, `GLTF`
+- Exporters, tools, docs, tests, samples, and Draco are disabled in CMake.
 
 ## Repository Layout
 

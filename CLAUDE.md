@@ -29,6 +29,7 @@ Stack:
 - SDL3 window + renderer
 - ImGui docking UI
 - Viskores for VTK IO/filtering
+- Assimp for geometry file import
 - OptiX for GPU ray tracing
 
 ## Key Source Files
@@ -36,8 +37,9 @@ Stack:
 - `src/main.cpp`
   - UI and application loop
   - Dataset/mask loading
+  - Geometry loading via Assimp
   - Mask/fluid surface extraction
-  - Mesh smoothing + rotation
+  - Mesh smoothing + rotation + per-geometry transforms
   - OptiX host setup, SBT/GAS rebuilds, launch
 - `src/shaders.cu`
   - raygen/miss programs
@@ -53,7 +55,6 @@ Runtime/UI state is grouped into structs:
 - `LightingState`
 - `MaskState`
 - `GroundState`
-- `FluidState`
 - `DatasetState`
 - `RenderMiscState`
 - `RayTracingState`
@@ -89,6 +90,15 @@ Runtime/UI state is grouped into structs:
 9. Cache mesh for rebuild/material updates.
 
 No volumetric texture upload or ray marching is used in the current design.
+
+### Imported geometry (`load_geometry_mesh_assimp`)
+
+1. Load geometry using Assimp.
+2. Triangulate and pre-transform scene meshes.
+3. Merge all mesh triangles into one cache entry.
+4. Generate/recompute normals when needed.
+5. Apply per-entry scale/rotation, then global `Rotate X/Y/Z` during scene rebuild.
+6. Upload to GPU and include in GAS/SBT as surface geometry.
 
 ## Material + Shading
 
@@ -128,6 +138,14 @@ No volumetric texture upload or ray marching is used in the current design.
 - Fluid material controls (`Color`, `Metallic`, `Roughness`, `Opacity`, `Glass IOR`)
 - Fluid smoothing controls (`Boundary Smoothing`, `Boundary Smooth Strength`)
 
+### `Render:Geometry`
+
+- `Add Geometry` imports a mesh file (`OBJ/STL/PLY/FBX/glTF`).
+- Each imported entry has:
+  - `Show`
+  - `Config` popup for scale, local rotation, and material controls
+  - `Clear` to remove that entry
+
 ## Rebuild Strategy
 
 - Full extract + rebuild:
@@ -135,10 +153,11 @@ No volumetric texture upload or ray marching is used in the current design.
   - smoothing changes
   - rotation changes
   - visibility changes requiring mesh inclusion
+  - geometry transform changes
 - GAS-only rebuild:
   - ground enable/disable or ground offset changes
 - SBT-only update:
-  - material and lighting parameter changes
+  - mask/fluid/geometry/ground material and lighting parameter changes
 
 ## Error Handling
 
@@ -160,3 +179,10 @@ These macros throw `std::runtime_error` with location/context.
 - ImGui
 - ImGuiFileDialog
 - Viskores
+- Assimp
+
+## Assimp Build Profile
+
+CMake disables unused Assimp features for performance:
+- only `OBJ`, `STL`, `PLY`, `FBX`, `GLTF` importers enabled
+- exporters, tools, samples, docs, tests, and Draco disabled
