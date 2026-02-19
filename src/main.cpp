@@ -2713,8 +2713,8 @@ int main(int argc, char* argv[]) {
 	        } else if (const char* home = getenv("HOME")) {
 	          geometry_config.path = home;
 	        }
-	        ImGuiFileDialog::Instance()->OpenDialog("OpenGeometryDlg", "Open Geometry",
-	                                                ".obj,.stl,.ply,.fbx,.gltf,.glb,.off,.3ds", geometry_config);
+        ImGuiFileDialog::Instance()->OpenDialog("OpenGeometryDlg", "Open Geometry",
+                                                ".obj,.stl,.ply,.fbx,.gltf,.glb", geometry_config);
 	      }
 	      if (geometry_layers.empty()) {
 	        ImGui::TextDisabled("No geometry entries.");
