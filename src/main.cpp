@@ -2455,6 +2455,30 @@ int main(int argc, char* argv[]) {
     ImGui::SetNextItemWidth(80);
     input_int_commit_on_enter("##rt_samples", rt_samples, 1, 64);
 
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+    ImGui::PushFont(bold_font);
+    ImGui::Text("Camera");
+    ImGui::PopFont();
+    if (ImGui::Button("X##camera_axis")) {
+      cam_yaw = 90.0f;
+      cam_pitch = 0.0f;
+      viewport_needs_render = true;
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Y##camera_axis")) {
+      cam_yaw = 0.0f;
+      cam_pitch = 89.0f;
+      viewport_needs_render = true;
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Z##camera_axis")) {
+      cam_yaw = 0.0f;
+      cam_pitch = 0.0f;
+      viewport_needs_render = true;
+    }
+
     // Ground Plane section
     ImGui::Spacing();
     ImGui::Separator();
@@ -2808,30 +2832,12 @@ int main(int argc, char* argv[]) {
 	            ImGui::SameLine();
 	            ImGui::SetNextItemWidth(140.0f);
 	            input_float_commit_on_enter("##geometry_rotate_y", geometry.rotate_y_deg, -360000.0f, 360000.0f);
-	            ImGui::Text("Rotate Z");
-	            ImGui::SameLine();
-	            ImGui::SetNextItemWidth(140.0f);
-	            input_float_commit_on_enter("##geometry_rotate_z", geometry.rotate_z_deg, -360000.0f, 360000.0f);
-	            ImGui::Text("Camera Axis");
-	            if (ImGui::Button("X##geometry_cam_axis")) {
-	              cam_yaw = 90.0f;
-	              cam_pitch = 0.0f;
-	              viewport_needs_render = true;
-	            }
-	            ImGui::SameLine();
-	            if (ImGui::Button("Y##geometry_cam_axis")) {
-	              cam_yaw = 0.0f;
-	              cam_pitch = 89.0f;
-	              viewport_needs_render = true;
-	            }
-	            ImGui::SameLine();
-	            if (ImGui::Button("Z##geometry_cam_axis")) {
-	              cam_yaw = 0.0f;
-	              cam_pitch = 0.0f;
-	              viewport_needs_render = true;
-	            }
-	            ImGui::Text("Color");
-	            ImGui::ColorEdit3("##geometry_color", (float*)&geometry.color);
+		            ImGui::Text("Rotate Z");
+		            ImGui::SameLine();
+		            ImGui::SetNextItemWidth(140.0f);
+		            input_float_commit_on_enter("##geometry_rotate_z", geometry.rotate_z_deg, -360000.0f, 360000.0f);
+		            ImGui::Text("Color");
+		            ImGui::ColorEdit3("##geometry_color", (float*)&geometry.color);
 	            ImGui::Text("Metallic");
 	            ImGui::SameLine();
 	            ImGui::SetNextItemWidth(-1);

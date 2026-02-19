@@ -73,6 +73,12 @@ Outputs:
 - `Rotate X`, `Rotate Y`, `Rotate Z`
 - Ray tracing `Bounces` supports `1..20`
 
+### Config
+
+- Background color
+- Global illumination
+- Camera axis buttons `X/Y/Z`
+
 ### Render:Mask
 
 - `File`, `Field`, `Solid Flag`, `Show`
@@ -95,7 +101,7 @@ Outputs:
 - `Add Geometry`
 - Per-entry:
   - `Show`
-  - `Config` (scale, local rotation, camera axis buttons `X/Y/Z`, color, metallic, roughness, opacity, glass IOR)
+  - `Config` (scale, local rotation, color, metallic, roughness, opacity, glass IOR)
   - `Clear`
 
 ## Notes

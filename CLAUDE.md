@@ -144,12 +144,16 @@ No volumetric texture upload or ray marching is used in the current design.
 - `Add Geometry` imports a mesh file (`OBJ/STL/PLY/FBX/glTF`).
 - Each imported entry has:
   - `Show`
-  - `Config` popup for scale, local rotation, camera axis orientation buttons (`X/Y/Z`), and material controls
+  - `Config` popup for scale, local rotation, and material controls
   - `Clear` to remove that entry
 
 ### `Config > Ray Tracing`
 
 - `Bounces` range is `1..20`
+
+### `Config > Camera`
+
+- Axis orientation buttons: `X`, `Y`, `Z`
 
 ## Rebuild Strategy
 
