@@ -78,6 +78,8 @@ Outputs:
 - Background color
 - Global illumination
 - Camera axis buttons `X/Y/Z`
+- `Save Camera Config` to store the current camera
+- Saved camera selector + `Load` to restore a saved view
 
 ### Render:Mask
 

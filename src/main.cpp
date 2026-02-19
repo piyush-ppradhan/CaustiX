@@ -295,11 +295,23 @@ struct RayTracingState {
 };
 
 struct CameraState {
+  struct Preset {
+    std::string name;
+    float yaw = 0.0f;
+    float pitch = 30.0f;
+    float distance = 5.0f;
+    float target[3] = {0.0f, 0.0f, 0.0f};
+    float fov = 60.0f;
+  };
+
   float yaw = 0.0f;
   float pitch = 30.0f;
   float distance = 5.0f;
   float target[3] = {0.0f, 0.0f, 0.0f};
   float fov = 60.0f;
+  std::vector<Preset> presets;
+  int selected_preset_index = -1;
+  int next_preset_id = 1;
   bool viewport_needs_render = true;
   int prev_vp_w = 0;
   int prev_vp_h = 0;
@@ -2349,6 +2361,9 @@ int main(int argc, char* argv[]) {
   float& cam_distance = camera.distance;
   float (&cam_target)[3] = camera.target;
   float& cam_fov = camera.fov;
+  std::vector<CameraState::Preset>& cam_presets = camera.presets;
+  int& selected_cam_preset_index = camera.selected_preset_index;
+  int& next_cam_preset_id = camera.next_preset_id;
   bool& viewport_needs_render = camera.viewport_needs_render;
   int& prev_vp_w = camera.prev_vp_w;
   int& prev_vp_h = camera.prev_vp_h;
@@ -2491,6 +2506,55 @@ int main(int argc, char* argv[]) {
       cam_yaw = 0.0f;
       cam_pitch = 0.0f;
       viewport_needs_render = true;
+    }
+    ImGui::Spacing();
+    if (ImGui::Button("Save Camera Config")) {
+      CameraState::Preset preset;
+      preset.name = "Camera " + std::to_string(next_cam_preset_id++);
+      preset.yaw = cam_yaw;
+      preset.pitch = cam_pitch;
+      preset.distance = cam_distance;
+      preset.target[0] = cam_target[0];
+      preset.target[1] = cam_target[1];
+      preset.target[2] = cam_target[2];
+      preset.fov = cam_fov;
+      cam_presets.push_back(std::move(preset));
+      selected_cam_preset_index = static_cast<int>(cam_presets.size()) - 1;
+    }
+    if (!cam_presets.empty()) {
+      if (selected_cam_preset_index < 0 || selected_cam_preset_index >= static_cast<int>(cam_presets.size())) {
+        selected_cam_preset_index = 0;
+      }
+      ImGui::Text("Saved");
+      ImGui::SameLine();
+      ImGui::SetNextItemWidth(170.0f);
+      const char* camera_preview =
+          cam_presets[static_cast<size_t>(selected_cam_preset_index)].name.c_str();
+      if (ImGui::BeginCombo("##camera_preset", camera_preview)) {
+        for (int i = 0; i < static_cast<int>(cam_presets.size()); i++) {
+          bool selected = (i == selected_cam_preset_index);
+          if (ImGui::Selectable(cam_presets[static_cast<size_t>(i)].name.c_str(), selected)) {
+            selected_cam_preset_index = i;
+          }
+          if (selected) {
+            ImGui::SetItemDefaultFocus();
+          }
+        }
+        ImGui::EndCombo();
+      }
+      if (ImGui::Button("Load##camera_preset")) {
+        if (selected_cam_preset_index >= 0 && selected_cam_preset_index < static_cast<int>(cam_presets.size())) {
+          const CameraState::Preset& preset = cam_presets[static_cast<size_t>(selected_cam_preset_index)];
+          cam_yaw = preset.yaw;
+          cam_pitch = preset.pitch;
+          cam_distance = std::max(0.1f, preset.distance);
+          cam_target[0] = preset.target[0];
+          cam_target[1] = preset.target[1];
+          cam_target[2] = preset.target[2];
+          cam_fov = preset.fov;
+          viewport_needs_render = true;
+        }
+      }
     }
 
     // Ground Plane section

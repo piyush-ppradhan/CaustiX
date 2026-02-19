@@ -154,6 +154,8 @@ No volumetric texture upload or ray marching is used in the current design.
 ### `Config > Camera`
 
 - Axis orientation buttons: `X`, `Y`, `Z`
+- `Save Camera Config` stores current camera parameters (`yaw`, `pitch`, `distance`, `target`, `fov`)
+- Saved camera preset combo + `Load` restores a stored camera
 
 ## Rebuild Strategy
 
