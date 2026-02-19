@@ -157,6 +157,15 @@ No volumetric texture upload or ray marching is used in the current design.
 - `Save Camera Config` stores current camera parameters (`yaw`, `pitch`, `distance`, `target`, `fov`)
 - Saved camera preset combo + `Load` restores a stored camera
 
+### `Config > File IO`
+
+- `Load Config from File` and `Save Config to File` are available at the top of the global Config panel.
+- Saved config includes:
+  - background color
+  - global illumination strength and color
+  - ground plane parameters (enabled, y offset, color, metallic, roughness, opacity)
+  - all saved camera presets
+
 ## Rebuild Strategy
 
 - Full extract + rebuild:

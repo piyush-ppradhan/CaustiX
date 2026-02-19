@@ -33,6 +33,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -1848,6 +1849,160 @@ static bool build_animation_frame_sequence(int& start_timestep, int& end_timeste
   return true;
 }
 
+static std::string ensure_cfg_extension(const std::string& filepath) {
+  if (filepath.empty()) {
+    return filepath;
+  }
+  std::filesystem::path out = filepath;
+  if (out.extension().empty()) {
+    out += ".cfg";
+  }
+  return out.string();
+}
+
+static bool save_global_config_file(const std::string& filepath, const ImVec4& bg_color, float light_strength,
+                                    const ImVec4& light_color, bool ground_enabled, float ground_y_offset,
+                                    const ImVec4& ground_color, float ground_metallic, float ground_roughness,
+                                    float ground_opacity, const std::vector<CameraState::Preset>& camera_presets,
+                                    std::string& error_message) {
+  error_message.clear();
+  std::ofstream out(filepath);
+  if (!out.is_open()) {
+    error_message = "Unable to open config file for writing.";
+    return false;
+  }
+
+  out << std::fixed << std::setprecision(9);
+  out << "CAUSTIX_CONFIG_V1\n";
+  out << "bg " << bg_color.x << " " << bg_color.y << " " << bg_color.z << "\n";
+  out << "gi_strength " << light_strength << "\n";
+  out << "gi_color " << light_color.x << " " << light_color.y << " " << light_color.z << "\n";
+  out << "ground " << (ground_enabled ? 1 : 0) << " " << ground_y_offset << " " << ground_color.x << " "
+      << ground_color.y << " " << ground_color.z << " " << ground_metallic << " " << ground_roughness << " "
+      << ground_opacity << "\n";
+  out << "camera_count " << camera_presets.size() << "\n";
+  for (const auto& preset : camera_presets) {
+    out << "camera " << std::quoted(preset.name) << " " << preset.yaw << " " << preset.pitch << " " << preset.distance
+        << " " << preset.target[0] << " " << preset.target[1] << " " << preset.target[2] << " " << preset.fov
+        << "\n";
+  }
+
+  if (!out.good()) {
+    error_message = "Failed while writing the config file.";
+    return false;
+  }
+  return true;
+}
+
+static bool load_global_config_file(const std::string& filepath, ImVec4& bg_color, float& light_strength,
+                                    ImVec4& light_color, bool& ground_enabled, float& ground_y_offset,
+                                    ImVec4& ground_color, float& ground_metallic, float& ground_roughness,
+                                    float& ground_opacity, std::vector<CameraState::Preset>& camera_presets,
+                                    int& selected_preset_index, int& next_preset_id, std::string& error_message) {
+  error_message.clear();
+  std::ifstream in(filepath);
+  if (!in.is_open()) {
+    error_message = "Unable to open config file for reading.";
+    return false;
+  }
+
+  auto expect_key = [&](const char* expected) -> bool {
+    std::string key;
+    if (!(in >> key)) {
+      error_message = std::string("Unexpected end of file while reading key '") + expected + "'.";
+      return false;
+    }
+    if (key != expected) {
+      error_message = std::string("Expected key '") + expected + "', got '" + key + "'.";
+      return false;
+    }
+    return true;
+  };
+
+  std::string magic;
+  if (!(in >> magic)) {
+    error_message = "Config file is empty.";
+    return false;
+  }
+  if (magic != "CAUSTIX_CONFIG_V1") {
+    error_message = "Unsupported config format.";
+    return false;
+  }
+
+  if (!expect_key("bg") || !(in >> bg_color.x >> bg_color.y >> bg_color.z)) {
+    if (error_message.empty()) {
+      error_message = "Failed to parse background color.";
+    }
+    return false;
+  }
+  bg_color.w = 1.0f;
+
+  if (!expect_key("gi_strength") || !(in >> light_strength)) {
+    if (error_message.empty()) {
+      error_message = "Failed to parse global illumination strength.";
+    }
+    return false;
+  }
+  light_strength = std::max(0.0f, light_strength);
+
+  if (!expect_key("gi_color") || !(in >> light_color.x >> light_color.y >> light_color.z)) {
+    if (error_message.empty()) {
+      error_message = "Failed to parse global illumination color.";
+    }
+    return false;
+  }
+  light_color.w = 1.0f;
+
+  int ground_enabled_int = 1;
+  if (!expect_key("ground") ||
+      !(in >> ground_enabled_int >> ground_y_offset >> ground_color.x >> ground_color.y >> ground_color.z >>
+        ground_metallic >> ground_roughness >> ground_opacity)) {
+    if (error_message.empty()) {
+      error_message = "Failed to parse ground configuration.";
+    }
+    return false;
+  }
+  ground_enabled = (ground_enabled_int != 0);
+  ground_color.w = 1.0f;
+  ground_metallic = std::clamp(ground_metallic, 0.0f, 1.0f);
+  ground_roughness = std::clamp(ground_roughness, 0.0f, 1.0f);
+  ground_opacity = std::clamp(ground_opacity, 0.0f, 1.0f);
+
+  int camera_count = 0;
+  if (!expect_key("camera_count") || !(in >> camera_count)) {
+    if (error_message.empty()) {
+      error_message = "Failed to parse camera count.";
+    }
+    return false;
+  }
+  camera_count = std::max(0, camera_count);
+  camera_presets.clear();
+  camera_presets.reserve(static_cast<size_t>(camera_count));
+
+  for (int i = 0; i < camera_count; i++) {
+    std::string key;
+    CameraState::Preset preset;
+    if (!(in >> key) || key != "camera" || !(in >> std::quoted(preset.name) >> preset.yaw >> preset.pitch >>
+                                              preset.distance >> preset.target[0] >> preset.target[1] >>
+                                              preset.target[2] >> preset.fov)) {
+      error_message = "Failed to parse camera preset entry.";
+      camera_presets.clear();
+      selected_preset_index = -1;
+      next_preset_id = 1;
+      return false;
+    }
+    if (preset.name.empty()) {
+      preset.name = "Camera " + std::to_string(i + 1);
+    }
+    preset.distance = std::max(0.1f, preset.distance);
+    camera_presets.push_back(std::move(preset));
+  }
+
+  selected_preset_index = camera_presets.empty() ? -1 : 0;
+  next_preset_id = static_cast<int>(camera_presets.size()) + 1;
+  return true;
+}
+
 static void extract_mesh(const std::string& mask_filepath, const std::string& field_name, int solid_val,
                          MeshCache& mesh_cache) {
   viskores::cont::DataSet ds = read_vtk_dataset_with_compat(mask_filepath);
@@ -2450,10 +2605,34 @@ int main(int argc, char* argv[]) {
       ImGui::DockBuilderFinish(dockspace_id);
     }
 
-    ImGui::Begin("Config");
-    ImGui::PushFont(bold_font);
-    ImGui::Text("Background Color");
-    ImGui::PopFont();
+	    ImGui::Begin("Config");
+	    if (ImGui::Button("Load Config from File")) {
+	      IGFD::FileDialogConfig cfg;
+	      if (!vtk_dir.empty()) {
+	        cfg.path = vtk_dir;
+	      } else if (const char* home = getenv("HOME")) {
+	        cfg.path = home;
+	      }
+	      ImGuiFileDialog::Instance()->OpenDialog("LoadGlobalConfigDlg", "Load Config", ".cfg", cfg);
+	    }
+	    ImGui::SameLine();
+	    if (ImGui::Button("Save Config to File")) {
+	      IGFD::FileDialogConfig cfg;
+	      if (!vtk_dir.empty()) {
+	        cfg.path = vtk_dir;
+	      } else if (const char* home = getenv("HOME")) {
+	        cfg.path = home;
+	      }
+	      cfg.flags |= ImGuiFileDialogFlags_ConfirmOverwrite;
+	      cfg.flags |= ImGuiFileDialogFlags_OptionalFileName;
+	      ImGuiFileDialog::Instance()->OpenDialog("SaveGlobalConfigDlg", "Save Config", ".cfg", cfg);
+	    }
+	    ImGui::Spacing();
+	    ImGui::Separator();
+	    ImGui::Spacing();
+	    ImGui::PushFont(bold_font);
+	    ImGui::Text("Background Color");
+	    ImGui::PopFont();
     ImGui::ColorEdit3("##bg", (float*)&bg_color);
     ImGui::Spacing();
     ImGui::Separator();
@@ -3085,11 +3264,67 @@ int main(int argc, char* argv[]) {
           }
         }
       }
-    }
-    ImGui::End();
+	    }
+	    ImGui::End();
 
-    if (ImGuiFileDialog::Instance()->Display("OpenFileDlg", ImGuiWindowFlags_None, ImVec2(840, 520),
-                                             ImVec2(1920, 1200))) {
+	    if (ImGuiFileDialog::Instance()->Display("LoadGlobalConfigDlg", ImGuiWindowFlags_None, ImVec2(840, 520),
+	                                             ImVec2(1920, 1200))) {
+	      if (ImGuiFileDialog::Instance()->IsOk()) {
+	        std::string config_file = ImGuiFileDialog::Instance()->GetFilePathName();
+	        if (config_file.empty()) {
+	          std::string current_path = ImGuiFileDialog::Instance()->GetCurrentPath();
+	          if (!current_path.empty()) {
+	            config_file = current_path;
+	          }
+	        }
+	        if (config_file.empty()) {
+	          show_mask_error = true;
+	          mask_error_msg = "No config file selected.";
+	        } else {
+	          std::string config_error;
+	          if (!load_global_config_file(config_file, bg_color, light_strength, light_color, ground_enabled,
+	                                       ground_y_offset, ground_color, ground_metallic, ground_roughness,
+	                                       ground_opacity, cam_presets, selected_cam_preset_index, next_cam_preset_id,
+	                                       config_error)) {
+	            show_mask_error = true;
+	            mask_error_msg = std::string("Failed to load config: ") + config_error;
+	          } else {
+	            viewport_needs_render = true;
+	          }
+	        }
+	      }
+	      ImGuiFileDialog::Instance()->Close();
+	    }
+
+	    if (ImGuiFileDialog::Instance()->Display("SaveGlobalConfigDlg", ImGuiWindowFlags_None, ImVec2(840, 520),
+	                                             ImVec2(1920, 1200))) {
+	      if (ImGuiFileDialog::Instance()->IsOk()) {
+	        std::string config_file = ImGuiFileDialog::Instance()->GetFilePathName();
+	        if (config_file.empty()) {
+	          std::string current_path = ImGuiFileDialog::Instance()->GetCurrentPath();
+	          if (!current_path.empty()) {
+	            config_file = current_path + "/caustix_config.cfg";
+	          }
+	        }
+	        config_file = ensure_cfg_extension(config_file);
+	        if (config_file.empty()) {
+	          show_mask_error = true;
+	          mask_error_msg = "No output config file selected.";
+	        } else {
+	          std::string config_error;
+	          if (!save_global_config_file(config_file, bg_color, light_strength, light_color, ground_enabled,
+	                                       ground_y_offset, ground_color, ground_metallic, ground_roughness,
+	                                       ground_opacity, cam_presets, config_error)) {
+	            show_mask_error = true;
+	            mask_error_msg = std::string("Failed to save config: ") + config_error;
+	          }
+	        }
+	      }
+	      ImGuiFileDialog::Instance()->Close();
+	    }
+
+	    if (ImGuiFileDialog::Instance()->Display("OpenFileDlg", ImGuiWindowFlags_None, ImVec2(840, 520),
+	                                             ImVec2(1920, 1200))) {
       if (ImGuiFileDialog::Instance()->IsOk()) {
         vtk_dir = ImGuiFileDialog::Instance()->GetCurrentPath();
         vtk_files.clear();

@@ -75,11 +75,19 @@ Outputs:
 
 ### Config
 
+- `Load Config from File`
+- `Save Config to File`
 - Background color
 - Global illumination
 - Camera axis buttons `X/Y/Z`
 - `Save Camera Config` to store the current camera
 - Saved camera selector + `Load` to restore a saved view
+
+Config files (`.cfg`) store:
+- background color
+- global illumination strength and color
+- ground plane properties
+- all saved camera positions
 
 ### Render:Mask
 
