@@ -2449,7 +2449,7 @@ int main(int argc, char* argv[]) {
     ImGui::Text("Bounces");
     ImGui::SameLine();
     ImGui::SetNextItemWidth(80);
-    input_int_commit_on_enter("##rt_bounces", rt_bounces, 1, 16);
+    input_int_commit_on_enter("##rt_bounces", rt_bounces, 1, 20);
     ImGui::Text("Samples");
     ImGui::SameLine();
     ImGui::SetNextItemWidth(80);
@@ -2699,6 +2699,58 @@ int main(int argc, char* argv[]) {
 	        ImGui::TextWrapped("%s", std::filesystem::path(mask_file).filename().string().c_str());
 	      }
 
+	      if (!mask_field_names.empty()) {
+	        ImGui::Spacing();
+	        ImGui::Text("Field");
+	        ImGui::SameLine();
+	        const char* preview = mask_field_names[mask_field_index].c_str();
+	        if (ImGui::BeginCombo("##mask_field", preview)) {
+          for (int i = 0; i < (int)mask_field_names.size(); i++) {
+            bool selected = (i == mask_field_index);
+            if (ImGui::Selectable(mask_field_names[i].c_str(), selected)) mask_field_index = i;
+            if (selected) ImGui::SetItemDefaultFocus();
+          }
+          ImGui::EndCombo();
+        }
+        ImGui::Spacing();
+        ImGui::Text("Solid Flag");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(80);
+        input_int_commit_on_enter("##solid_flag", solid_flag, -1000000, 1000000);
+        ImGui::Spacing();
+        ImGui::Checkbox("Show##mask", &show_mask);
+
+	        if (show_mask) {
+          ImGui::Spacing();
+          ImGui::Text("Color");
+          ImGui::ColorEdit3("##mask_color", (float*)&mask_color);
+          ImGui::Text("Metallic");
+          ImGui::SameLine();
+          ImGui::SetNextItemWidth(-1);
+          ImGui::SliderFloat("##mask_metallic", &mask_metallic, 0.0f, 1.0f, "%.3f", ImGuiSliderFlags_NoInput);
+          ImGui::Text("Roughness");
+          ImGui::SameLine();
+          ImGui::SetNextItemWidth(-1);
+          ImGui::SliderFloat("##mask_roughness", &mask_roughness, 0.0f, 1.0f, "%.3f", ImGuiSliderFlags_NoInput);
+          ImGui::Text("Opacity");
+          ImGui::SameLine();
+          ImGui::SetNextItemWidth(-1);
+          ImGui::SliderFloat("##mask_opacity", &mask_opacity, 0.0f, 1.0f, "%.3f", ImGuiSliderFlags_NoInput);
+          ImGui::Text("Glass IOR");
+          ImGui::SameLine();
+          ImGui::SetNextItemWidth(-1);
+          ImGui::SliderFloat("##mask_ior", &mask_glass_ior, 1.0f, 2.5f, "%.3f", ImGuiSliderFlags_NoInput);
+          ImGui::Text("Smoothing");
+          ImGui::SameLine();
+          ImGui::SetNextItemWidth(-1);
+          ImGui::SliderInt("##smooth_iters", &smooth_iterations, 0, 50, "%d", ImGuiSliderFlags_NoInput);
+          ImGui::Text("Smooth Strength");
+          ImGui::SameLine();
+	          ImGui::SetNextItemWidth(-1);
+		          ImGui::SliderFloat("##smooth_strength", &smooth_strength, 0.0f, 1.0f, "%.3f", ImGuiSliderFlags_NoInput);
+		        }
+	      }
+
 	      ImGui::Spacing();
 	      ImGui::Separator();
 	      ImGui::Spacing();
@@ -2713,8 +2765,8 @@ int main(int argc, char* argv[]) {
 	        } else if (const char* home = getenv("HOME")) {
 	          geometry_config.path = home;
 	        }
-        ImGuiFileDialog::Instance()->OpenDialog("OpenGeometryDlg", "Open Geometry",
-                                                ".obj,.stl,.ply,.fbx,.gltf,.glb", geometry_config);
+	        ImGuiFileDialog::Instance()->OpenDialog("OpenGeometryDlg", "Open Geometry",
+	                                                ".obj,.stl,.ply,.fbx,.gltf,.glb", geometry_config);
 	      }
 	      if (geometry_layers.empty()) {
 	        ImGui::TextDisabled("No geometry entries.");
@@ -2760,6 +2812,24 @@ int main(int argc, char* argv[]) {
 	            ImGui::SameLine();
 	            ImGui::SetNextItemWidth(140.0f);
 	            input_float_commit_on_enter("##geometry_rotate_z", geometry.rotate_z_deg, -360000.0f, 360000.0f);
+	            ImGui::Text("Camera Axis");
+	            if (ImGui::Button("X##geometry_cam_axis")) {
+	              cam_yaw = 90.0f;
+	              cam_pitch = 0.0f;
+	              viewport_needs_render = true;
+	            }
+	            ImGui::SameLine();
+	            if (ImGui::Button("Y##geometry_cam_axis")) {
+	              cam_yaw = 0.0f;
+	              cam_pitch = 89.0f;
+	              viewport_needs_render = true;
+	            }
+	            ImGui::SameLine();
+	            if (ImGui::Button("Z##geometry_cam_axis")) {
+	              cam_yaw = 0.0f;
+	              cam_pitch = 0.0f;
+	              viewport_needs_render = true;
+	            }
 	            ImGui::Text("Color");
 	            ImGui::ColorEdit3("##geometry_color", (float*)&geometry.color);
 	            ImGui::Text("Metallic");
@@ -2792,57 +2862,8 @@ int main(int argc, char* argv[]) {
 	          ++i;
 	        }
 	      }
+
 	      if (!mask_field_names.empty()) {
-	        ImGui::Spacing();
-	        ImGui::Text("Field");
-        ImGui::SameLine();
-        const char* preview = mask_field_names[mask_field_index].c_str();
-        if (ImGui::BeginCombo("##mask_field", preview)) {
-          for (int i = 0; i < (int)mask_field_names.size(); i++) {
-            bool selected = (i == mask_field_index);
-            if (ImGui::Selectable(mask_field_names[i].c_str(), selected)) mask_field_index = i;
-            if (selected) ImGui::SetItemDefaultFocus();
-          }
-          ImGui::EndCombo();
-        }
-        ImGui::Spacing();
-        ImGui::Text("Solid Flag");
-        ImGui::SameLine();
-        ImGui::SetNextItemWidth(80);
-        input_int_commit_on_enter("##solid_flag", solid_flag, -1000000, 1000000);
-        ImGui::Spacing();
-        ImGui::Checkbox("Show##mask", &show_mask);
-
-	        if (show_mask) {
-          ImGui::Spacing();
-          ImGui::Text("Color");
-          ImGui::ColorEdit3("##mask_color", (float*)&mask_color);
-          ImGui::Text("Metallic");
-          ImGui::SameLine();
-          ImGui::SetNextItemWidth(-1);
-          ImGui::SliderFloat("##mask_metallic", &mask_metallic, 0.0f, 1.0f, "%.3f", ImGuiSliderFlags_NoInput);
-          ImGui::Text("Roughness");
-          ImGui::SameLine();
-          ImGui::SetNextItemWidth(-1);
-          ImGui::SliderFloat("##mask_roughness", &mask_roughness, 0.0f, 1.0f, "%.3f", ImGuiSliderFlags_NoInput);
-          ImGui::Text("Opacity");
-          ImGui::SameLine();
-          ImGui::SetNextItemWidth(-1);
-          ImGui::SliderFloat("##mask_opacity", &mask_opacity, 0.0f, 1.0f, "%.3f", ImGuiSliderFlags_NoInput);
-          ImGui::Text("Glass IOR");
-          ImGui::SameLine();
-          ImGui::SetNextItemWidth(-1);
-          ImGui::SliderFloat("##mask_ior", &mask_glass_ior, 1.0f, 2.5f, "%.3f", ImGuiSliderFlags_NoInput);
-          ImGui::Text("Smoothing");
-          ImGui::SameLine();
-          ImGui::SetNextItemWidth(-1);
-          ImGui::SliderInt("##smooth_iters", &smooth_iterations, 0, 50, "%d", ImGuiSliderFlags_NoInput);
-          ImGui::Text("Smooth Strength");
-          ImGui::SameLine();
-          ImGui::SetNextItemWidth(-1);
-	          ImGui::SliderFloat("##smooth_strength", &smooth_strength, 0.0f, 1.0f, "%.3f", ImGuiSliderFlags_NoInput);
-	        }
-
 	        ImGui::Spacing();
 	        ImGui::Separator();
 	        ImGui::Spacing();

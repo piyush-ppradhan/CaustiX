@@ -71,12 +71,14 @@ Outputs:
 - `Enable Shadows`
 - `Show Outlines`
 - `Rotate X`, `Rotate Y`, `Rotate Z`
+- Ray tracing `Bounces` supports `1..20`
 
 ### Render:Mask
 
 - `File`, `Field`, `Solid Flag`, `Show`
 - Material: `Color`, `Metallic`, `Roughness`, `Opacity`, `Glass IOR`
 - Smoothing: `Smoothing`, `Smooth Strength`
+- `Render:Geometry` appears below this section in the Render panel
 
 ### Render:Data
 
@@ -93,7 +95,7 @@ Outputs:
 - `Add Geometry`
 - Per-entry:
   - `Show`
-  - `Config` (scale, local rotation, color, metallic, roughness, opacity, glass IOR)
+  - `Config` (scale, local rotation, camera axis buttons `X/Y/Z`, color, metallic, roughness, opacity, glass IOR)
   - `Clear`
 
 ## Notes
