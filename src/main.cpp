@@ -1097,9 +1097,9 @@ static void recompute_vertex_normals(const std::vector<float3>& positions, const
 static void load_geometry_mesh_assimp(const std::string& geometry_file, MeshCache& mesh_cache) {
   Assimp::Importer importer;
   unsigned int flags = aiProcess_Triangulate | aiProcess_JoinIdenticalVertices | aiProcess_PreTransformVertices |
-                       aiProcess_GenSmoothNormals | aiProcess_ImproveCacheLocality | aiProcess_RemoveRedundantMaterials |
-                       aiProcess_SortByPType | aiProcess_FindInvalidData | aiProcess_OptimizeMeshes |
-                       aiProcess_OptimizeGraph;
+                       aiProcess_GenSmoothNormals | aiProcess_ImproveCacheLocality |
+                       aiProcess_RemoveRedundantMaterials | aiProcess_SortByPType | aiProcess_FindInvalidData |
+                       aiProcess_OptimizeMeshes | aiProcess_OptimizeGraph;
 
   const aiScene* scene = importer.ReadFile(geometry_file, flags);
   if (scene == nullptr || (scene->mFlags & AI_SCENE_FLAGS_INCOMPLETE) != 0 || scene->mRootNode == nullptr) {
@@ -1206,8 +1206,8 @@ static void build_render_mesh_from_cache(const MeshCache& mesh_cache, int smooth
 
 static void build_render_geometry_from_cache(const MeshCache& mesh_cache, float scale, float local_rotate_x_deg,
                                              float local_rotate_y_deg, float local_rotate_z_deg, float translate_x,
-                                             float translate_y, float translate_z, float rotate_x_deg, float rotate_y_deg,
-                                             float rotate_z_deg, std::vector<float3>& out_positions,
+                                             float translate_y, float translate_z, float rotate_x_deg,
+                                             float rotate_y_deg, float rotate_z_deg, std::vector<float3>& out_positions,
                                              std::vector<float3>& out_normals, BBox& out_bbox) {
   if (!mesh_cache.valid || mesh_cache.base_positions.empty() || mesh_cache.indices.empty()) {
     throw std::runtime_error("Cached geometry mesh is not available.");
@@ -1279,8 +1279,8 @@ static void rebuild_gas(OptixState& state, const BBox& bbox, bool include_mask, 
   accel_options.buildFlags = OPTIX_BUILD_FLAG_PREFER_FAST_TRACE;
   accel_options.operation = OPTIX_BUILD_OPERATION_BUILD;
 
-  int num_inputs_expected =
-      (include_mask ? 1 : 0) + std::max(0, fluid_mesh_count) + std::max(0, geometry_mesh_count) + (ground_enabled ? 1 : 0);
+  int num_inputs_expected = (include_mask ? 1 : 0) + std::max(0, fluid_mesh_count) + std::max(0, geometry_mesh_count) +
+                            (ground_enabled ? 1 : 0);
   std::vector<uint32_t> flags(static_cast<size_t>(num_inputs_expected), OPTIX_GEOMETRY_FLAG_NONE);
   std::vector<CUdeviceptr> vertex_buffers(static_cast<size_t>(num_inputs_expected), 0);
   std::vector<OptixBuildInput> build_inputs(static_cast<size_t>(num_inputs_expected));
@@ -1326,7 +1326,8 @@ static void rebuild_gas(OptixState& state, const BBox& bbox, bool include_mask, 
   }
 
   for (int i = 0; i < geometry_mesh_count; i++) {
-    if (i >= static_cast<int>(state.geometry_meshes.size()) || !state.geometry_meshes[static_cast<size_t>(i)].IsValid()) {
+    if (i >= static_cast<int>(state.geometry_meshes.size()) ||
+        !state.geometry_meshes[static_cast<size_t>(i)].IsValid()) {
       continue;
     }
     const GpuMeshBuffers& geometry_mesh = state.geometry_meshes[static_cast<size_t>(i)];
@@ -1740,9 +1741,8 @@ static void overlay_bbox_outline_on_host(std::vector<uchar4>& host_pixels, int w
   cam_right.y /= right_len;
   cam_right.z /= right_len;
 
-  float3 cam_up =
-      make_float3(cam_right.y * fwd.z - cam_right.z * fwd.y, cam_right.z * fwd.x - cam_right.x * fwd.z,
-                  cam_right.x * fwd.y - cam_right.y * fwd.x);
+  float3 cam_up = make_float3(cam_right.y * fwd.z - cam_right.z * fwd.y, cam_right.z * fwd.x - cam_right.x * fwd.z,
+                              cam_right.x * fwd.y - cam_right.y * fwd.x);
   float up_len = std::sqrt(cam_up.x * cam_up.x + cam_up.y * cam_up.y + cam_up.z * cam_up.z);
   if (up_len <= 1e-6f) {
     return;
@@ -1779,8 +1779,7 @@ static void overlay_bbox_outline_on_host(std::vector<uchar4>& host_pixels, int w
   float3 hi = bbox.hi;
   float3 corners[8] = {{lo.x, lo.y, lo.z}, {hi.x, lo.y, lo.z}, {hi.x, hi.y, lo.z}, {lo.x, hi.y, lo.z},
                        {lo.x, lo.y, hi.z}, {hi.x, lo.y, hi.z}, {hi.x, hi.y, hi.z}, {lo.x, hi.y, hi.z}};
-  int edges[12][2] = {{0, 1}, {1, 2}, {2, 3}, {3, 0}, {4, 5}, {5, 6},
-                      {6, 7}, {7, 4}, {0, 4}, {1, 5}, {2, 6}, {3, 7}};
+  int edges[12][2] = {{0, 1}, {1, 2}, {2, 3}, {3, 0}, {4, 5}, {5, 6}, {6, 7}, {7, 4}, {0, 4}, {1, 5}, {2, 6}, {3, 7}};
 
   uchar4 color = make_uchar4(static_cast<unsigned char>(std::clamp(outline_color.x, 0.0f, 1.0f) * 255.0f + 0.5f),
                              static_cast<unsigned char>(std::clamp(outline_color.y, 0.0f, 1.0f) * 255.0f + 0.5f),
@@ -1815,7 +1814,8 @@ static std::string strip_png_extension(const std::string& input_name) {
   std::string name = input_name;
   if (name.size() >= 4) {
     std::string ext = name.substr(name.size() - 4);
-    std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    std::transform(ext.begin(), ext.end(), ext.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
     if (ext == ".png") {
       name.resize(name.size() - 4);
     }
@@ -1883,8 +1883,7 @@ static bool save_global_config_file(const std::string& filepath, const ImVec4& b
   out << "camera_count " << camera_presets.size() << "\n";
   for (const auto& preset : camera_presets) {
     out << "camera " << std::quoted(preset.name) << " " << preset.yaw << " " << preset.pitch << " " << preset.distance
-        << " " << preset.target[0] << " " << preset.target[1] << " " << preset.target[2] << " " << preset.fov
-        << "\n";
+        << " " << preset.target[0] << " " << preset.target[1] << " " << preset.target[2] << " " << preset.fov << "\n";
   }
 
   if (!out.good()) {
@@ -1954,9 +1953,8 @@ static bool load_global_config_file(const std::string& filepath, ImVec4& bg_colo
   light_color.w = 1.0f;
 
   int ground_enabled_int = 1;
-  if (!expect_key("ground") ||
-      !(in >> ground_enabled_int >> ground_y_offset >> ground_color.x >> ground_color.y >> ground_color.z >>
-        ground_metallic >> ground_roughness >> ground_opacity)) {
+  if (!expect_key("ground") || !(in >> ground_enabled_int >> ground_y_offset >> ground_color.x >> ground_color.y >>
+                                 ground_color.z >> ground_metallic >> ground_roughness >> ground_opacity)) {
     if (error_message.empty()) {
       error_message = "Failed to parse ground configuration.";
     }
@@ -1982,9 +1980,9 @@ static bool load_global_config_file(const std::string& filepath, ImVec4& bg_colo
   for (int i = 0; i < camera_count; i++) {
     std::string key;
     CameraState::Preset preset;
-    if (!(in >> key) || key != "camera" || !(in >> std::quoted(preset.name) >> preset.yaw >> preset.pitch >>
-                                              preset.distance >> preset.target[0] >> preset.target[1] >>
-                                              preset.target[2] >> preset.fov)) {
+    if (!(in >> key) || key != "camera" ||
+        !(in >> std::quoted(preset.name) >> preset.yaw >> preset.pitch >> preset.distance >> preset.target[0] >>
+          preset.target[1] >> preset.target[2] >> preset.fov)) {
       error_message = "Failed to parse camera preset entry.";
       camera_presets.clear();
       selected_preset_index = -1;
@@ -2605,34 +2603,34 @@ int main(int argc, char* argv[]) {
       ImGui::DockBuilderFinish(dockspace_id);
     }
 
-	    ImGui::Begin("Config");
-	    if (ImGui::Button("Load Config from File")) {
-	      IGFD::FileDialogConfig cfg;
-	      if (!vtk_dir.empty()) {
-	        cfg.path = vtk_dir;
-	      } else if (const char* home = getenv("HOME")) {
-	        cfg.path = home;
-	      }
-	      ImGuiFileDialog::Instance()->OpenDialog("LoadGlobalConfigDlg", "Load Config", ".cfg", cfg);
-	    }
-	    ImGui::SameLine();
-	    if (ImGui::Button("Save Config to File")) {
-	      IGFD::FileDialogConfig cfg;
-	      if (!vtk_dir.empty()) {
-	        cfg.path = vtk_dir;
-	      } else if (const char* home = getenv("HOME")) {
-	        cfg.path = home;
-	      }
-	      cfg.flags |= ImGuiFileDialogFlags_ConfirmOverwrite;
-	      cfg.flags |= ImGuiFileDialogFlags_OptionalFileName;
-	      ImGuiFileDialog::Instance()->OpenDialog("SaveGlobalConfigDlg", "Save Config", ".cfg", cfg);
-	    }
-	    ImGui::Spacing();
-	    ImGui::Separator();
-	    ImGui::Spacing();
-	    ImGui::PushFont(bold_font);
-	    ImGui::Text("Background Color");
-	    ImGui::PopFont();
+    ImGui::Begin("Config");
+    if (ImGui::Button("Load Config from File")) {
+      IGFD::FileDialogConfig cfg;
+      if (!vtk_dir.empty()) {
+        cfg.path = vtk_dir;
+      } else if (const char* home = getenv("HOME")) {
+        cfg.path = home;
+      }
+      ImGuiFileDialog::Instance()->OpenDialog("LoadGlobalConfigDlg", "Load Config", ".cfg", cfg);
+    }
+    // ImGui::SameLine();
+    if (ImGui::Button("Save Config to File")) {
+      IGFD::FileDialogConfig cfg;
+      if (!vtk_dir.empty()) {
+        cfg.path = vtk_dir;
+      } else if (const char* home = getenv("HOME")) {
+        cfg.path = home;
+      }
+      cfg.flags |= ImGuiFileDialogFlags_ConfirmOverwrite;
+      cfg.flags |= ImGuiFileDialogFlags_OptionalFileName;
+      ImGuiFileDialog::Instance()->OpenDialog("SaveGlobalConfigDlg", "Save Config", ".cfg", cfg);
+    }
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+    ImGui::PushFont(bold_font);
+    ImGui::Text("Background Color");
+    ImGui::PopFont();
     ImGui::ColorEdit3("##bg", (float*)&bg_color);
     ImGui::Spacing();
     ImGui::Separator();
@@ -2707,8 +2705,7 @@ int main(int argc, char* argv[]) {
       ImGui::Text("Saved");
       ImGui::SameLine();
       ImGui::SetNextItemWidth(170.0f);
-      const char* camera_preview =
-          cam_presets[static_cast<size_t>(selected_cam_preset_index)].name.c_str();
+      const char* camera_preview = cam_presets[static_cast<size_t>(selected_cam_preset_index)].name.c_str();
       if (ImGui::BeginCombo("##camera_preset", camera_preview)) {
         for (int i = 0; i < static_cast<int>(cam_presets.size()); i++) {
           bool selected = (i == selected_cam_preset_index);
@@ -2859,7 +2856,8 @@ int main(int argc, char* argv[]) {
         }
       }
 
-      if (animation_export.running || animation_export.finished || animation_export.canceled || animation_export.failed) {
+      if (animation_export.running || animation_export.finished || animation_export.canceled ||
+          animation_export.failed) {
         ImGui::Spacing();
         float progress = 0.0f;
         if (!animation_export.frame_indices.empty()) {
@@ -2976,16 +2974,16 @@ int main(int argc, char* argv[]) {
         mesh_loaded = false;
       }
 
-	      if (!mask_file.empty()) {
-	        ImGui::TextWrapped("%s", std::filesystem::path(mask_file).filename().string().c_str());
-	      }
+      if (!mask_file.empty()) {
+        ImGui::TextWrapped("%s", std::filesystem::path(mask_file).filename().string().c_str());
+      }
 
-	      if (!mask_field_names.empty()) {
-	        ImGui::Spacing();
-	        ImGui::Text("Field");
-	        ImGui::SameLine();
-	        const char* preview = mask_field_names[mask_field_index].c_str();
-	        if (ImGui::BeginCombo("##mask_field", preview)) {
+      if (!mask_field_names.empty()) {
+        ImGui::Spacing();
+        ImGui::Text("Field");
+        ImGui::SameLine();
+        const char* preview = mask_field_names[mask_field_index].c_str();
+        if (ImGui::BeginCombo("##mask_field", preview)) {
           for (int i = 0; i < (int)mask_field_names.size(); i++) {
             bool selected = (i == mask_field_index);
             if (ImGui::Selectable(mask_field_names[i].c_str(), selected)) mask_field_index = i;
@@ -3001,7 +2999,7 @@ int main(int argc, char* argv[]) {
         ImGui::Spacing();
         ImGui::Checkbox("Show##mask", &show_mask);
 
-	        if (show_mask) {
+        if (show_mask) {
           ImGui::Spacing();
           ImGui::Text("Color");
           ImGui::ColorEdit3("##mask_color", (float*)&mask_color);
@@ -3027,124 +3025,121 @@ int main(int argc, char* argv[]) {
           ImGui::SliderInt("##smooth_iters", &smooth_iterations, 0, 50, "%d", ImGuiSliderFlags_NoInput);
           ImGui::Text("Smooth Strength");
           ImGui::SameLine();
-	          ImGui::SetNextItemWidth(-1);
-		          ImGui::SliderFloat("##smooth_strength", &smooth_strength, 0.0f, 1.0f, "%.3f", ImGuiSliderFlags_NoInput);
-		        }
-	      }
+          ImGui::SetNextItemWidth(-1);
+          ImGui::SliderFloat("##smooth_strength", &smooth_strength, 0.0f, 1.0f, "%.3f", ImGuiSliderFlags_NoInput);
+        }
+      }
 
-	      ImGui::Spacing();
-	      ImGui::Separator();
-	      ImGui::Spacing();
-	      ImGui::PushFont(bold_font);
-	      ImGui::Text("Render:Geometry");
-	      ImGui::PopFont();
-	      ImGui::Spacing();
-	      if (ImGui::Button("Add Geometry")) {
-	        IGFD::FileDialogConfig geometry_config;
-	        if (!vtk_dir.empty()) {
-	          geometry_config.path = vtk_dir;
-	        } else if (const char* home = getenv("HOME")) {
-	          geometry_config.path = home;
-	        }
-	        ImGuiFileDialog::Instance()->OpenDialog("OpenGeometryDlg", "Open Geometry",
-	                                                ".obj,.stl,.ply,.fbx,.gltf,.glb", geometry_config);
-	      }
-	      if (geometry_layers.empty()) {
-	        ImGui::TextDisabled("No geometry entries.");
-	      } else {
-	        for (size_t i = 0; i < geometry_layers.size();) {
-	          GeometryLayer& geometry = geometry_layers[i];
-	          ImGui::PushID(static_cast<int>(i));
-	          ImGui::Spacing();
-	          if (i > 0) {
-	            ImGui::Separator();
-	            ImGui::Spacing();
-	          }
+      ImGui::Spacing();
+      ImGui::Separator();
+      ImGui::Spacing();
+      ImGui::PushFont(bold_font);
+      ImGui::Text("Render:Geometry");
+      ImGui::PopFont();
+      ImGui::Spacing();
+      if (ImGui::Button("Add Geometry")) {
+        IGFD::FileDialogConfig geometry_config;
+        if (!vtk_dir.empty()) {
+          geometry_config.path = vtk_dir;
+        } else if (const char* home = getenv("HOME")) {
+          geometry_config.path = home;
+        }
+        ImGuiFileDialog::Instance()->OpenDialog("OpenGeometryDlg", "Open Geometry", ".obj,.stl,.ply,.fbx,.gltf,.glb",
+                                                geometry_config);
+      }
+      if (geometry_layers.empty()) {
+        ImGui::TextDisabled("No geometry entries.");
+      } else {
+        for (size_t i = 0; i < geometry_layers.size();) {
+          GeometryLayer& geometry = geometry_layers[i];
+          ImGui::PushID(static_cast<int>(i));
+          ImGui::Spacing();
+          if (i > 0) {
+            ImGui::Separator();
+            ImGui::Spacing();
+          }
 
-	          ImGui::TextWrapped("%s", geometry.display_name.c_str());
-	          ImGui::Checkbox("Show##geometry", &geometry.show);
-	          ImGui::SameLine();
-	          if (ImGui::Button("Config")) {
-	            ImGui::OpenPopup("GeometryConfig");
-	          }
-	          ImGui::SameLine();
-	          if (ImGui::Button("Clear##geometry")) {
-	            geometry_layers.erase(geometry_layers.begin() + static_cast<long>(i));
-	            mesh_loaded = false;
-	            ImGui::PopID();
-	            continue;
-	          }
+          ImGui::TextWrapped("%s", geometry.display_name.c_str());
+          ImGui::Checkbox("Show##geometry", &geometry.show);
+          ImGui::SameLine();
+          if (ImGui::Button("Config")) {
+            ImGui::OpenPopup("GeometryConfig");
+          }
+          ImGui::SameLine();
+          if (ImGui::Button("Clear##geometry")) {
+            geometry_layers.erase(geometry_layers.begin() + static_cast<long>(i));
+            mesh_loaded = false;
+            ImGui::PopID();
+            continue;
+          }
 
-	          if (ImGui::BeginPopup("GeometryConfig")) {
-	            ImGui::TextWrapped("%s", geometry.file_path.c_str());
-	            ImGui::Text("Scale");
-	            ImGui::SameLine();
-	            ImGui::SetNextItemWidth(140.0f);
-	            input_float_commit_on_enter("##geometry_scale", geometry.scale, 0.0001f, 1000000.0f);
-	            ImGui::Text("Rotate X");
-	            ImGui::SameLine();
-	            ImGui::SetNextItemWidth(140.0f);
-	            input_float_commit_on_enter("##geometry_rotate_x", geometry.rotate_x_deg, -360000.0f, 360000.0f);
-	            ImGui::Text("Rotate Y");
-	            ImGui::SameLine();
-	            ImGui::SetNextItemWidth(140.0f);
-	            input_float_commit_on_enter("##geometry_rotate_y", geometry.rotate_y_deg, -360000.0f, 360000.0f);
-		            ImGui::Text("Rotate Z");
-		            ImGui::SameLine();
-		            ImGui::SetNextItemWidth(140.0f);
-		            input_float_commit_on_enter("##geometry_rotate_z", geometry.rotate_z_deg, -360000.0f, 360000.0f);
-		            ImGui::Text("Translate X");
-		            ImGui::SameLine();
-		            ImGui::SetNextItemWidth(140.0f);
-		            input_float_commit_on_enter("##geometry_translate_x", geometry.translate_x, -1000000.0f, 1000000.0f);
-		            ImGui::Text("Translate Y");
-		            ImGui::SameLine();
-		            ImGui::SetNextItemWidth(140.0f);
-		            input_float_commit_on_enter("##geometry_translate_y", geometry.translate_y, -1000000.0f, 1000000.0f);
-		            ImGui::Text("Translate Z");
-		            ImGui::SameLine();
-		            ImGui::SetNextItemWidth(140.0f);
-		            input_float_commit_on_enter("##geometry_translate_z", geometry.translate_z, -1000000.0f, 1000000.0f);
-		            ImGui::Text("Color");
-		            ImGui::ColorEdit3("##geometry_color", (float*)&geometry.color);
-	            ImGui::Text("Metallic");
-	            ImGui::SameLine();
-	            ImGui::SetNextItemWidth(-1);
-	            ImGui::SliderFloat("##geometry_metallic", &geometry.metallic, 0.0f, 1.0f, "%.3f",
-	                               ImGuiSliderFlags_NoInput);
-	            ImGui::Text("Roughness");
-	            ImGui::SameLine();
-	            ImGui::SetNextItemWidth(-1);
-	            ImGui::SliderFloat("##geometry_roughness", &geometry.roughness, 0.0f, 1.0f, "%.3f",
-	                               ImGuiSliderFlags_NoInput);
-	            ImGui::Text("Opacity");
-	            ImGui::SameLine();
-	            ImGui::SetNextItemWidth(-1);
-	            ImGui::SliderFloat("##geometry_opacity", &geometry.opacity, 0.0f, 1.0f, "%.3f",
-	                               ImGuiSliderFlags_NoInput);
-	            ImGui::Text("Glass IOR");
-	            ImGui::SameLine();
-	            ImGui::SetNextItemWidth(-1);
-	            ImGui::SliderFloat("##geometry_ior", &geometry.glass_ior, 1.0f, 2.5f, "%.3f",
-	                               ImGuiSliderFlags_NoInput);
-	            if (ImGui::Button("Close##geometry_config")) {
-	              ImGui::CloseCurrentPopup();
-	            }
-	            ImGui::EndPopup();
-	          }
+          if (ImGui::BeginPopup("GeometryConfig")) {
+            ImGui::TextWrapped("%s", geometry.file_path.c_str());
+            ImGui::Text("Scale");
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(140.0f);
+            input_float_commit_on_enter("##geometry_scale", geometry.scale, 0.0001f, 1000000.0f);
+            ImGui::Text("Rotate X");
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(140.0f);
+            input_float_commit_on_enter("##geometry_rotate_x", geometry.rotate_x_deg, -360000.0f, 360000.0f);
+            ImGui::Text("Rotate Y");
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(140.0f);
+            input_float_commit_on_enter("##geometry_rotate_y", geometry.rotate_y_deg, -360000.0f, 360000.0f);
+            ImGui::Text("Rotate Z");
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(140.0f);
+            input_float_commit_on_enter("##geometry_rotate_z", geometry.rotate_z_deg, -360000.0f, 360000.0f);
+            ImGui::Text("Translate X");
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(140.0f);
+            input_float_commit_on_enter("##geometry_translate_x", geometry.translate_x, -1000000.0f, 1000000.0f);
+            ImGui::Text("Translate Y");
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(140.0f);
+            input_float_commit_on_enter("##geometry_translate_y", geometry.translate_y, -1000000.0f, 1000000.0f);
+            ImGui::Text("Translate Z");
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(140.0f);
+            input_float_commit_on_enter("##geometry_translate_z", geometry.translate_z, -1000000.0f, 1000000.0f);
+            ImGui::Text("Color");
+            ImGui::ColorEdit3("##geometry_color", (float*)&geometry.color);
+            ImGui::Text("Metallic");
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(-1);
+            ImGui::SliderFloat("##geometry_metallic", &geometry.metallic, 0.0f, 1.0f, "%.3f", ImGuiSliderFlags_NoInput);
+            ImGui::Text("Roughness");
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(-1);
+            ImGui::SliderFloat("##geometry_roughness", &geometry.roughness, 0.0f, 1.0f, "%.3f",
+                               ImGuiSliderFlags_NoInput);
+            ImGui::Text("Opacity");
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(-1);
+            ImGui::SliderFloat("##geometry_opacity", &geometry.opacity, 0.0f, 1.0f, "%.3f", ImGuiSliderFlags_NoInput);
+            ImGui::Text("Glass IOR");
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(-1);
+            ImGui::SliderFloat("##geometry_ior", &geometry.glass_ior, 1.0f, 2.5f, "%.3f", ImGuiSliderFlags_NoInput);
+            if (ImGui::Button("Close##geometry_config")) {
+              ImGui::CloseCurrentPopup();
+            }
+            ImGui::EndPopup();
+          }
 
-	          ImGui::PopID();
-	          ++i;
-	        }
-	      }
+          ImGui::PopID();
+          ++i;
+        }
+      }
 
-	      if (!mask_field_names.empty()) {
-	        ImGui::Spacing();
-	        ImGui::Separator();
-	        ImGui::Spacing();
-	        ImGui::PushFont(bold_font);
-	        ImGui::Text("Render:Data");
-	        ImGui::PopFont();
+      if (!mask_field_names.empty()) {
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::Spacing();
+        ImGui::PushFont(bold_font);
+        ImGui::Text("Render:Data");
+        ImGui::PopFont();
         ImGui::Spacing();
         if (ImGui::Button("Add##data")) {
           ImGui::OpenPopup("AddDataLayer");
@@ -3264,67 +3259,66 @@ int main(int argc, char* argv[]) {
           }
         }
       }
-	    }
-	    ImGui::End();
+    }
+    ImGui::End();
 
-	    if (ImGuiFileDialog::Instance()->Display("LoadGlobalConfigDlg", ImGuiWindowFlags_None, ImVec2(840, 520),
-	                                             ImVec2(1920, 1200))) {
-	      if (ImGuiFileDialog::Instance()->IsOk()) {
-	        std::string config_file = ImGuiFileDialog::Instance()->GetFilePathName();
-	        if (config_file.empty()) {
-	          std::string current_path = ImGuiFileDialog::Instance()->GetCurrentPath();
-	          if (!current_path.empty()) {
-	            config_file = current_path;
-	          }
-	        }
-	        if (config_file.empty()) {
-	          show_mask_error = true;
-	          mask_error_msg = "No config file selected.";
-	        } else {
-	          std::string config_error;
-	          if (!load_global_config_file(config_file, bg_color, light_strength, light_color, ground_enabled,
-	                                       ground_y_offset, ground_color, ground_metallic, ground_roughness,
-	                                       ground_opacity, cam_presets, selected_cam_preset_index, next_cam_preset_id,
-	                                       config_error)) {
-	            show_mask_error = true;
-	            mask_error_msg = std::string("Failed to load config: ") + config_error;
-	          } else {
-	            viewport_needs_render = true;
-	          }
-	        }
-	      }
-	      ImGuiFileDialog::Instance()->Close();
-	    }
+    if (ImGuiFileDialog::Instance()->Display("LoadGlobalConfigDlg", ImGuiWindowFlags_None, ImVec2(840, 520),
+                                             ImVec2(1920, 1200))) {
+      if (ImGuiFileDialog::Instance()->IsOk()) {
+        std::string config_file = ImGuiFileDialog::Instance()->GetFilePathName();
+        if (config_file.empty()) {
+          std::string current_path = ImGuiFileDialog::Instance()->GetCurrentPath();
+          if (!current_path.empty()) {
+            config_file = current_path;
+          }
+        }
+        if (config_file.empty()) {
+          show_mask_error = true;
+          mask_error_msg = "No config file selected.";
+        } else {
+          std::string config_error;
+          if (!load_global_config_file(config_file, bg_color, light_strength, light_color, ground_enabled,
+                                       ground_y_offset, ground_color, ground_metallic, ground_roughness, ground_opacity,
+                                       cam_presets, selected_cam_preset_index, next_cam_preset_id, config_error)) {
+            show_mask_error = true;
+            mask_error_msg = std::string("Failed to load config: ") + config_error;
+          } else {
+            viewport_needs_render = true;
+          }
+        }
+      }
+      ImGuiFileDialog::Instance()->Close();
+    }
 
-	    if (ImGuiFileDialog::Instance()->Display("SaveGlobalConfigDlg", ImGuiWindowFlags_None, ImVec2(840, 520),
-	                                             ImVec2(1920, 1200))) {
-	      if (ImGuiFileDialog::Instance()->IsOk()) {
-	        std::string config_file = ImGuiFileDialog::Instance()->GetFilePathName();
-	        if (config_file.empty()) {
-	          std::string current_path = ImGuiFileDialog::Instance()->GetCurrentPath();
-	          if (!current_path.empty()) {
-	            config_file = current_path + "/caustix_config.cfg";
-	          }
-	        }
-	        config_file = ensure_cfg_extension(config_file);
-	        if (config_file.empty()) {
-	          show_mask_error = true;
-	          mask_error_msg = "No output config file selected.";
-	        } else {
-	          std::string config_error;
-	          if (!save_global_config_file(config_file, bg_color, light_strength, light_color, ground_enabled,
-	                                       ground_y_offset, ground_color, ground_metallic, ground_roughness,
-	                                       ground_opacity, cam_presets, config_error)) {
-	            show_mask_error = true;
-	            mask_error_msg = std::string("Failed to save config: ") + config_error;
-	          }
-	        }
-	      }
-	      ImGuiFileDialog::Instance()->Close();
-	    }
+    if (ImGuiFileDialog::Instance()->Display("SaveGlobalConfigDlg", ImGuiWindowFlags_None, ImVec2(840, 520),
+                                             ImVec2(1920, 1200))) {
+      if (ImGuiFileDialog::Instance()->IsOk()) {
+        std::string config_file = ImGuiFileDialog::Instance()->GetFilePathName();
+        if (config_file.empty()) {
+          std::string current_path = ImGuiFileDialog::Instance()->GetCurrentPath();
+          if (!current_path.empty()) {
+            config_file = current_path + "/caustix_config.cfg";
+          }
+        }
+        config_file = ensure_cfg_extension(config_file);
+        if (config_file.empty()) {
+          show_mask_error = true;
+          mask_error_msg = "No output config file selected.";
+        } else {
+          std::string config_error;
+          if (!save_global_config_file(config_file, bg_color, light_strength, light_color, ground_enabled,
+                                       ground_y_offset, ground_color, ground_metallic, ground_roughness, ground_opacity,
+                                       cam_presets, config_error)) {
+            show_mask_error = true;
+            mask_error_msg = std::string("Failed to save config: ") + config_error;
+          }
+        }
+      }
+      ImGuiFileDialog::Instance()->Close();
+    }
 
-	    if (ImGuiFileDialog::Instance()->Display("OpenFileDlg", ImGuiWindowFlags_None, ImVec2(840, 520),
-	                                             ImVec2(1920, 1200))) {
+    if (ImGuiFileDialog::Instance()->Display("OpenFileDlg", ImGuiWindowFlags_None, ImVec2(840, 520),
+                                             ImVec2(1920, 1200))) {
       if (ImGuiFileDialog::Instance()->IsOk()) {
         vtk_dir = ImGuiFileDialog::Instance()->GetCurrentPath();
         vtk_files.clear();
@@ -3772,14 +3766,14 @@ int main(int argc, char* argv[]) {
       GeometryFrameState& state = geometry_states[i];
       state.renderable = geometry.show && geometry.mesh_cache.valid;
       state.visibility_changed = (state.renderable != geometry.prev_renderable);
-	      state.transform_changed = state.renderable &&
-	                                (std::fabs(geometry.scale - geometry.prev_scale) > 1e-6f ||
-	                                 std::fabs(geometry.rotate_x_deg - geometry.prev_rotate_x_deg) > 1e-4f ||
-	                                 std::fabs(geometry.rotate_y_deg - geometry.prev_rotate_y_deg) > 1e-4f ||
-	                                 std::fabs(geometry.rotate_z_deg - geometry.prev_rotate_z_deg) > 1e-4f ||
-	                                 std::fabs(geometry.translate_x - geometry.prev_translate_x) > 1e-5f ||
-	                                 std::fabs(geometry.translate_y - geometry.prev_translate_y) > 1e-5f ||
-	                                 std::fabs(geometry.translate_z - geometry.prev_translate_z) > 1e-5f);
+      state.transform_changed =
+          state.renderable && (std::fabs(geometry.scale - geometry.prev_scale) > 1e-6f ||
+                               std::fabs(geometry.rotate_x_deg - geometry.prev_rotate_x_deg) > 1e-4f ||
+                               std::fabs(geometry.rotate_y_deg - geometry.prev_rotate_y_deg) > 1e-4f ||
+                               std::fabs(geometry.rotate_z_deg - geometry.prev_rotate_z_deg) > 1e-4f ||
+                               std::fabs(geometry.translate_x - geometry.prev_translate_x) > 1e-5f ||
+                               std::fabs(geometry.translate_y - geometry.prev_translate_y) > 1e-5f ||
+                               std::fabs(geometry.translate_z - geometry.prev_translate_z) > 1e-5f);
       state.material_changed =
           state.renderable &&
           (geometry.color.x != geometry.prev_color.x || geometry.color.y != geometry.prev_color.y ||
@@ -3869,12 +3863,13 @@ int main(int argc, char* argv[]) {
     bool render_geometry = !active_geometry_layer_indices.empty();
     bool render_any = render_mask || render_fluid || render_geometry;
 
-    bool visibility_changed = (show_mask != prev_show_mask) || any_layer_visibility_changed || any_geometry_visibility_changed;
-    bool needs_mesh_rebuild_from_cache =
-        render_any && !needs_extract &&
-        ((render_mask && (mask_smooth_changed || transform_changed)) ||
-         (render_fluid && (any_layer_smooth_changed || transform_changed)) ||
-         (render_geometry && (any_geometry_transform_changed || transform_changed)) || visibility_changed || !mesh_loaded);
+    bool visibility_changed =
+        (show_mask != prev_show_mask) || any_layer_visibility_changed || any_geometry_visibility_changed;
+    bool needs_mesh_rebuild_from_cache = render_any && !needs_extract &&
+                                         ((render_mask && (mask_smooth_changed || transform_changed)) ||
+                                          (render_fluid && (any_layer_smooth_changed || transform_changed)) ||
+                                          (render_geometry && (any_geometry_transform_changed || transform_changed)) ||
+                                          visibility_changed || !mesh_loaded);
     bool needs_full_rebuild = render_any && (extraction_attempted || needs_mesh_rebuild_from_cache);
     bool needs_gas_rebuild =
         render_any && mesh_loaded && !needs_full_rebuild && (ground_toggled || ground_offset_changed);
@@ -3883,13 +3878,12 @@ int main(int argc, char* argv[]) {
       try {
         bool mesh_was_loaded = mesh_loaded;
         BBox bbox;
-        rebuild_scene_from_caches(render_mask ? &mask_mesh_cache : nullptr, active_fluid_layer_indices, data_layers,
-                                  data_layer_mesh_caches, active_geometry_layer_indices, geometry_layers, optix_state,
-                                  light_dir, light_color.x, light_color.y, light_color.z, light_strength,
-                                  ground_enabled, ground_color, ground_metallic, ground_roughness, ground_opacity,
-                                  ground_y_offset, rotate_x_deg, rotate_y_deg, rotate_z_deg, smooth_iterations,
-                                  smooth_strength, mask_color, mask_metallic, mask_roughness, mask_opacity,
-                                  mask_glass_ior, bbox);
+        rebuild_scene_from_caches(
+            render_mask ? &mask_mesh_cache : nullptr, active_fluid_layer_indices, data_layers, data_layer_mesh_caches,
+            active_geometry_layer_indices, geometry_layers, optix_state, light_dir, light_color.x, light_color.y,
+            light_color.z, light_strength, ground_enabled, ground_color, ground_metallic, ground_roughness,
+            ground_opacity, ground_y_offset, rotate_x_deg, rotate_y_deg, rotate_z_deg, smooth_iterations,
+            smooth_strength, mask_color, mask_metallic, mask_roughness, mask_opacity, mask_glass_ior, bbox);
         mesh_loaded = true;
         mesh_bbox = bbox;
         viewport_needs_render = true;
@@ -3967,7 +3961,8 @@ int main(int argc, char* argv[]) {
             geometry_idx >= static_cast<int>(geometry_layers.size())) {
           continue;
         }
-        geometry_mat_changed = geometry_mat_changed || geometry_states[static_cast<size_t>(geometry_idx)].material_changed;
+        geometry_mat_changed =
+            geometry_mat_changed || geometry_states[static_cast<size_t>(geometry_idx)].material_changed;
       }
       bool ground_mat_changed =
           ground_enabled &&
@@ -4033,14 +4028,14 @@ int main(int argc, char* argv[]) {
     for (size_t i = 0; i < geometry_layers.size(); i++) {
       GeometryLayer& geometry = geometry_layers[i];
       geometry.prev_show = geometry.show;
-	      geometry.prev_scale = geometry.scale;
-	      geometry.prev_rotate_x_deg = geometry.rotate_x_deg;
-	      geometry.prev_rotate_y_deg = geometry.rotate_y_deg;
-	      geometry.prev_rotate_z_deg = geometry.rotate_z_deg;
-	      geometry.prev_translate_x = geometry.translate_x;
-	      geometry.prev_translate_y = geometry.translate_y;
-	      geometry.prev_translate_z = geometry.translate_z;
-	      geometry.prev_color = geometry.color;
+      geometry.prev_scale = geometry.scale;
+      geometry.prev_rotate_x_deg = geometry.rotate_x_deg;
+      geometry.prev_rotate_y_deg = geometry.rotate_y_deg;
+      geometry.prev_rotate_z_deg = geometry.rotate_z_deg;
+      geometry.prev_translate_x = geometry.translate_x;
+      geometry.prev_translate_y = geometry.translate_y;
+      geometry.prev_translate_z = geometry.translate_z;
+      geometry.prev_color = geometry.color;
       geometry.prev_metallic = geometry.metallic;
       geometry.prev_roughness = geometry.roughness;
       geometry.prev_opacity = geometry.opacity;
@@ -4265,9 +4260,9 @@ int main(int argc, char* argv[]) {
                                              cam_target, cam_fov, outline_color, outline_thickness);
               }
 
-              int write_ok = stbi_write_png(
-                  out_path.string().c_str(), animation_export.width, animation_export.height, 4,
-                  animation_export.export_pixels.data(), animation_export.width * static_cast<int>(sizeof(uchar4)));
+              int write_ok = stbi_write_png(out_path.string().c_str(), animation_export.width, animation_export.height,
+                                            4, animation_export.export_pixels.data(),
+                                            animation_export.width * static_cast<int>(sizeof(uchar4)));
               if (write_ok == 0) {
                 throw std::runtime_error("Failed to write PNG: " + out_path.string());
               }
