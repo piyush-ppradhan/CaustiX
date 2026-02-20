@@ -2920,6 +2920,11 @@ int main(int argc, char* argv[]) {
           }
         }
       }
+    } else {
+      dataset_cell_names.clear();
+      dataset_scalar_cell_names.clear();
+      dataset_loaded_field_vtk_index = -1;
+    }
       ImGui::Spacing();
       ImGui::Separator();
       ImGui::PushFont(bold_font);
@@ -3258,7 +3263,6 @@ int main(int argc, char* argv[]) {
             ++i;
           }
         }
-      }
     }
     ImGui::End();
 
