@@ -305,6 +305,7 @@ struct CameraState {
     float distance = 5.0f;
     float target[3] = {0.0f, 0.0f, 0.0f};
     float fov = 60.0f;
+    float orientation[4] = {-0.2588190451f, 0.0f, 0.0f, 0.9659258263f};  // x,y,z,w
   };
 
   float yaw = 0.0f;
@@ -312,6 +313,7 @@ struct CameraState {
   float distance = 5.0f;
   float target[3] = {0.0f, 0.0f, 0.0f};
   float fov = 60.0f;
+  float orientation[4] = {-0.2588190451f, 0.0f, 0.0f, 0.9659258263f};  // x,y,z,w
   std::vector<Preset> presets;
   int selected_preset_index = -1;
   int next_preset_id = 1;
@@ -393,6 +395,8 @@ struct OptixState {
   size_t denoiser_state_size = 0;
   size_t denoiser_scratch_size = 0;
   bool denoiser_supported = false;
+  int denoiser_w = 0;
+  int denoiser_h = 0;
   int img_w = 0, img_h = 0;
 };
 
@@ -1605,6 +1609,93 @@ static void update_scene_material_sbt(OptixState& state, const float3& light_dir
   }
 }
 
+struct Quatf {
+  float x = 0.0f;
+  float y = 0.0f;
+  float z = 0.0f;
+  float w = 1.0f;
+};
+
+static float3 cross3(const float3& a, const float3& b) {
+  return make_float3(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x);
+}
+
+static float dot3(const float3& a, const float3& b) {
+  return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+
+static float3 normalize3(const float3& v) {
+  float len = std::sqrt(dot3(v, v));
+  if (len <= 1e-12f) {
+    return make_float3(0.0f, 0.0f, 0.0f);
+  }
+  return make_float3(v.x / len, v.y / len, v.z / len);
+}
+
+static Quatf quat_normalize(const Quatf& q) {
+  float len = std::sqrt(q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w);
+  if (len <= 1e-12f) {
+    return Quatf{};
+  }
+  return Quatf{q.x / len, q.y / len, q.z / len, q.w / len};
+}
+
+static Quatf quat_mul(const Quatf& a, const Quatf& b) {
+  return Quatf{a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y, a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
+               a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w, a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z};
+}
+
+static Quatf quat_from_axis_angle(const float3& axis, float angle_rad) {
+  float3 n = normalize3(axis);
+  if (dot3(n, n) <= 1e-12f) {
+    return Quatf{};
+  }
+  float h = 0.5f * angle_rad;
+  float s = std::sin(h);
+  return quat_normalize(Quatf{n.x * s, n.y * s, n.z * s, std::cos(h)});
+}
+
+static float3 quat_rotate_vec3(const Quatf& qn, const float3& v) {
+  Quatf q = quat_normalize(qn);
+  float3 qv = make_float3(q.x, q.y, q.z);
+  float3 t = cross3(qv, v);
+  t.x *= 2.0f;
+  t.y *= 2.0f;
+  t.z *= 2.0f;
+  float3 out = make_float3(v.x + q.w * t.x, v.y + q.w * t.y, v.z + q.w * t.z);
+  float3 c = cross3(qv, t);
+  out.x += c.x;
+  out.y += c.y;
+  out.z += c.z;
+  return out;
+}
+
+static Quatf quat_from_yaw_pitch(float yaw_deg, float pitch_deg) {
+  constexpr float kPi = 3.14159265358979323846f;
+  Quatf q_yaw = quat_from_axis_angle(make_float3(0.0f, 1.0f, 0.0f), yaw_deg * (kPi / 180.0f));
+  Quatf q_pitch = quat_from_axis_angle(make_float3(1.0f, 0.0f, 0.0f), -pitch_deg * (kPi / 180.0f));
+  return quat_normalize(quat_mul(q_yaw, q_pitch));
+}
+
+static Quatf quat_from_array(const float q[4]) {
+  return quat_normalize(Quatf{q[0], q[1], q[2], q[3]});
+}
+
+static void quat_to_array(const Quatf& qn, float out[4]) {
+  Quatf q = quat_normalize(qn);
+  out[0] = q.x;
+  out[1] = q.y;
+  out[2] = q.z;
+  out[3] = q.w;
+}
+
+static void sync_yaw_pitch_from_orientation(const float orientation[4], float& yaw_deg, float& pitch_deg) {
+  constexpr float kPi = 3.14159265358979323846f;
+  float3 fwd = normalize3(quat_rotate_vec3(quat_from_array(orientation), make_float3(0.0f, 0.0f, -1.0f)));
+  pitch_deg = std::asin(std::clamp(-fwd.y, -1.0f, 1.0f)) * (180.0f / kPi);
+  yaw_deg = std::atan2(-fwd.x, -fwd.z) * (180.0f / kPi);
+}
+
 static void render_background_to_host(int width, int height, const ImVec4& bg_color, std::vector<uchar4>& host_pixels) {
   host_pixels.resize(static_cast<size_t>(width) * static_cast<size_t>(height));
   uchar4 bg = make_uchar4(static_cast<unsigned char>(bg_color.x * 255.0f + 0.5f),
@@ -1626,7 +1717,7 @@ static void ensure_denoiser_resources(OptixState& state, int width, int height) 
   if (!state.denoiser_supported || state.denoiser == nullptr) {
     return;
   }
-  bool resize_needed = (state.img_w != width || state.img_h != height || state.d_denoised_image == 0 ||
+  bool resize_needed = (state.denoiser_w != width || state.denoiser_h != height || state.d_denoised_image == 0 ||
                         state.d_denoiser_state == 0 || state.d_denoiser_scratch == 0 || state.d_denoiser_intensity == 0);
   if (!resize_needed) {
     return;
@@ -1662,48 +1753,20 @@ static void ensure_denoiser_resources(OptixState& state, int width, int height) 
   OPTIX_CHECK(optixDenoiserSetup(state.denoiser, 0, static_cast<unsigned int>(width), static_cast<unsigned int>(height),
                                  state.d_denoiser_state, state.denoiser_state_size, state.d_denoiser_scratch,
                                  state.denoiser_scratch_size));
+  state.denoiser_w = width;
+  state.denoiser_h = height;
 }
 
 static void render_optix_frame(OptixState& optix_state, int width, int height, int rt_samples, int rt_bounces,
-                               float cam_yaw, float cam_pitch, float cam_distance, const float cam_target[3],
+                               const float cam_orientation[4], float cam_distance, const float cam_target[3],
                                float cam_fov, bool shadows_enabled, bool denoise_enabled,
                                std::vector<uchar4>& host_pixels) {
-  // Compute camera eye from spherical coordinates
-  float yaw_rad = cam_yaw * 3.14159265f / 180.0f;
-  float pitch_rad = cam_pitch * 3.14159265f / 180.0f;
-  float3 eye = make_float3(cam_target[0] + cam_distance * std::cos(pitch_rad) * std::sin(yaw_rad),
-                           cam_target[1] + cam_distance * std::sin(pitch_rad),
-                           cam_target[2] + cam_distance * std::cos(pitch_rad) * std::cos(yaw_rad));
+  Quatf q = quat_from_array(cam_orientation);
+  float3 W = normalize3(quat_rotate_vec3(q, make_float3(0.0f, 0.0f, -1.0f)));
+  float3 U = normalize3(quat_rotate_vec3(q, make_float3(1.0f, 0.0f, 0.0f)));
+  float3 V = normalize3(quat_rotate_vec3(q, make_float3(0.0f, 1.0f, 0.0f)));
   float3 target = make_float3(cam_target[0], cam_target[1], cam_target[2]);
-
-  // Compute camera frame vectors
-  float3 W = make_float3(target.x - eye.x, target.y - eye.y, target.z - eye.z);
-  float w_len = std::sqrt(W.x * W.x + W.y * W.y + W.z * W.z);
-  if (w_len > 1e-6f) {
-    W.x /= w_len;
-    W.y /= w_len;
-    W.z /= w_len;
-  }
-
-  float3 world_up = make_float3(0.0f, 1.0f, 0.0f);
-  float3 U = make_float3(W.y * world_up.z - W.z * world_up.y, W.z * world_up.x - W.x * world_up.z,
-                         W.x * world_up.y - W.y * world_up.x);
-  float u_len = std::sqrt(U.x * U.x + U.y * U.y + U.z * U.z);
-  if (u_len <= 1e-6f) {
-    world_up = make_float3(0.0f, 0.0f, 1.0f);
-    U = make_float3(W.y * world_up.z - W.z * world_up.y, W.z * world_up.x - W.x * world_up.z,
-                    W.x * world_up.y - W.y * world_up.x);
-    u_len = std::sqrt(U.x * U.x + U.y * U.y + U.z * U.z);
-  }
-  if (u_len > 1e-6f) {
-    U.x /= u_len;
-    U.y /= u_len;
-    U.z /= u_len;
-  } else {
-    U = make_float3(1.0f, 0.0f, 0.0f);
-  }
-
-  float3 V = make_float3(U.y * W.z - U.z * W.y, U.z * W.x - U.x * W.z, U.x * W.y - U.y * W.x);
+  float3 eye = make_float3(target.x - W.x * cam_distance, target.y - W.y * cam_distance, target.z - W.z * cam_distance);
 
   float half_h = std::tan(cam_fov * 3.14159265f / 360.0f);
   float aspect = static_cast<float>(width) / static_cast<float>(height);
@@ -1833,54 +1896,25 @@ static void draw_line_host(std::vector<uchar4>& host_pixels, int width, int heig
 }
 
 static void overlay_bbox_outline_on_host(std::vector<uchar4>& host_pixels, int width, int height, const BBox& bbox,
-                                         float cam_yaw, float cam_pitch, float cam_distance, const float cam_target[3],
+                                         const float cam_orientation[4], float cam_distance, const float cam_target[3],
                                          float cam_fov, const ImVec4& outline_color, float outline_thickness) {
   if (host_pixels.size() < static_cast<size_t>(width) * static_cast<size_t>(height) || width <= 0 || height <= 0) {
     return;
   }
 
-  float yaw_rad = cam_yaw * 3.14159265f / 180.0f;
-  float pitch_rad = cam_pitch * 3.14159265f / 180.0f;
-  float3 eye = make_float3(cam_target[0] + cam_distance * std::cos(pitch_rad) * std::sin(yaw_rad),
-                           cam_target[1] + cam_distance * std::sin(pitch_rad),
-                           cam_target[2] + cam_distance * std::cos(pitch_rad) * std::cos(yaw_rad));
   float3 target = make_float3(cam_target[0], cam_target[1], cam_target[2]);
-
-  float3 fwd = make_float3(target.x - eye.x, target.y - eye.y, target.z - eye.z);
+  Quatf q = quat_from_array(cam_orientation);
+  float3 fwd = normalize3(quat_rotate_vec3(q, make_float3(0.0f, 0.0f, -1.0f)));
+  float3 cam_right = normalize3(quat_rotate_vec3(q, make_float3(1.0f, 0.0f, 0.0f)));
+  float3 cam_up = normalize3(quat_rotate_vec3(q, make_float3(0.0f, 1.0f, 0.0f)));
+  float3 eye = make_float3(target.x - fwd.x * cam_distance, target.y - fwd.y * cam_distance, target.z - fwd.z * cam_distance);
   float fwd_len = std::sqrt(fwd.x * fwd.x + fwd.y * fwd.y + fwd.z * fwd.z);
   if (fwd_len <= 1e-6f) {
     return;
   }
-  fwd.x /= fwd_len;
-  fwd.y /= fwd_len;
-  fwd.z /= fwd_len;
-
-  float3 world_up = make_float3(0.0f, 1.0f, 0.0f);
-  float3 cam_right = make_float3(fwd.y * world_up.z - fwd.z * world_up.y, fwd.z * world_up.x - fwd.x * world_up.z,
-                                 fwd.x * world_up.y - fwd.y * world_up.x);
-  float right_len = std::sqrt(cam_right.x * cam_right.x + cam_right.y * cam_right.y + cam_right.z * cam_right.z);
-  if (right_len <= 1e-6f) {
-    world_up = make_float3(0.0f, 0.0f, 1.0f);
-    cam_right = make_float3(fwd.y * world_up.z - fwd.z * world_up.y, fwd.z * world_up.x - fwd.x * world_up.z,
-                            fwd.x * world_up.y - fwd.y * world_up.x);
-    right_len = std::sqrt(cam_right.x * cam_right.x + cam_right.y * cam_right.y + cam_right.z * cam_right.z);
-  }
-  if (right_len <= 1e-6f) {
+  if (dot3(cam_right, cam_right) <= 1e-12f || dot3(cam_up, cam_up) <= 1e-12f) {
     return;
   }
-  cam_right.x /= right_len;
-  cam_right.y /= right_len;
-  cam_right.z /= right_len;
-
-  float3 cam_up = make_float3(cam_right.y * fwd.z - cam_right.z * fwd.y, cam_right.z * fwd.x - cam_right.x * fwd.z,
-                              cam_right.x * fwd.y - cam_right.y * fwd.x);
-  float up_len = std::sqrt(cam_up.x * cam_up.x + cam_up.y * cam_up.y + cam_up.z * cam_up.z);
-  if (up_len <= 1e-6f) {
-    return;
-  }
-  cam_up.x /= up_len;
-  cam_up.y /= up_len;
-  cam_up.z /= up_len;
 
   float half_h = std::tan(cam_fov * 3.14159265f / 360.0f);
   float half_w = half_h * (static_cast<float>(width) / static_cast<float>(height));
@@ -2013,8 +2047,10 @@ static bool save_global_config_file(const std::string& filepath, const ImVec4& b
       << ground_opacity << "\n";
   out << "camera_count " << camera_presets.size() << "\n";
   for (const auto& preset : camera_presets) {
+    Quatf q = quat_from_array(preset.orientation);
     out << "camera " << std::quoted(preset.name) << " " << preset.yaw << " " << preset.pitch << " " << preset.distance
-        << " " << preset.target[0] << " " << preset.target[1] << " " << preset.target[2] << " " << preset.fov << "\n";
+        << " " << preset.target[0] << " " << preset.target[1] << " " << preset.target[2] << " " << preset.fov << " "
+        << q.x << " " << q.y << " " << q.z << " " << q.w << "\n";
   }
 
   if (!out.good()) {
@@ -2108,17 +2144,33 @@ static bool load_global_config_file(const std::string& filepath, ImVec4& bg_colo
   camera_presets.clear();
   camera_presets.reserve(static_cast<size_t>(camera_count));
 
+  std::string line;
+  std::getline(in, line);  // consume trailing newline after camera_count line
   for (int i = 0; i < camera_count; i++) {
-    std::string key;
     CameraState::Preset preset;
-    if (!(in >> key) || key != "camera" ||
-        !(in >> std::quoted(preset.name) >> preset.yaw >> preset.pitch >> preset.distance >> preset.target[0] >>
+    if (!std::getline(in, line)) {
+      error_message = "Failed to read camera preset entry.";
+      camera_presets.clear();
+      selected_preset_index = -1;
+      next_preset_id = 1;
+      return false;
+    }
+    std::istringstream ss(line);
+    std::string key;
+    if (!(ss >> key) || key != "camera" ||
+        !(ss >> std::quoted(preset.name) >> preset.yaw >> preset.pitch >> preset.distance >> preset.target[0] >>
           preset.target[1] >> preset.target[2] >> preset.fov)) {
       error_message = "Failed to parse camera preset entry.";
       camera_presets.clear();
       selected_preset_index = -1;
       next_preset_id = 1;
       return false;
+    }
+    float qx = 0.0f, qy = 0.0f, qz = 0.0f, qw = 1.0f;
+    if (ss >> qx >> qy >> qz >> qw) {
+      quat_to_array(quat_normalize(Quatf{qx, qy, qz, qw}), preset.orientation);
+    } else {
+      quat_to_array(quat_from_yaw_pitch(preset.yaw, preset.pitch), preset.orientation);
     }
     if (preset.name.empty()) {
       preset.name = "Camera " + std::to_string(i + 1);
@@ -2522,6 +2574,8 @@ static void cleanup_optix(OptixState& state) {
   if (state.denoiser) optixDenoiserDestroy(state.denoiser);
   if (state.module) optixModuleDestroy(state.module);
   if (state.context) optixDeviceContextDestroy(state.context);
+  state.denoiser_w = 0;
+  state.denoiser_h = 0;
 }
 
 int main(int argc, char* argv[]) {
@@ -2652,6 +2706,7 @@ int main(int argc, char* argv[]) {
   float& cam_distance = camera.distance;
   float (&cam_target)[3] = camera.target;
   float& cam_fov = camera.fov;
+  float (&cam_orientation)[4] = camera.orientation;
   std::vector<CameraState::Preset>& cam_presets = camera.presets;
   int& selected_cam_preset_index = camera.selected_preset_index;
   int& next_cam_preset_id = camera.next_preset_id;
@@ -2816,33 +2871,33 @@ int main(int argc, char* argv[]) {
     ImGui::Text("Camera");
     ImGui::PopFont();
     if (ImGui::Button("X##camera_axis")) {
-      cam_yaw = 90.0f;
-      cam_pitch = 0.0f;
+      quat_to_array(quat_from_yaw_pitch(90.0f, 0.0f), cam_orientation);
+      sync_yaw_pitch_from_orientation(cam_orientation, cam_yaw, cam_pitch);
       viewport_needs_render = true;
     }
     ImGui::SameLine();
     if (ImGui::Button("Y##camera_axis")) {
-      cam_yaw = 0.0f;
-      cam_pitch = 89.0f;
+      quat_to_array(quat_from_yaw_pitch(0.0f, 90.0f), cam_orientation);
+      sync_yaw_pitch_from_orientation(cam_orientation, cam_yaw, cam_pitch);
       viewport_needs_render = true;
     }
     ImGui::SameLine();
     if (ImGui::Button("Z##camera_axis")) {
-      cam_yaw = 0.0f;
-      cam_pitch = 0.0f;
+      quat_to_array(quat_from_yaw_pitch(0.0f, 0.0f), cam_orientation);
+      sync_yaw_pitch_from_orientation(cam_orientation, cam_yaw, cam_pitch);
       viewport_needs_render = true;
     }
     ImGui::Spacing();
     if (ImGui::Button("Save Camera Config")) {
       CameraState::Preset preset;
       preset.name = "Camera " + std::to_string(next_cam_preset_id++);
-      preset.yaw = cam_yaw;
-      preset.pitch = cam_pitch;
+      sync_yaw_pitch_from_orientation(cam_orientation, preset.yaw, preset.pitch);
       preset.distance = cam_distance;
       preset.target[0] = cam_target[0];
       preset.target[1] = cam_target[1];
       preset.target[2] = cam_target[2];
       preset.fov = cam_fov;
+      std::copy(std::begin(cam_orientation), std::end(cam_orientation), std::begin(preset.orientation));
       cam_presets.push_back(std::move(preset));
       selected_cam_preset_index = static_cast<int>(cam_presets.size()) - 1;
     }
@@ -2869,8 +2924,14 @@ int main(int argc, char* argv[]) {
       if (ImGui::Button("Load##camera_preset")) {
         if (selected_cam_preset_index >= 0 && selected_cam_preset_index < static_cast<int>(cam_presets.size())) {
           const CameraState::Preset& preset = cam_presets[static_cast<size_t>(selected_cam_preset_index)];
-          cam_yaw = preset.yaw;
-          cam_pitch = preset.pitch;
+          float q_norm2 = preset.orientation[0] * preset.orientation[0] + preset.orientation[1] * preset.orientation[1] +
+                          preset.orientation[2] * preset.orientation[2] + preset.orientation[3] * preset.orientation[3];
+          if (q_norm2 > 1e-12f) {
+            quat_to_array(quat_from_array(preset.orientation), cam_orientation);
+          } else {
+            quat_to_array(quat_from_yaw_pitch(preset.yaw, preset.pitch), cam_orientation);
+          }
+          sync_yaw_pitch_from_orientation(cam_orientation, cam_yaw, cam_pitch);
           cam_distance = std::max(0.1f, preset.distance);
           cam_target[0] = preset.target[0];
           cam_target[1] = preset.target[1];
@@ -3661,14 +3722,15 @@ int main(int argc, char* argv[]) {
           std::filesystem::path out_path = std::filesystem::path(save_image_dir) / (file_name + ".png");
 
           if (mesh_loaded && optix_state.gas_handle != 0) {
-            render_optix_frame(optix_state, save_image_width, save_image_height, rt_samples, rt_bounces, cam_yaw,
-                               cam_pitch, cam_distance, cam_target, cam_fov, shadows_enabled, rt_denoise, host_pixels);
+            render_optix_frame(optix_state, save_image_width, save_image_height, rt_samples, rt_bounces,
+                               cam_orientation, cam_distance, cam_target, cam_fov, shadows_enabled, rt_denoise,
+                               host_pixels);
           } else {
             render_background_to_host(save_image_width, save_image_height, bg_color, host_pixels);
           }
           if (show_outlines && mesh_loaded) {
-            overlay_bbox_outline_on_host(host_pixels, save_image_width, save_image_height, mesh_bbox, cam_yaw,
-                                         cam_pitch, cam_distance, cam_target, cam_fov, outline_color,
+            overlay_bbox_outline_on_host(host_pixels, save_image_width, save_image_height, mesh_bbox, cam_orientation,
+                                         cam_distance, cam_target, cam_fov, outline_color,
                                          outline_thickness);
           }
 
@@ -4212,49 +4274,26 @@ int main(int argc, char* argv[]) {
       // Left mouse drag: orbit
       if (ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
         ImVec2 delta = io.MouseDelta;
-        cam_yaw -= delta.x * 0.3f;
-        cam_pitch += delta.y * 0.3f;
-        cam_yaw = std::remainder(cam_yaw, 360.0f);
-        cam_pitch = std::remainder(cam_pitch, 360.0f);
+        constexpr float kDegToRad = 3.14159265358979323846f / 180.0f;
+        float yaw_delta_rad = -delta.x * 0.3f * kDegToRad;
+        float pitch_delta_rad = delta.y * 0.3f * kDegToRad;
+        Quatf q = quat_from_array(cam_orientation);
+        Quatf q_yaw = quat_from_axis_angle(make_float3(0.0f, 1.0f, 0.0f), yaw_delta_rad);
+        q = quat_normalize(quat_mul(q_yaw, q));
+        float3 cam_right = normalize3(quat_rotate_vec3(q, make_float3(1.0f, 0.0f, 0.0f)));
+        Quatf q_pitch = quat_from_axis_angle(cam_right, pitch_delta_rad);
+        q = quat_normalize(quat_mul(q_pitch, q));
+        quat_to_array(q, cam_orientation);
+        sync_yaw_pitch_from_orientation(cam_orientation, cam_yaw, cam_pitch);
         viewport_needs_render = true;
       }
 
       // Middle mouse drag: pan
       if (ImGui::IsMouseDragging(ImGuiMouseButton_Middle)) {
         ImVec2 delta = io.MouseDelta;
-        float yaw_rad = cam_yaw * 3.14159265f / 180.0f;
-        float pitch_rad = cam_pitch * 3.14159265f / 180.0f;
-
-        // Camera right and up vectors
-        float3 forward = make_float3(std::cos(pitch_rad) * std::sin(yaw_rad), std::sin(pitch_rad),
-                                     std::cos(pitch_rad) * std::cos(yaw_rad));
-        float3 world_up = make_float3(0, 1, 0);
-        // cross(forward, world_up)
-        float3 right = make_float3(forward.y * world_up.z - forward.z * world_up.y,
-                                   forward.z * world_up.x - forward.x * world_up.z,
-                                   forward.x * world_up.y - forward.y * world_up.x);
-        float right_len = std::sqrt(right.x * right.x + right.y * right.y + right.z * right.z);
-        if (right_len <= 1e-6f) {
-          world_up = make_float3(0.0f, 0.0f, 1.0f);
-          right = make_float3(forward.y * world_up.z - forward.z * world_up.y,
-                              forward.z * world_up.x - forward.x * world_up.z,
-                              forward.x * world_up.y - forward.y * world_up.x);
-          right_len = std::sqrt(right.x * right.x + right.y * right.y + right.z * right.z);
-        }
-        if (right_len > 1e-6f) {
-          right.x /= right_len;
-          right.y /= right_len;
-          right.z /= right_len;
-        }
-        // cross(right, forward)
-        float3 up = make_float3(right.y * forward.z - right.z * forward.y, right.z * forward.x - right.x * forward.z,
-                                right.x * forward.y - right.y * forward.x);
-        float up_len = std::sqrt(up.x * up.x + up.y * up.y + up.z * up.z);
-        if (up_len > 1e-6f) {
-          up.x /= up_len;
-          up.y /= up_len;
-          up.z /= up_len;
-        }
+        Quatf q = quat_from_array(cam_orientation);
+        float3 right = normalize3(quat_rotate_vec3(q, make_float3(1.0f, 0.0f, 0.0f)));
+        float3 up = normalize3(quat_rotate_vec3(q, make_float3(0.0f, 1.0f, 0.0f)));
 
         float pan_speed = cam_distance * 0.002f;
         cam_target[0] -= (right.x * delta.x + up.x * delta.y) * pan_speed;
@@ -4285,8 +4324,8 @@ int main(int argc, char* argv[]) {
     if (render_any && mesh_loaded && viewport_needs_render) {
       viewport_needs_render = false;
       try {
-        render_optix_frame(optix_state, vp_w, vp_h, rt_samples, rt_bounces, cam_yaw, cam_pitch, cam_distance,
-                           cam_target, cam_fov, shadows_enabled, rt_denoise, host_pixels);
+        render_optix_frame(optix_state, vp_w, vp_h, rt_samples, rt_bounces, cam_orientation, cam_distance, cam_target,
+                           cam_fov, shadows_enabled, rt_denoise, host_pixels);
 
         // Upload to SDL texture
         void* tex_pixels = nullptr;
@@ -4407,7 +4446,7 @@ int main(int argc, char* argv[]) {
 
               if (render_any && mesh_loaded && optix_state.gas_handle != 0) {
                 render_optix_frame(optix_state, animation_export.width, animation_export.height, rt_samples, rt_bounces,
-                                   cam_yaw, cam_pitch, cam_distance, cam_target, cam_fov, shadows_enabled, rt_denoise,
+                                   cam_orientation, cam_distance, cam_target, cam_fov, shadows_enabled, rt_denoise,
                                    animation_export.export_pixels);
               } else {
                 render_background_to_host(animation_export.width, animation_export.height, bg_color,
@@ -4415,7 +4454,7 @@ int main(int argc, char* argv[]) {
               }
               if (show_outlines && mesh_loaded) {
                 overlay_bbox_outline_on_host(animation_export.export_pixels, animation_export.width,
-                                             animation_export.height, mesh_bbox, cam_yaw, cam_pitch, cam_distance,
+                                             animation_export.height, mesh_bbox, cam_orientation, cam_distance,
                                              cam_target, cam_fov, outline_color, outline_thickness);
               }
 
@@ -4450,43 +4489,12 @@ int main(int argc, char* argv[]) {
 
       // Draw bounding box outline overlay
       if (render_any && mesh_loaded && show_outlines) {
-        float yaw_rad = cam_yaw * 3.14159265f / 180.0f;
-        float pitch_rad = cam_pitch * 3.14159265f / 180.0f;
-        float3 eye = make_float3(cam_target[0] + cam_distance * std::cos(pitch_rad) * std::sin(yaw_rad),
-                                 cam_target[1] + cam_distance * std::sin(pitch_rad),
-                                 cam_target[2] + cam_distance * std::cos(pitch_rad) * std::cos(yaw_rad));
+        Quatf q = quat_from_array(cam_orientation);
+        float3 fwd = normalize3(quat_rotate_vec3(q, make_float3(0.0f, 0.0f, -1.0f)));
+        float3 cam_right = normalize3(quat_rotate_vec3(q, make_float3(1.0f, 0.0f, 0.0f)));
+        float3 cam_up = normalize3(quat_rotate_vec3(q, make_float3(0.0f, 1.0f, 0.0f)));
         float3 tgt = make_float3(cam_target[0], cam_target[1], cam_target[2]);
-        float3 fwd = make_float3(tgt.x - eye.x, tgt.y - eye.y, tgt.z - eye.z);
-        float fwd_len = std::sqrt(fwd.x * fwd.x + fwd.y * fwd.y + fwd.z * fwd.z);
-        if (fwd_len > 1e-6f) {
-          fwd.x /= fwd_len;
-          fwd.y /= fwd_len;
-          fwd.z /= fwd_len;
-        }
-        float3 world_up = make_float3(0.0f, 1.0f, 0.0f);
-        float3 cam_right = make_float3(fwd.y * world_up.z - fwd.z * world_up.y, fwd.z * world_up.x - fwd.x * world_up.z,
-                                       fwd.x * world_up.y - fwd.y * world_up.x);
-        float cr_len = std::sqrt(cam_right.x * cam_right.x + cam_right.y * cam_right.y + cam_right.z * cam_right.z);
-        if (cr_len <= 1e-6f) {
-          world_up = make_float3(0.0f, 0.0f, 1.0f);
-          cam_right = make_float3(fwd.y * world_up.z - fwd.z * world_up.y, fwd.z * world_up.x - fwd.x * world_up.z,
-                                  fwd.x * world_up.y - fwd.y * world_up.x);
-          cr_len = std::sqrt(cam_right.x * cam_right.x + cam_right.y * cam_right.y + cam_right.z * cam_right.z);
-        }
-        if (cr_len > 1e-6f) {
-          cam_right.x /= cr_len;
-          cam_right.y /= cr_len;
-          cam_right.z /= cr_len;
-        }
-        float3 cam_up =
-            make_float3(cam_right.y * fwd.z - cam_right.z * fwd.y, cam_right.z * fwd.x - cam_right.x * fwd.z,
-                        cam_right.x * fwd.y - cam_right.y * fwd.x);
-        float cu_len = std::sqrt(cam_up.x * cam_up.x + cam_up.y * cam_up.y + cam_up.z * cam_up.z);
-        if (cu_len > 1e-6f) {
-          cam_up.x /= cu_len;
-          cam_up.y /= cu_len;
-          cam_up.z /= cu_len;
-        }
+        float3 eye = make_float3(tgt.x - fwd.x * cam_distance, tgt.y - fwd.y * cam_distance, tgt.z - fwd.z * cam_distance);
 
         float half_h = std::tan(cam_fov * 3.14159265f / 360.0f);
         float aspect = (float)vp_w / (float)vp_h;
