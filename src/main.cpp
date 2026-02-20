@@ -293,6 +293,8 @@ struct RayTracingState {
   int prev_bounces = bounces;
   int samples = 1;
   int prev_samples = samples;
+  bool denoise = false;
+  bool prev_denoise = denoise;
 };
 
 struct CameraState {
@@ -382,7 +384,15 @@ struct OptixState {
   CUdeviceptr d_ground_vertices = 0;
   CUdeviceptr d_ground_indices = 0;
   CUdeviceptr d_image = 0;
+  CUdeviceptr d_denoised_image = 0;
   CUdeviceptr d_params = 0;
+  OptixDenoiser denoiser = nullptr;
+  CUdeviceptr d_denoiser_state = 0;
+  CUdeviceptr d_denoiser_scratch = 0;
+  CUdeviceptr d_denoiser_intensity = 0;
+  size_t denoiser_state_size = 0;
+  size_t denoiser_scratch_size = 0;
+  bool denoiser_supported = false;
   int img_w = 0, img_h = 0;
 };
 
@@ -417,6 +427,18 @@ static void init_optix(OptixState& state, const std::string& ptx_path, const ImV
   ctx_options.logCallbackLevel = 4;
   CUcontext cu_ctx = 0;
   OPTIX_CHECK(optixDeviceContextCreate(cu_ctx, &ctx_options, &state.context));
+
+  // Create OptiX denoiser if available on this system.
+  OptixDenoiserOptions denoiser_options = {};
+  OptixResult denoiser_result =
+      optixDenoiserCreate(state.context, OPTIX_DENOISER_MODEL_KIND_HDR, &denoiser_options, &state.denoiser);
+  if (denoiser_result == OPTIX_SUCCESS) {
+    state.denoiser_supported = true;
+  } else {
+    state.denoiser_supported = false;
+    state.denoiser = nullptr;
+    std::cerr << "OptiX denoiser unavailable (error " << static_cast<int>(denoiser_result) << ").\n";
+  }
 
   // Load PTX
   std::string ptx = load_ptx_file(ptx_path);
@@ -1591,9 +1613,61 @@ static void render_background_to_host(int width, int height, const ImVec4& bg_co
   std::fill(host_pixels.begin(), host_pixels.end(), bg);
 }
 
+static uchar4 linear_to_srgb_uchar4(const float4& c) {
+  auto map = [](float v) -> unsigned char {
+    float clamped = std::clamp(v, 0.0f, 1.0f);
+    float srgb = std::pow(clamped, 1.0f / 2.2f);
+    return static_cast<unsigned char>(srgb * 255.0f + 0.5f);
+  };
+  return make_uchar4(map(c.x), map(c.y), map(c.z), static_cast<unsigned char>(std::clamp(c.w, 0.0f, 1.0f) * 255.0f + 0.5f));
+}
+
+static void ensure_denoiser_resources(OptixState& state, int width, int height) {
+  if (!state.denoiser_supported || state.denoiser == nullptr) {
+    return;
+  }
+  bool resize_needed = (state.img_w != width || state.img_h != height || state.d_denoised_image == 0 ||
+                        state.d_denoiser_state == 0 || state.d_denoiser_scratch == 0 || state.d_denoiser_intensity == 0);
+  if (!resize_needed) {
+    return;
+  }
+
+  if (state.d_denoised_image) {
+    CUDA_CHECK(cudaFree(reinterpret_cast<void*>(state.d_denoised_image)));
+    state.d_denoised_image = 0;
+  }
+  if (state.d_denoiser_state) {
+    CUDA_CHECK(cudaFree(reinterpret_cast<void*>(state.d_denoiser_state)));
+    state.d_denoiser_state = 0;
+  }
+  if (state.d_denoiser_scratch) {
+    CUDA_CHECK(cudaFree(reinterpret_cast<void*>(state.d_denoiser_scratch)));
+    state.d_denoiser_scratch = 0;
+  }
+  if (state.d_denoiser_intensity) {
+    CUDA_CHECK(cudaFree(reinterpret_cast<void*>(state.d_denoiser_intensity)));
+    state.d_denoiser_intensity = 0;
+  }
+
+  OptixDenoiserSizes sizes = {};
+  OPTIX_CHECK(optixDenoiserComputeMemoryResources(state.denoiser, static_cast<unsigned int>(width),
+                                                  static_cast<unsigned int>(height), &sizes));
+  state.denoiser_state_size = sizes.stateSizeInBytes;
+  state.denoiser_scratch_size = sizes.withoutOverlapScratchSizeInBytes;
+  CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&state.d_denoiser_state), state.denoiser_state_size));
+  CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&state.d_denoiser_scratch), state.denoiser_scratch_size));
+  CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&state.d_denoiser_intensity), sizeof(float)));
+  CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&state.d_denoised_image),
+                        static_cast<size_t>(width) * static_cast<size_t>(height) * sizeof(float4)));
+  OPTIX_CHECK(optixDenoiserSetup(state.denoiser, 0, static_cast<unsigned int>(width), static_cast<unsigned int>(height),
+                                 state.d_denoiser_state, state.denoiser_state_size, state.d_denoiser_scratch,
+                                 state.denoiser_scratch_size));
+}
+
 static void render_optix_frame(OptixState& optix_state, int width, int height, int rt_samples, int rt_bounces,
                                float cam_yaw, float cam_pitch, float cam_distance, const float cam_target[3],
-                               float cam_fov, bool shadows_enabled, std::vector<uchar4>& host_pixels) {
+                               float cam_fov, bool shadows_enabled, bool denoise_enabled,
+                               std::vector<uchar4>& host_pixels) {
   // Compute camera eye from spherical coordinates
   float yaw_rad = cam_yaw * 3.14159265f / 180.0f;
   float pitch_rad = cam_pitch * 3.14159265f / 180.0f;
@@ -1615,10 +1689,18 @@ static void render_optix_frame(OptixState& optix_state, int width, int height, i
   float3 U = make_float3(W.y * world_up.z - W.z * world_up.y, W.z * world_up.x - W.x * world_up.z,
                          W.x * world_up.y - W.y * world_up.x);
   float u_len = std::sqrt(U.x * U.x + U.y * U.y + U.z * U.z);
+  if (u_len <= 1e-6f) {
+    world_up = make_float3(0.0f, 0.0f, 1.0f);
+    U = make_float3(W.y * world_up.z - W.z * world_up.y, W.z * world_up.x - W.x * world_up.z,
+                    W.x * world_up.y - W.y * world_up.x);
+    u_len = std::sqrt(U.x * U.x + U.y * U.y + U.z * U.z);
+  }
   if (u_len > 1e-6f) {
     U.x /= u_len;
     U.y /= u_len;
     U.z /= u_len;
+  } else {
+    U = make_float3(1.0f, 0.0f, 0.0f);
   }
 
   float3 V = make_float3(U.y * W.z - U.z * W.y, U.z * W.x - U.x * W.z, U.x * W.y - U.y * W.x);
@@ -1635,14 +1717,15 @@ static void render_optix_frame(OptixState& optix_state, int width, int height, i
       CUDA_CHECK(cudaFree(reinterpret_cast<void*>(optix_state.d_image)));
     }
     CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&optix_state.d_image),
-                          static_cast<size_t>(width) * static_cast<size_t>(height) * sizeof(uchar4)));
+                          static_cast<size_t>(width) * static_cast<size_t>(height) * sizeof(float4)));
     optix_state.img_w = width;
     optix_state.img_h = height;
   }
   host_pixels.resize(static_cast<size_t>(width) * static_cast<size_t>(height));
+  std::vector<float4> host_linear(static_cast<size_t>(width) * static_cast<size_t>(height));
 
   Params launch_params = {};
-  launch_params.image = reinterpret_cast<uchar4*>(optix_state.d_image);
+  launch_params.image = reinterpret_cast<float4*>(optix_state.d_image);
   launch_params.image_width = width;
   launch_params.image_height = height;
   launch_params.samples_per_pixel = static_cast<unsigned int>(rt_samples);
@@ -1660,9 +1743,51 @@ static void render_optix_frame(OptixState& optix_state, int width, int height, i
       optixLaunch(optix_state.pipeline, 0, optix_state.d_params, sizeof(Params), &optix_state.sbt, width, height, 1));
   CUDA_CHECK(cudaDeviceSynchronize());
 
-  CUDA_CHECK(cudaMemcpy(host_pixels.data(), reinterpret_cast<void*>(optix_state.d_image),
-                        static_cast<size_t>(width) * static_cast<size_t>(height) * sizeof(uchar4),
+  CUdeviceptr image_to_copy = optix_state.d_image;
+  if (denoise_enabled && optix_state.denoiser_supported && optix_state.denoiser != nullptr) {
+    ensure_denoiser_resources(optix_state, width, height);
+
+    OptixImage2D input_layer = {};
+    input_layer.data = optix_state.d_image;
+    input_layer.width = static_cast<unsigned int>(width);
+    input_layer.height = static_cast<unsigned int>(height);
+    input_layer.rowStrideInBytes = static_cast<unsigned int>(static_cast<size_t>(width) * sizeof(float4));
+    input_layer.pixelStrideInBytes = sizeof(float4);
+    input_layer.format = OPTIX_PIXEL_FORMAT_FLOAT4;
+
+    OptixImage2D output_image = {};
+    output_image.data = optix_state.d_denoised_image;
+    output_image.width = static_cast<unsigned int>(width);
+    output_image.height = static_cast<unsigned int>(height);
+    output_image.rowStrideInBytes = static_cast<unsigned int>(static_cast<size_t>(width) * sizeof(float4));
+    output_image.pixelStrideInBytes = sizeof(float4);
+    output_image.format = OPTIX_PIXEL_FORMAT_FLOAT4;
+
+    OptixDenoiserParams denoiser_params = {};
+    denoiser_params.hdrIntensity = optix_state.d_denoiser_intensity;
+    denoiser_params.blendFactor = 0.0f;
+
+    OptixDenoiserGuideLayer guide_layer = {};
+    OptixDenoiserLayer denoiser_layer = {};
+    denoiser_layer.input = input_layer;
+    denoiser_layer.output = output_image;
+    denoiser_layer.type = OPTIX_DENOISER_AOV_TYPE_BEAUTY;
+
+    OPTIX_CHECK(optixDenoiserComputeIntensity(optix_state.denoiser, 0, &input_layer, optix_state.d_denoiser_intensity,
+                                              optix_state.d_denoiser_scratch, optix_state.denoiser_scratch_size));
+    OPTIX_CHECK(optixDenoiserInvoke(optix_state.denoiser, 0, &denoiser_params, optix_state.d_denoiser_state,
+                                    optix_state.denoiser_state_size, &guide_layer, &denoiser_layer, 1, 0, 0,
+                                    optix_state.d_denoiser_scratch, optix_state.denoiser_scratch_size));
+    CUDA_CHECK(cudaDeviceSynchronize());
+    image_to_copy = optix_state.d_denoised_image;
+  }
+
+  CUDA_CHECK(cudaMemcpy(host_linear.data(), reinterpret_cast<void*>(image_to_copy),
+                        static_cast<size_t>(width) * static_cast<size_t>(height) * sizeof(float4),
                         cudaMemcpyDeviceToHost));
+  for (size_t i = 0; i < host_linear.size(); i++) {
+    host_pixels[i] = linear_to_srgb_uchar4(host_linear[i]);
+  }
 }
 
 static void draw_disc_pixel(std::vector<uchar4>& host_pixels, int width, int height, int px, int py, int radius,
@@ -1734,6 +1859,12 @@ static void overlay_bbox_outline_on_host(std::vector<uchar4>& host_pixels, int w
   float3 cam_right = make_float3(fwd.y * world_up.z - fwd.z * world_up.y, fwd.z * world_up.x - fwd.x * world_up.z,
                                  fwd.x * world_up.y - fwd.y * world_up.x);
   float right_len = std::sqrt(cam_right.x * cam_right.x + cam_right.y * cam_right.y + cam_right.z * cam_right.z);
+  if (right_len <= 1e-6f) {
+    world_up = make_float3(0.0f, 0.0f, 1.0f);
+    cam_right = make_float3(fwd.y * world_up.z - fwd.z * world_up.y, fwd.z * world_up.x - fwd.x * world_up.z,
+                            fwd.x * world_up.y - fwd.y * world_up.x);
+    right_len = std::sqrt(cam_right.x * cam_right.x + cam_right.y * cam_right.y + cam_right.z * cam_right.z);
+  }
   if (right_len <= 1e-6f) {
     return;
   }
@@ -2355,6 +2486,10 @@ static void extract_fluid_mesh(const std::string& density_filepath, const std::s
 
 static void cleanup_optix(OptixState& state) {
   if (state.d_image) cudaFree(reinterpret_cast<void*>(state.d_image));
+  if (state.d_denoised_image) cudaFree(reinterpret_cast<void*>(state.d_denoised_image));
+  if (state.d_denoiser_state) cudaFree(reinterpret_cast<void*>(state.d_denoiser_state));
+  if (state.d_denoiser_scratch) cudaFree(reinterpret_cast<void*>(state.d_denoiser_scratch));
+  if (state.d_denoiser_intensity) cudaFree(reinterpret_cast<void*>(state.d_denoiser_intensity));
   if (state.d_params) cudaFree(reinterpret_cast<void*>(state.d_params));
   if (state.d_gas_temp) cudaFree(reinterpret_cast<void*>(state.d_gas_temp));
   if (state.d_gas_output) cudaFree(reinterpret_cast<void*>(state.d_gas_output));
@@ -2384,6 +2519,7 @@ static void cleanup_optix(OptixState& state) {
   if (state.miss_shadow_pg) optixProgramGroupDestroy(state.miss_shadow_pg);
   if (state.miss_radiance_pg) optixProgramGroupDestroy(state.miss_radiance_pg);
   if (state.raygen_pg) optixProgramGroupDestroy(state.raygen_pg);
+  if (state.denoiser) optixDenoiserDestroy(state.denoiser);
   if (state.module) optixModuleDestroy(state.module);
   if (state.context) optixDeviceContextDestroy(state.context);
 }
@@ -2508,6 +2644,8 @@ int main(int argc, char* argv[]) {
   int& prev_rt_bounces = rt.prev_bounces;
   int& rt_samples = rt.samples;
   int& prev_rt_samples = rt.prev_samples;
+  bool& rt_denoise = rt.denoise;
+  bool& prev_rt_denoise = rt.prev_denoise;
 
   float& cam_yaw = camera.yaw;
   float& cam_pitch = camera.pitch;
@@ -2660,6 +2798,16 @@ int main(int argc, char* argv[]) {
     ImGui::SameLine();
     ImGui::SetNextItemWidth(80);
     input_int_commit_on_enter("##rt_samples", rt_samples, 1, 64);
+    if (optix_state.denoiser_supported) {
+      ImGui::Checkbox("Enable Denoiser", &rt_denoise);
+    } else {
+      bool denoise_disabled = false;
+      ImGui::BeginDisabled();
+      ImGui::Checkbox("Enable Denoiser", &denoise_disabled);
+      ImGui::EndDisabled();
+      ImGui::TextDisabled("OptiX denoiser unavailable.");
+      rt_denoise = false;
+    }
 
     ImGui::Spacing();
     ImGui::Separator();
@@ -3514,7 +3662,7 @@ int main(int argc, char* argv[]) {
 
           if (mesh_loaded && optix_state.gas_handle != 0) {
             render_optix_frame(optix_state, save_image_width, save_image_height, rt_samples, rt_bounces, cam_yaw,
-                               cam_pitch, cam_distance, cam_target, cam_fov, shadows_enabled, host_pixels);
+                               cam_pitch, cam_distance, cam_target, cam_fov, shadows_enabled, rt_denoise, host_pixels);
           } else {
             render_background_to_host(save_image_width, save_image_height, bg_color, host_pixels);
           }
@@ -3929,7 +4077,7 @@ int main(int argc, char* argv[]) {
 
     // Detect background color / render settings change
     if (bg_color.x != prev_bg_color.x || bg_color.y != prev_bg_color.y || bg_color.z != prev_bg_color.z ||
-        rt_samples != prev_rt_samples || rt_bounces != prev_rt_bounces) {
+        rt_samples != prev_rt_samples || rt_bounces != prev_rt_bounces || rt_denoise != prev_rt_denoise) {
       if (render_any && mesh_loaded) {
         update_miss_sbt(optix_state, bg_color);
       }
@@ -3937,6 +4085,7 @@ int main(int argc, char* argv[]) {
       prev_bg_color = bg_color;
       prev_rt_samples = rt_samples;
       prev_rt_bounces = rt_bounces;
+      prev_rt_denoise = rt_denoise;
     }
 
     // Detect material/light changes (cheap SBT update, no GAS rebuild)
@@ -4065,7 +4214,8 @@ int main(int argc, char* argv[]) {
         ImVec2 delta = io.MouseDelta;
         cam_yaw -= delta.x * 0.3f;
         cam_pitch += delta.y * 0.3f;
-        cam_pitch = std::max(-89.0f, std::min(89.0f, cam_pitch));
+        cam_yaw = std::remainder(cam_yaw, 360.0f);
+        cam_pitch = std::remainder(cam_pitch, 360.0f);
         viewport_needs_render = true;
       }
 
@@ -4084,6 +4234,13 @@ int main(int argc, char* argv[]) {
                                    forward.z * world_up.x - forward.x * world_up.z,
                                    forward.x * world_up.y - forward.y * world_up.x);
         float right_len = std::sqrt(right.x * right.x + right.y * right.y + right.z * right.z);
+        if (right_len <= 1e-6f) {
+          world_up = make_float3(0.0f, 0.0f, 1.0f);
+          right = make_float3(forward.y * world_up.z - forward.z * world_up.y,
+                              forward.z * world_up.x - forward.x * world_up.z,
+                              forward.x * world_up.y - forward.y * world_up.x);
+          right_len = std::sqrt(right.x * right.x + right.y * right.y + right.z * right.z);
+        }
         if (right_len > 1e-6f) {
           right.x /= right_len;
           right.y /= right_len;
@@ -4129,7 +4286,7 @@ int main(int argc, char* argv[]) {
       viewport_needs_render = false;
       try {
         render_optix_frame(optix_state, vp_w, vp_h, rt_samples, rt_bounces, cam_yaw, cam_pitch, cam_distance,
-                           cam_target, cam_fov, shadows_enabled, host_pixels);
+                           cam_target, cam_fov, shadows_enabled, rt_denoise, host_pixels);
 
         // Upload to SDL texture
         void* tex_pixels = nullptr;
@@ -4250,7 +4407,7 @@ int main(int argc, char* argv[]) {
 
               if (render_any && mesh_loaded && optix_state.gas_handle != 0) {
                 render_optix_frame(optix_state, animation_export.width, animation_export.height, rt_samples, rt_bounces,
-                                   cam_yaw, cam_pitch, cam_distance, cam_target, cam_fov, shadows_enabled,
+                                   cam_yaw, cam_pitch, cam_distance, cam_target, cam_fov, shadows_enabled, rt_denoise,
                                    animation_export.export_pixels);
               } else {
                 render_background_to_host(animation_export.width, animation_export.height, bg_color,
@@ -4310,6 +4467,12 @@ int main(int argc, char* argv[]) {
         float3 cam_right = make_float3(fwd.y * world_up.z - fwd.z * world_up.y, fwd.z * world_up.x - fwd.x * world_up.z,
                                        fwd.x * world_up.y - fwd.y * world_up.x);
         float cr_len = std::sqrt(cam_right.x * cam_right.x + cam_right.y * cam_right.y + cam_right.z * cam_right.z);
+        if (cr_len <= 1e-6f) {
+          world_up = make_float3(0.0f, 0.0f, 1.0f);
+          cam_right = make_float3(fwd.y * world_up.z - fwd.z * world_up.y, fwd.z * world_up.x - fwd.x * world_up.z,
+                                  fwd.x * world_up.y - fwd.y * world_up.x);
+          cr_len = std::sqrt(cam_right.x * cam_right.x + cam_right.y * cam_right.y + cam_right.z * cam_right.z);
+        }
         if (cr_len > 1e-6f) {
           cam_right.x /= cr_len;
           cam_right.y /= cr_len;

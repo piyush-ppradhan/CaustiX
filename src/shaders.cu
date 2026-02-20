@@ -70,15 +70,6 @@ static __forceinline__ __device__ float clampf(float x, float lo, float hi) {
   return fminf(fmaxf(x, lo), hi);
 }
 
-static __forceinline__ __device__ uchar4 make_color(float3 c) {
-  // Clamp and apply sRGB gamma
-  float r = powf(clampf(c.x, 0.0f, 1.0f), 1.0f / 2.2f);
-  float g = powf(clampf(c.y, 0.0f, 1.0f), 1.0f / 2.2f);
-  float b = powf(clampf(c.z, 0.0f, 1.0f), 1.0f / 2.2f);
-  return make_uchar4((unsigned char)(r * 255.0f + 0.5f), (unsigned char)(g * 255.0f + 0.5f),
-                     (unsigned char)(b * 255.0f + 0.5f), 255u);
-}
-
 // --- Payload helpers (4 payload values: RGB color + depth) ---
 
 static __forceinline__ __device__ void setPayload(float3 p) {
@@ -207,7 +198,7 @@ extern "C" __global__ void __raygen__rg() {
   }
 
   float3 result = accum * (1.0f / static_cast<float>(spp));
-  params.image[idx.y * params.image_width + idx.x] = make_color(result);
+  params.image[idx.y * params.image_width + idx.x] = make_float4(result.x, result.y, result.z, 1.0f);
 }
 
 // --- Miss programs ---
