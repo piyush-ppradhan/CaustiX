@@ -1,6 +1,6 @@
 # CaustiX
 
-CaustiX is a GPU ray-traced visualization app for VTK datasets.
+CaustiX is a GPU ray-traced visualization app for VTK datasets and XDMF datasets backed by HDF5.
 It extracts and renders surfaces from scalar fields for both solid masks and fluid regions.
 
 <p align="center">
@@ -10,6 +10,7 @@ It extracts and renders surfaces from scalar fields for both solid masks and flu
 ## Features
 
 - VTK dataset loading and frame navigation
+- XDMF/HDF5 dataset loading for files produced by `save_fields_hdf5_xdmf` in `test.py`
 - Mask surface extraction from scalar fields (`Solid Flag - 0.5` isovalue)
 - Fluid surface extraction from scalar cell fields using:
   - dataset frame selected in `Render > Dataset`
@@ -26,7 +27,7 @@ It extracts and renders surfaces from scalar fields for both solid masks and flu
 ## Requirements
 
 - Linux
-- CMake 3.15+
+- CMake 3.26+
 - CUDA Toolkit 13.1+
 - NVIDIA OptiX SDK 9.1.0
 - NVIDIA GPU
@@ -51,7 +52,8 @@ Outputs:
 ## Quick Start
 
 1. Open a dataset folder from `Render > Dataset > Open`.
-2. In `Render:Mask`, choose a mask `.vtk` and select the mask field.
+   Supported sequence entries are `.vtk` and per-timestep `.xdmf`. `_series.xdmf` is ignored during folder scans.
+2. In `Render:Mask`, choose a mask `.vtk` or `.xdmf` and select the mask field.
 3. Enable `Show` in `Render:Mask` to render solids.
 4. In `Render:Data`:
    - click `Add` and choose a scalar **cell** array
@@ -119,6 +121,8 @@ Config files (`.cfg`) store:
 - Fluid extraction uses the mask field selected in `Render:Mask`.
 - Points with `mask == Fluid Flag` are treated as fluid candidates.
 - Thresholding is then applied to the selected data field to build the fluid surface.
+- For XDMF input, point the UI at the `.xdmf` file. The app reads the referenced `.hdf5` arrays automatically.
+- XDMF support is intentionally narrow: it targets the dense cell-centered layout written by `save_fields_hdf5_xdmf` in `test.py`, including static fields referenced from separate HDF5 files.
 
 ## Troubleshooting
 
@@ -140,10 +144,13 @@ Config files (`.cfg`) store:
 - Assimp is built with only required importers enabled:
   - `OBJ`, `STL`, `PLY`, `FBX`, `GLTF`
 - Exporters, tools, docs, tests, samples, and Draco are disabled in CMake.
+- HDF5 is built in-tree as a static dependency with only the core C library enabled.
+- TinyXML2 is used to parse XDMF metadata.
 
 ## Repository Layout
 
 - `src/main.cpp`: app loop, UI, extraction, OptiX host setup
+- `src/dataset_io.cpp`: VTK + XDMF/HDF5 dataset inspection and loading
 - `src/shaders.cu`: raygen/miss/mesh/ground shaders
 - `src/fluid_shading.cuh`: fluid closest-hit shader (surface-based)
 - `src/optix_params.h`: shared launch/SBT structs

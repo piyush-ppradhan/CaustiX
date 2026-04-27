@@ -5,10 +5,10 @@
 #include <imgui_impl_sdl3.h>
 #include <imgui_impl_sdlrenderer3.h>
 #include <ImGuiFileDialog.h>
+#include "dataset_io.h"
 #include <assimp/Importer.hpp>
 #include <assimp/postprocess.h>
 #include <assimp/scene.h>
-#include <viskores/io/VTKDataSetReader.h>
 #include <viskores/cont/DataSet.h>
 #include <viskores/cont/Field.h>
 #include <viskores/cont/CellSetStructured.h>
@@ -952,72 +952,6 @@ static bool input_float_commit_on_enter(const char* label, float& value, float m
   return committed;
 }
 
-static bool replace_all_padded(std::string& text, const std::string& token, const std::string& replacement) {
-  if (replacement.size() > token.size()) {
-    return false;
-  }
-  bool changed = false;
-  std::string padded = replacement + std::string(token.size() - replacement.size(), ' ');
-  size_t pos = 0;
-  while ((pos = text.find(token, pos)) != std::string::npos) {
-    text.replace(pos, token.size(), padded);
-    pos += padded.size();
-    changed = true;
-  }
-  return changed;
-}
-
-static bool normalize_legacy_vtk_binary(std::string& bytes) {
-  bool changed = false;
-  changed = replace_all_padded(bytes, "vtk DataFile Version 5.1", "vtk DataFile Version 4.2") || changed;
-  changed = replace_all_padded(bytes, "signed_char", "char") || changed;
-  changed = replace_all_padded(bytes, "vtktypeint64", "long") || changed;
-  changed = replace_all_padded(bytes, "vtktypeint32", "int") || changed;
-  changed = replace_all_padded(bytes, "vtktypeuint8", "unsigned_char") || changed;
-  return changed;
-}
-
-static viskores::cont::DataSet read_vtk_dataset_with_compat(const std::string& vtk_file) {
-  viskores::io::VTKDataSetReader reader(vtk_file);
-  try {
-    return reader.ReadDataSet();
-  } catch (const viskores::io::ErrorIO&) {
-    std::ifstream in(vtk_file, std::ios::binary);
-    if (!in.is_open()) {
-      throw;
-    }
-    std::string bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-    if (bytes.empty()) {
-      throw;
-    }
-    if (!normalize_legacy_vtk_binary(bytes)) {
-      throw;
-    }
-
-    std::filesystem::path temp_path = std::filesystem::path("/tmp") /
-                                      ("caustix_compat_" + std::to_string(std::hash<std::string>{}(vtk_file)) + ".vtk");
-    {
-      std::ofstream out(temp_path, std::ios::binary | std::ios::trunc);
-      out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
-      if (!out.good()) {
-        throw;
-      }
-    }
-
-    try {
-      viskores::io::VTKDataSetReader compat_reader(temp_path.string());
-      viskores::cont::DataSet converted = compat_reader.ReadDataSet();
-      std::error_code remove_ec;
-      std::filesystem::remove(temp_path, remove_ec);
-      return converted;
-    } catch (...) {
-      std::error_code remove_ec;
-      std::filesystem::remove(temp_path, remove_ec);
-      throw;
-    }
-  }
-}
-
 static bool load_dataset_field_lists(const std::string& vtk_file, std::vector<std::string>& all_field_names,
                                      std::vector<std::string>& scalar_cell_field_names) {
   all_field_names.clear();
@@ -1025,22 +959,9 @@ static bool load_dataset_field_lists(const std::string& vtk_file, std::vector<st
   if (vtk_file.empty()) {
     return false;
   }
-
-  viskores::cont::DataSet ds = read_vtk_dataset_with_compat(vtk_file);
-
-  for (viskores::IdComponent i = 0; i < ds.GetNumberOfFields(); i++) {
-    const auto& field = ds.GetField(i);
-    if (field.IsPointField() || field.IsCellField()) {
-      all_field_names.push_back(field.GetName());
-    }
-    if (!field.IsCellField()) {
-      continue;
-    }
-    if (field.GetData().GetNumberOfComponentsFlat() != 1) {
-      continue;
-    }
-    scalar_cell_field_names.push_back(field.GetName());
-  }
+  DatasetFileInfo info = inspect_dataset_file(vtk_file);
+  all_field_names = info.all_field_names;
+  scalar_cell_field_names = info.scalar_cell_field_names;
   return true;
 }
 
@@ -2186,7 +2107,7 @@ static bool load_global_config_file(const std::string& filepath, ImVec4& bg_colo
 
 static void extract_mesh(const std::string& mask_filepath, const std::string& field_name, int solid_val,
                          MeshCache& mesh_cache) {
-  viskores::cont::DataSet ds = read_vtk_dataset_with_compat(mask_filepath);
+  viskores::cont::DataSet ds = read_dataset_with_compat(mask_filepath);
 
   auto selectedField = ds.GetField(field_name);
   if (selectedField.GetData().GetNumberOfComponentsFlat() != 1) {
@@ -2301,10 +2222,10 @@ static void extract_fluid_mesh(const std::string& density_filepath, const std::s
                                float density_threshold_min, float density_threshold_max,
                                const std::string& mask_filepath, const std::string& mask_field_name, int fluid_flag,
                                MeshCache& mesh_cache) {
-  viskores::cont::DataSet density_ds = read_vtk_dataset_with_compat(density_filepath);
+  viskores::cont::DataSet density_ds = read_dataset_with_compat(density_filepath);
   viskores::cont::DataSet mask_ds = density_ds;
   if (mask_filepath != density_filepath) {
-    mask_ds = read_vtk_dataset_with_compat(mask_filepath);
+    mask_ds = read_dataset_with_compat(mask_filepath);
   }
 
   viskores::cont::Field density_field;
@@ -3174,7 +3095,7 @@ int main(int argc, char* argv[]) {
     if (ImGui::Button("Open##mask")) {
       IGFD::FileDialogConfig mask_config;
       mask_config.path = vtk_dir;
-      ImGuiFileDialog::Instance()->OpenDialog("OpenMaskDlg", "Open Mask", ".vtk", mask_config);
+      ImGuiFileDialog::Instance()->OpenDialog("OpenMaskDlg", "Open Mask", ".vtk,.xdmf", mask_config);
     }
     ImGui::SameLine();
     if (ImGui::Button("Clear##mask")) {
@@ -3534,7 +3455,7 @@ int main(int argc, char* argv[]) {
         vtk_dir = ImGuiFileDialog::Instance()->GetCurrentPath();
         vtk_files.clear();
         for (auto& entry : std::filesystem::directory_iterator(vtk_dir)) {
-          if (entry.is_regular_file() && entry.path().extension() == ".vtk") {
+          if (entry.is_regular_file() && is_supported_dataset_sequence_entry(entry.path())) {
             vtk_files.push_back(entry.path().string());
           }
         }
@@ -3569,16 +3490,9 @@ int main(int argc, char* argv[]) {
         std::string selected_file = ImGuiFileDialog::Instance()->GetFilePathName();
 
         try {
-          viskores::cont::DataSet mask_dataset = read_vtk_dataset_with_compat(selected_file);
+          DatasetFileInfo mask_info = inspect_dataset_file(selected_file);
 
-          bool is_3d = true;
-          auto cellSet = mask_dataset.GetCellSet();
-          if (cellSet.CanConvert<viskores::cont::CellSetStructured<1>>() ||
-              cellSet.CanConvert<viskores::cont::CellSetStructured<2>>()) {
-            is_3d = false;
-          }
-
-          if (!is_3d) {
+          if (!mask_info.is_3d) {
             show_mask_error = true;
             mask_error_msg = "Only 3D files are supported.";
           } else {
@@ -3590,12 +3504,7 @@ int main(int argc, char* argv[]) {
               layer_cache.Clear();
             }
             mesh_loaded = false;
-            for (viskores::IdComponent i = 0; i < mask_dataset.GetNumberOfFields(); i++) {
-              const auto& field = mask_dataset.GetField(i);
-              if (field.IsPointField() || field.IsCellField()) {
-                mask_field_names.push_back(field.GetName());
-              }
-            }
+            mask_field_names = mask_info.all_field_names;
             // Auto-select field containing "mask" (case-insensitive)
             for (int i = 0; i < (int)mask_field_names.size(); i++) {
               std::string lower_name = mask_field_names[i];
@@ -3607,12 +3516,9 @@ int main(int argc, char* argv[]) {
               }
             }
           }
-        } catch (const viskores::io::ErrorIO& e) {
+        } catch (const std::exception& e) {
           show_mask_error = true;
           mask_error_msg = std::string("Failed to read file: ") + e.what();
-        } catch (...) {
-          show_mask_error = true;
-          mask_error_msg = "Failed to read file as a VTK dataset.";
         }
       }
       ImGuiFileDialog::Instance()->Close();

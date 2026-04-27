@@ -17,3 +17,9 @@
 [submodule "lib/assimp"]
 	path = lib/assimp
 	url = https://github.com/assimp/assimp
+[submodule "lib/hdf5"]
+	path = lib/hdf5
+	url = https://github.com/HDFGroup/hdf5
+[submodule "lib/tinyxml2"]
+	path = lib/tinyxml2
+	url = https://github.com/leethomason/tinyxml2
