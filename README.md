@@ -27,7 +27,7 @@ It extracts and renders surfaces from scalar fields for both solid masks and flu
 ## Requirements
 
 - Linux
-- CMake 3.26+
+- CMake 3.25+
 - CUDA Toolkit 13.1+
 - NVIDIA OptiX SDK 9.1.0
 - NVIDIA GPU
@@ -53,7 +53,9 @@ Outputs:
 
 1. Open a dataset folder from `Render > Dataset > Open`.
    Supported sequence entries are `.vtk` and per-timestep `.xdmf`. `_series.xdmf` is ignored during folder scans.
-2. In `Render:Mask`, choose a mask `.vtk` or `.xdmf` and select the mask field.
+2. In `Render:Mask`, either:
+   - choose a mask `.vtk` or `.xdmf`, or
+   - click `Use Dataset` to use fields from the current dataset frame, including static XDMF/HDF5 fields when present.
 3. Enable `Show` in `Render:Mask` to render solids.
 4. In `Render:Data`:
    - click `Add` and choose a scalar **cell** array
@@ -93,7 +95,7 @@ Config files (`.cfg`) store:
 
 ### Render:Mask
 
-- `File`, `Field`, `Solid Flag`, `Show`
+- `File`, `Use Dataset`, `Field`, `Solid Flag`, `Show`
 - Material: `Color`, `Metallic`, `Roughness`, `Opacity`, `Glass IOR`
 - Smoothing: `Smoothing`, `Smooth Strength`
 - `Render:Geometry` appears below this section in the Render panel
@@ -119,6 +121,7 @@ Config files (`.cfg`) store:
 ## Notes
 
 - Fluid extraction uses the mask field selected in `Render:Mask`.
+- When `Use Dataset` is active, the current dataset frame is also used as the mask source.
 - Points with `mask == Fluid Flag` are treated as fluid candidates.
 - Thresholding is then applied to the selected data field to build the fluid surface.
 - For XDMF input, point the UI at the `.xdmf` file. The app reads the referenced `.hdf5` arrays automatically.
@@ -130,7 +133,7 @@ Config files (`.cfg`) store:
   - ensure the selected mask field is scalar
   - ensure the dataset is 3D
 - If fluid extraction fails:
-  - ensure `Render:Mask` has a valid mask file/field
+  - ensure `Render:Mask` has a valid mask file/field or `Use Dataset` is enabled
   - ensure selected `Render:Data` field is scalar cell data
   - ensure `Threshold Min/Max` includes values present in fluid regions
   - ensure `Fluid Flag` matches the fluid label in the mask

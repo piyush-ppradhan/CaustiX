@@ -75,6 +75,7 @@ static char optix_log[2048];
 static size_t optix_log_size = sizeof(optix_log);
 static constexpr float kDefaultDataThresholdMin = 0.5f;
 static constexpr float kDefaultDataThresholdMax = 1.0f;
+static constexpr const char* kCurrentDatasetMaskSource = "__caustix_current_dataset__";
 
 #define OPTIX_CHECK_LOG(call)                                    \
   do {                                                           \
@@ -158,6 +159,8 @@ struct GpuMeshBuffers {
 struct MeshCache {
   std::string source_file;
   std::string source_field;
+  std::string source_mask_file;
+  std::string source_mask_field;
   int source_solid_flag = 1;
   std::vector<float3> base_positions;
   std::vector<float3> base_normals;
@@ -167,6 +170,8 @@ struct MeshCache {
   void Clear() {
     source_file.clear();
     source_field.clear();
+    source_mask_file.clear();
+    source_mask_field.clear();
     source_solid_flag = 1;
     base_positions.clear();
     base_normals.clear();
@@ -963,6 +968,53 @@ static bool load_dataset_field_lists(const std::string& vtk_file, std::vector<st
   all_field_names = info.all_field_names;
   scalar_cell_field_names = info.scalar_cell_field_names;
   return true;
+}
+
+static bool mask_uses_current_dataset(const std::string& mask_file) {
+  return mask_file == kCurrentDatasetMaskSource;
+}
+
+static std::string resolve_mask_source_file(const std::string& mask_file, const std::string& current_dataset_file) {
+  return mask_uses_current_dataset(mask_file) ? current_dataset_file : mask_file;
+}
+
+static int find_mask_field_index_by_name(const std::vector<std::string>& field_names, const std::string& target_name) {
+  for (size_t i = 0; i < field_names.size(); i++) {
+    if (field_names[i] == target_name) {
+      return static_cast<int>(i);
+    }
+  }
+  return -1;
+}
+
+static int pick_default_mask_field_index(const std::vector<std::string>& field_names) {
+  for (size_t i = 0; i < field_names.size(); i++) {
+    std::string lower_name = field_names[i];
+    std::transform(lower_name.begin(), lower_name.end(), lower_name.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (lower_name.find("mask") != std::string::npos) {
+      return static_cast<int>(i);
+    }
+  }
+  return field_names.empty() ? 0 : 0;
+}
+
+static void sync_mask_selection_from_dataset(const std::vector<std::string>& dataset_field_names, std::string& mask_file,
+                                             std::vector<std::string>& mask_field_names, int& mask_field_index) {
+  std::string previous_name;
+  if (mask_field_index >= 0 && mask_field_index < static_cast<int>(mask_field_names.size())) {
+    previous_name = mask_field_names[static_cast<size_t>(mask_field_index)];
+  }
+
+  mask_file = kCurrentDatasetMaskSource;
+  mask_field_names = dataset_field_names;
+  if (mask_field_names.empty()) {
+    mask_field_index = 0;
+    return;
+  }
+
+  int matched_index = previous_name.empty() ? -1 : find_mask_field_index_by_name(mask_field_names, previous_name);
+  mask_field_index = (matched_index >= 0) ? matched_index : pick_default_mask_field_index(mask_field_names);
 }
 
 static viskores::cont::ArrayHandle<int> cast_scalar_field_to_int32(const viskores::cont::Field& field,
@@ -2211,6 +2263,8 @@ static void extract_mesh(const std::string& mask_filepath, const std::string& fi
 
   mesh_cache.source_file = mask_filepath;
   mesh_cache.source_field = field_name;
+  mesh_cache.source_mask_file.clear();
+  mesh_cache.source_mask_field.clear();
   mesh_cache.source_solid_flag = solid_val;
   mesh_cache.base_positions = std::move(positions);
   mesh_cache.base_normals = std::move(normal_data);
@@ -2448,6 +2502,8 @@ static void extract_fluid_mesh(const std::string& density_filepath, const std::s
 
   mesh_cache.source_file = density_filepath;
   mesh_cache.source_field = density_field_name;
+  mesh_cache.source_mask_file = mask_filepath;
+  mesh_cache.source_mask_field = mask_field_name;
   mesh_cache.source_solid_flag = fluid_flag;
   mesh_cache.base_positions = std::move(positions);
   mesh_cache.base_normals = std::move(normal_data);
@@ -3031,12 +3087,19 @@ int main(int argc, char* argv[]) {
       if (dataset_loaded_field_vtk_index != vtk_index) {
         try {
           if (load_dataset_field_lists(vtk_files[vtk_index], dataset_cell_names, dataset_scalar_cell_names)) {
+            if (mask_uses_current_dataset(mask_file)) {
+              sync_mask_selection_from_dataset(dataset_cell_names, mask_file, mask_field_names, mask_field_index);
+            }
             for (auto& layer_cache : data_layer_mesh_caches) {
               layer_cache.Clear();
             }
             dataset_loaded_field_vtk_index = vtk_index;
           } else {
             dataset_loaded_field_vtk_index = -1;
+            if (mask_uses_current_dataset(mask_file)) {
+              mask_field_names.clear();
+              mask_field_index = 0;
+            }
             for (auto& layer_cache : data_layer_mesh_caches) {
               layer_cache.Clear();
             }
@@ -3045,6 +3108,10 @@ int main(int argc, char* argv[]) {
           dataset_cell_names.clear();
           dataset_scalar_cell_names.clear();
           dataset_loaded_field_vtk_index = -1;
+          if (mask_uses_current_dataset(mask_file)) {
+            mask_field_names.clear();
+            mask_field_index = 0;
+          }
           for (auto& layer_cache : data_layer_mesh_caches) {
             layer_cache.Clear();
           }
@@ -3054,6 +3121,11 @@ int main(int argc, char* argv[]) {
       dataset_cell_names.clear();
       dataset_scalar_cell_names.clear();
       dataset_loaded_field_vtk_index = -1;
+      if (mask_uses_current_dataset(mask_file)) {
+        mask_file.clear();
+        mask_field_names.clear();
+        mask_field_index = 0;
+      }
     }
     ImGui::Spacing();
     ImGui::Separator();
@@ -3098,6 +3170,17 @@ int main(int argc, char* argv[]) {
       ImGuiFileDialog::Instance()->OpenDialog("OpenMaskDlg", "Open Mask", ".vtk,.xdmf", mask_config);
     }
     ImGui::SameLine();
+    if (ImGui::Button("Use Dataset##mask")) {
+      if (!vtk_files.empty() && vtk_index >= 0 && vtk_index < static_cast<int>(vtk_files.size())) {
+        sync_mask_selection_from_dataset(dataset_cell_names, mask_file, mask_field_names, mask_field_index);
+        mask_mesh_cache.Clear();
+        for (auto& layer_cache : data_layer_mesh_caches) {
+          layer_cache.Clear();
+        }
+        mesh_loaded = false;
+      }
+    }
+    ImGui::SameLine();
     if (ImGui::Button("Clear##mask")) {
       mask_file.clear();
       mask_field_names.clear();
@@ -3110,7 +3193,15 @@ int main(int argc, char* argv[]) {
     }
 
     if (!mask_file.empty()) {
-      ImGui::TextWrapped("%s", std::filesystem::path(mask_file).filename().string().c_str());
+      if (mask_uses_current_dataset(mask_file)) {
+        std::string dataset_name = "<none>";
+        if (!vtk_files.empty() && vtk_index >= 0 && vtk_index < static_cast<int>(vtk_files.size())) {
+          dataset_name = std::filesystem::path(vtk_files[static_cast<size_t>(vtk_index)]).filename().string();
+        }
+        ImGui::TextWrapped("Current Dataset: %s", dataset_name.c_str());
+      } else {
+        ImGui::TextWrapped("%s", std::filesystem::path(mask_file).filename().string().c_str());
+      }
     }
 
     if (!mask_field_names.empty()) {
@@ -3470,6 +3561,9 @@ int main(int argc, char* argv[]) {
         if (!vtk_files.empty()) {
           try {
             if (load_dataset_field_lists(vtk_files[vtk_index], dataset_cell_names, dataset_scalar_cell_names)) {
+              if (mask_uses_current_dataset(mask_file) || mask_file.empty()) {
+                sync_mask_selection_from_dataset(dataset_cell_names, mask_file, mask_field_names, mask_field_index);
+              }
               dataset_loaded_field_vtk_index = vtk_index;
             }
           } catch (...) {
@@ -3478,6 +3572,11 @@ int main(int argc, char* argv[]) {
             data_layers.clear();
             data_layer_mesh_caches.clear();
             dataset_loaded_field_vtk_index = -1;
+            if (mask_uses_current_dataset(mask_file)) {
+              mask_file.clear();
+              mask_field_names.clear();
+              mask_field_index = 0;
+            }
           }
         }
       }
@@ -3505,16 +3604,7 @@ int main(int argc, char* argv[]) {
             }
             mesh_loaded = false;
             mask_field_names = mask_info.all_field_names;
-            // Auto-select field containing "mask" (case-insensitive)
-            for (int i = 0; i < (int)mask_field_names.size(); i++) {
-              std::string lower_name = mask_field_names[i];
-              std::transform(lower_name.begin(), lower_name.end(), lower_name.begin(),
-                             [](unsigned char c) { return std::tolower(c); });
-              if (lower_name.find("mask") != std::string::npos) {
-                mask_field_index = i;
-                break;
-              }
-            }
+            mask_field_index = pick_default_mask_field_index(mask_field_names);
           }
         } catch (const std::exception& e) {
           show_mask_error = true;
@@ -3792,16 +3882,17 @@ int main(int argc, char* argv[]) {
     bool ground_toggled = (ground_enabled != prev_ground_enabled);
     bool ground_offset_changed = (ground_y_offset != prev_ground_y_offset);
 
-    bool has_mask_selection = !mask_file.empty() && !mask_field_names.empty() && mask_field_index >= 0 &&
-                              mask_field_index < static_cast<int>(mask_field_names.size());
-    std::string selected_mask_field = has_mask_selection ? mask_field_names[mask_field_index] : std::string();
     std::string fluid_source_file =
         (!vtk_files.empty() && vtk_index >= 0 && vtk_index < static_cast<int>(vtk_files.size())) ? vtk_files[vtk_index]
                                                                                                  : std::string();
+    std::string resolved_mask_file = resolve_mask_source_file(mask_file, fluid_source_file);
+    bool has_mask_selection = !resolved_mask_file.empty() && !mask_field_names.empty() && mask_field_index >= 0 &&
+                              mask_field_index < static_cast<int>(mask_field_names.size());
+    std::string selected_mask_field = has_mask_selection ? mask_field_names[mask_field_index] : std::string();
 
     bool wants_mask = show_mask && has_mask_selection;
     bool mask_cache_matches_selection =
-        wants_mask && mask_mesh_cache.valid && mask_mesh_cache.source_file == mask_file &&
+        wants_mask && mask_mesh_cache.valid && mask_mesh_cache.source_file == resolved_mask_file &&
         mask_mesh_cache.source_field == selected_mask_field && mask_mesh_cache.source_solid_flag == solid_flag;
     bool needs_mask_extract = wants_mask && (mask_selection_changed || !mask_cache_matches_selection);
 
@@ -3860,7 +3951,7 @@ int main(int argc, char* argv[]) {
 
       state.same_failed_request =
           state.renderable && layer.suppress_retry_after_error && layer.failed_source_file == fluid_source_file &&
-          layer.failed_mask_file == mask_file && layer.failed_mask_field == selected_mask_field &&
+          layer.failed_mask_file == resolved_mask_file && layer.failed_mask_field == selected_mask_field &&
           layer.failed_field_name == layer.name && layer.failed_fluid_flag == layer.fluid_flag &&
           std::fabs(layer.failed_threshold_min - layer.threshold_min) <= 1e-5f &&
           std::fabs(layer.failed_threshold_max - layer.threshold_max) <= 1e-5f;
@@ -3870,7 +3961,9 @@ int main(int argc, char* argv[]) {
       }
 
       state.cache_matches = state.renderable && layer_cache.valid && layer_cache.source_file == fluid_source_file &&
-                            layer_cache.source_field == layer.name && layer_cache.source_solid_flag == layer.fluid_flag;
+                            layer_cache.source_field == layer.name && layer_cache.source_mask_file == resolved_mask_file &&
+                            layer_cache.source_mask_field == selected_mask_field &&
+                            layer_cache.source_solid_flag == layer.fluid_flag;
       state.needs_extract =
           state.renderable && !state.same_failed_request && (!state.cache_matches || state.threshold_changed);
 
@@ -3910,7 +4003,7 @@ int main(int argc, char* argv[]) {
     if (needs_mask_extract) {
       extraction_attempted = true;
       try {
-        extract_mesh(mask_file, selected_mask_field, solid_flag, mask_mesh_cache);
+        extract_mesh(resolved_mask_file, selected_mask_field, solid_flag, mask_mesh_cache);
       } catch (const std::exception& e) {
         show_mask_error = true;
         mask_error_msg = std::string("Mesh extraction failed: ") + e.what();
@@ -3930,7 +4023,7 @@ int main(int argc, char* argv[]) {
       DataLayer& layer = data_layers[i];
       MeshCache& layer_cache = data_layer_mesh_caches[i];
       try {
-        extract_fluid_mesh(fluid_source_file, layer.name, layer.threshold_min, layer.threshold_max, mask_file,
+        extract_fluid_mesh(fluid_source_file, layer.name, layer.threshold_min, layer.threshold_max, resolved_mask_file,
                            selected_mask_field, layer.fluid_flag, layer_cache);
         layer.suppress_retry_after_error = false;
       } catch (const std::exception& e) {
@@ -3939,7 +4032,7 @@ int main(int argc, char* argv[]) {
         layer_cache.Clear();
         layer.suppress_retry_after_error = true;
         layer.failed_source_file = fluid_source_file;
-        layer.failed_mask_file = mask_file;
+        layer.failed_mask_file = resolved_mask_file;
         layer.failed_mask_field = selected_mask_field;
         layer.failed_field_name = layer.name;
         layer.failed_fluid_flag = layer.fluid_flag;
@@ -3951,7 +4044,7 @@ int main(int argc, char* argv[]) {
         layer_cache.Clear();
         layer.suppress_retry_after_error = true;
         layer.failed_source_file = fluid_source_file;
-        layer.failed_mask_file = mask_file;
+        layer.failed_mask_file = resolved_mask_file;
         layer.failed_mask_field = selected_mask_field;
         layer.failed_field_name = layer.name;
         layer.failed_fluid_flag = layer.fluid_flag;
