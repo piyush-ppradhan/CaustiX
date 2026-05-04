@@ -891,8 +891,21 @@ static void apply_geometry_rotation(std::vector<float3>& positions, std::vector<
   float sy = std::sin(ry), cy = std::cos(ry);
   float sz = std::sin(rz), cz = std::cos(rz);
 
+  float3 lo = make_float3(1e30f, 1e30f, 1e30f);
+  float3 hi = make_float3(-1e30f, -1e30f, -1e30f);
+  for (const auto& p : positions) {
+    lo.x = std::min(lo.x, p.x);
+    lo.y = std::min(lo.y, p.y);
+    lo.z = std::min(lo.z, p.z);
+    hi.x = std::max(hi.x, p.x);
+    hi.y = std::max(hi.y, p.y);
+    hi.z = std::max(hi.z, p.z);
+  }
+  float3 pivot = make_float3((lo.x + hi.x) * 0.5f, (lo.y + hi.y) * 0.5f, (lo.z + hi.z) * 0.5f);
   for (auto& p : positions) {
-    p = rotate_euler_xyz(p, sx, cx, sy, cy, sz, cz);
+    float3 centered = make_float3(p.x - pivot.x, p.y - pivot.y, p.z - pivot.z);
+    centered = rotate_euler_xyz(centered, sx, cx, sy, cy, sz, cz);
+    p = make_float3(centered.x + pivot.x, centered.y + pivot.y, centered.z + pivot.z);
   }
   for (auto& n : normals) {
     n = rotate_euler_xyz(n, sx, cx, sy, cy, sz, cz);

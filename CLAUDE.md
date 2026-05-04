@@ -198,7 +198,7 @@ No volumetric texture upload or ray marching is used in the current design.
 
 ### Animation Export
 
-- Optional geometry rotation during export applies to global `Rotate X/Y/Z`.
+- Optional geometry rotation during export applies to global `Rotate X/Y/Z` around mesh center.
 - Rotation uses selected axis and degrees-per-frame rate; invalid axis/rate reset to sane defaults.
 - Original global rotation is restored after export success, failure, or cancel.
 
