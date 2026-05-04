@@ -82,6 +82,7 @@ add_executable(${CMAKE_PROJECT_NAME}
 	src/main.cpp
 	src/dataset_io.cpp
 	src/stb_image_write_impl.cpp
+	src/stb_truetype_impl.cpp
 	${IMGUI_DIR}/imgui.cpp
 	${IMGUI_DIR}/imgui_draw.cpp
 	${IMGUI_DIR}/imgui_tables.cpp

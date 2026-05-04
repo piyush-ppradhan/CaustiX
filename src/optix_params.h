@@ -7,6 +7,7 @@ enum RayType { RAY_TYPE_RADIANCE = 0, RAY_TYPE_SHADOW = 1, RAY_TYPE_COUNT };
 
 struct Params {
   float4* image;
+  float* depth;
   unsigned int image_width;
   unsigned int image_height;
   unsigned int samples_per_pixel;

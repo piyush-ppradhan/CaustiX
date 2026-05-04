@@ -73,7 +73,8 @@ Outputs:
 ### Render:Misc
 
 - `Enable Shadows`
-- `Show Outlines`
+- `Show Outlines` draws depth-tested bounding-box outlines
+- `Show Timestep` overlays current dataset index; controls include position, size, and font
 - `Rotate X`, `Rotate Y`, `Rotate Z`
 - Ray tracing `Bounces` supports `1..20`
 
@@ -124,6 +125,7 @@ Config files (`.cfg`) store:
 - When `Use Dataset` is active, the current dataset frame is also used as the mask source.
 - Points with `mask == Fluid Flag` are treated as fluid candidates.
 - Thresholding is then applied to the selected data field to build the fluid surface.
+- Timestep overlay is baked into viewport texture, saved PNGs, and animation frames.
 - For XDMF input, point the UI at the `.xdmf` file. The app reads the referenced `.hdf5` arrays automatically.
 - XDMF support is intentionally narrow: it targets the dense cell-centered layout written by `save_fields_hdf5_xdmf` in `test.py`, including static fields referenced from separate HDF5 files.
 

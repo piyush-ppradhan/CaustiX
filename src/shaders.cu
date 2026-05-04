@@ -193,7 +193,14 @@ extern "C" __global__ void __raygen__rg() {
     float3 origin = params.cam_eye;
     float3 direction = normalize(d.x * params.cam_u + d.y * params.cam_v + params.cam_w);
 
-    float3 color = trace_radiance(origin, direction, 0);
+    unsigned int p0, p1, p2, p3;
+    p3 = 0;
+    optixTrace(params.handle, origin, direction, 0.001f, 1e16f, 0.0f, OptixVisibilityMask(255), OPTIX_RAY_FLAG_NONE,
+               RAY_TYPE_RADIANCE, RAY_TYPE_COUNT, RAY_TYPE_RADIANCE, p0, p1, p2, p3);
+    float3 color = make_float3(__uint_as_float(p0), __uint_as_float(p1), __uint_as_float(p2));
+    if (s == 0 && params.depth) {
+      params.depth[idx.y * params.image_width + idx.x] = __uint_as_float(p3);
+    }
     accum = accum + color;
   }
 
@@ -207,6 +214,7 @@ extern "C" __global__ void __miss__radiance() {
   MissData* data = reinterpret_cast<MissData*>(optixGetSbtDataPointer());
   // Background color is already in linear space, pass through
   setPayload(data->bg_color);
+  optixSetPayload_3(__float_as_uint(1e30f));
 }
 
 extern "C" __global__ void __miss__shadow() {
@@ -300,6 +308,8 @@ extern "C" __global__ void __closesthit__ch() {
   }
 
   setPayload(color);
+  float depth_z = dot(hit_pos - params.cam_eye, params.cam_w);
+  optixSetPayload_3(__float_as_uint(depth_z));
 }
 
 // --- Closest hit: ground plane ---
@@ -330,4 +340,6 @@ extern "C" __global__ void __closesthit__ground() {
   color = color * data->opacity;
 
   setPayload(color);
+  float depth_z = dot(hit_pos - params.cam_eye, params.cam_w);
+  optixSetPayload_3(__float_as_uint(depth_z));
 }

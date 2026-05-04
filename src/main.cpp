@@ -38,11 +38,13 @@
 #include <unordered_map>
 #include <vector>
 #include <iostream>
+#include <iterator>
 #include <stdexcept>
 #include <limits>
 #include <sstream>
 #include <functional>
 #include "stb_image_write.h"
+#include "stb_truetype.h"
 #include "config.hpp"
 #include "optix_params.h"
 
@@ -281,8 +283,11 @@ struct DatasetState {
 
 struct RenderMiscState {
   bool show_outlines = false;
+  bool prev_show_outlines = false;
   ImVec4 outline_color = ImVec4(1.0f, 1.0f, 0.0f, 1.0f);
+  ImVec4 prev_outline_color = outline_color;
   float outline_thickness = 2.0f;
+  float prev_outline_thickness = outline_thickness;
   float rotate_x_deg = 0.0f;
   float prev_rotate_x_deg = rotate_x_deg;
   float rotate_y_deg = 0.0f;
@@ -291,6 +296,19 @@ struct RenderMiscState {
   float prev_rotate_z_deg = rotate_z_deg;
   bool show_mask_error = false;
   std::string mask_error_msg;
+};
+
+struct TimestepOverlayState {
+  bool show = false;
+  bool prev_show = false;
+  float x = 0.02f;
+  float prev_x = x;
+  float y = 0.02f;
+  float prev_y = y;
+  float size = 32.0f;
+  float prev_size = size;
+  int font_index = 1;
+  int prev_font_index = font_index;
 };
 
 struct RayTracingState {
@@ -391,6 +409,7 @@ struct OptixState {
   CUdeviceptr d_ground_vertices = 0;
   CUdeviceptr d_ground_indices = 0;
   CUdeviceptr d_image = 0;
+  CUdeviceptr d_depth = 0;
   CUdeviceptr d_denoised_image = 0;
   CUdeviceptr d_params = 0;
   OptixDenoiser denoiser = nullptr;
@@ -1677,6 +1696,127 @@ static void render_background_to_host(int width, int height, const ImVec4& bg_co
   std::fill(host_pixels.begin(), host_pixels.end(), bg);
 }
 
+static const char* timestep_font_path(int font_index) {
+  switch (font_index) {
+    case 0:
+      return font_regular;
+    case 2:
+      return font_italic;
+    case 1:
+    default:
+      return font_bold;
+  }
+}
+
+static const char* timestep_font_label(int font_index) {
+  switch (font_index) {
+    case 0:
+      return "Regular";
+    case 2:
+      return "Italic";
+    case 1:
+    default:
+      return "Bold";
+  }
+}
+
+static void blend_pixel(uchar4& dst, const uchar4& src, float alpha) {
+  alpha = std::clamp(alpha, 0.0f, 1.0f);
+  float inv = 1.0f - alpha;
+  dst.x = static_cast<unsigned char>(std::clamp(dst.x * inv + src.x * alpha, 0.0f, 255.0f));
+  dst.y = static_cast<unsigned char>(std::clamp(dst.y * inv + src.y * alpha, 0.0f, 255.0f));
+  dst.z = static_cast<unsigned char>(std::clamp(dst.z * inv + src.z * alpha, 0.0f, 255.0f));
+  dst.w = 255;
+}
+
+static const std::vector<unsigned char>* load_font_bytes_cached(const char* path) {
+  if (path == nullptr || path[0] == '\0') {
+    return nullptr;
+  }
+  static std::unordered_map<std::string, std::vector<unsigned char>> cache;
+  std::string key(path);
+  auto cached = cache.find(key);
+  if (cached != cache.end()) {
+    return cached->second.empty() ? nullptr : &cached->second;
+  }
+  std::ifstream file(path, std::ios::binary);
+  if (!file.is_open()) {
+    return nullptr;
+  }
+  std::vector<unsigned char> bytes;
+  bytes.assign(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
+  auto inserted = cache.emplace(std::move(key), std::move(bytes));
+  return inserted.first->second.empty() ? nullptr : &inserted.first->second;
+}
+
+static void overlay_timestep_text_on_host(std::vector<uchar4>& host_pixels, int width, int height,
+                                          const TimestepOverlayState& overlay, int timestep_1based) {
+  if (!overlay.show || width <= 0 || height <= 0 ||
+      host_pixels.size() < static_cast<size_t>(width) * static_cast<size_t>(height)) {
+    return;
+  }
+
+  const std::vector<unsigned char>* font_bytes = load_font_bytes_cached(timestep_font_path(overlay.font_index));
+  if (font_bytes == nullptr) {
+    return;
+  }
+
+  stbtt_fontinfo font = {};
+  int font_offset = stbtt_GetFontOffsetForIndex(font_bytes->data(), 0);
+  if (font_offset < 0 || !stbtt_InitFont(&font, font_bytes->data(), font_offset)) {
+    return;
+  }
+
+  char text[64];
+  std::snprintf(text, sizeof(text), "Timestep: %07d", std::max(0, timestep_1based));
+  float pixel_height = std::clamp(overlay.size, 8.0f, 256.0f);
+  float scale = stbtt_ScaleForPixelHeight(&font, pixel_height);
+  int ascent = 0, descent = 0, line_gap = 0;
+  stbtt_GetFontVMetrics(&font, &ascent, &descent, &line_gap);
+
+  int x0 = static_cast<int>(std::lround(std::clamp(overlay.x, 0.0f, 1.0f) * static_cast<float>(width - 1)));
+  int y0 = static_cast<int>(std::lround(std::clamp(overlay.y, 0.0f, 1.0f) * static_cast<float>(height - 1)));
+  int baseline = y0 + static_cast<int>(std::lround(ascent * scale));
+  uchar4 shadow = make_uchar4(0, 0, 0, 255);
+  uchar4 fg = make_uchar4(255, 255, 255, 255);
+
+  auto draw_text_at = [&](int base_x, int base_y, const uchar4& color, float alpha_scale) {
+    int pen_x = base_x;
+    const unsigned char* s = reinterpret_cast<const unsigned char*>(text);
+    while (*s != 0) {
+      int codepoint = static_cast<int>(*s);
+      int advance = 0, lsb = 0;
+      stbtt_GetCodepointHMetrics(&font, codepoint, &advance, &lsb);
+      int bx0 = 0, by0 = 0, bx1 = 0, by1 = 0;
+      stbtt_GetCodepointBitmapBox(&font, codepoint, scale, scale, &bx0, &by0, &bx1, &by1);
+      int glyph_w = bx1 - bx0;
+      int glyph_h = by1 - by0;
+      if (glyph_w > 0 && glyph_h > 0) {
+        std::vector<unsigned char> bitmap(static_cast<size_t>(glyph_w) * static_cast<size_t>(glyph_h));
+        stbtt_MakeCodepointBitmap(&font, bitmap.data(), glyph_w, glyph_h, glyph_w, scale, scale, codepoint);
+        for (int gy = 0; gy < glyph_h; gy++) {
+          int py = base_y + by0 + gy;
+          if (py < 0 || py >= height) continue;
+          for (int gx = 0; gx < glyph_w; gx++) {
+            int px = pen_x + bx0 + gx;
+            if (px < 0 || px >= width) continue;
+            float a = (static_cast<float>(bitmap[static_cast<size_t>(gy) * glyph_w + gx]) / 255.0f) * alpha_scale;
+            blend_pixel(host_pixels[static_cast<size_t>(py) * width + px], color, a);
+          }
+        }
+      }
+      if (s[1] != 0) {
+        pen_x += static_cast<int>(std::lround(stbtt_GetCodepointKernAdvance(&font, codepoint, static_cast<int>(s[1])) * scale));
+      }
+      pen_x += static_cast<int>(std::lround(advance * scale));
+      s++;
+    }
+  };
+
+  draw_text_at(x0 + 2, baseline + 2, shadow, 0.85f);
+  draw_text_at(x0, baseline, fg, 1.0f);
+}
+
 static uchar4 linear_to_srgb_uchar4(const float4& c) {
   auto map = [](float v) -> unsigned char {
     float clamped = std::clamp(v, 0.0f, 1.0f);
@@ -1733,7 +1873,7 @@ static void ensure_denoiser_resources(OptixState& state, int width, int height) 
 static void render_optix_frame(OptixState& optix_state, int width, int height, int rt_samples, int rt_bounces,
                                const float cam_orientation[4], float cam_distance, const float cam_target[3],
                                float cam_fov, bool shadows_enabled, bool denoise_enabled,
-                               std::vector<uchar4>& host_pixels) {
+                               std::vector<uchar4>& host_pixels, std::vector<float>* host_depth = nullptr) {
   Quatf q = quat_from_array(cam_orientation);
   float3 W = normalize3(quat_rotate_vec3(q, make_float3(0.0f, 0.0f, -1.0f)));
   float3 U = normalize3(quat_rotate_vec3(q, make_float3(1.0f, 0.0f, 0.0f)));
@@ -1754,6 +1894,11 @@ static void render_optix_frame(OptixState& optix_state, int width, int height, i
     }
     CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&optix_state.d_image),
                           static_cast<size_t>(width) * static_cast<size_t>(height) * sizeof(float4)));
+    if (optix_state.d_depth) {
+      CUDA_CHECK(cudaFree(reinterpret_cast<void*>(optix_state.d_depth)));
+    }
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&optix_state.d_depth),
+                          static_cast<size_t>(width) * static_cast<size_t>(height) * sizeof(float)));
     optix_state.img_w = width;
     optix_state.img_h = height;
   }
@@ -1762,6 +1907,7 @@ static void render_optix_frame(OptixState& optix_state, int width, int height, i
 
   Params launch_params = {};
   launch_params.image = reinterpret_cast<float4*>(optix_state.d_image);
+  launch_params.depth = reinterpret_cast<float*>(optix_state.d_depth);
   launch_params.image_width = width;
   launch_params.image_height = height;
   launch_params.samples_per_pixel = static_cast<unsigned int>(rt_samples);
@@ -1824,12 +1970,34 @@ static void render_optix_frame(OptixState& optix_state, int width, int height, i
   for (size_t i = 0; i < host_linear.size(); i++) {
     host_pixels[i] = linear_to_srgb_uchar4(host_linear[i]);
   }
+  if (host_depth != nullptr) {
+    host_depth->resize(static_cast<size_t>(width) * static_cast<size_t>(height));
+    CUDA_CHECK(cudaMemcpy(host_depth->data(), reinterpret_cast<void*>(optix_state.d_depth),
+                          static_cast<size_t>(width) * static_cast<size_t>(height) * sizeof(float),
+                          cudaMemcpyDeviceToHost));
+  }
 }
 
-static void draw_disc_pixel(std::vector<uchar4>& host_pixels, int width, int height, int px, int py, int radius,
-                            const uchar4& color) {
+static bool outline_pixel_visible(const std::vector<float>* depth_buffer, int width, int height, int x, int y,
+                                  float outline_depth) {
+  if (depth_buffer == nullptr || depth_buffer->size() < static_cast<size_t>(width) * static_cast<size_t>(height)) {
+    return true;
+  }
+  if (x < 0 || x >= width || y < 0 || y >= height) {
+    return false;
+  }
+  float scene_depth = (*depth_buffer)[static_cast<size_t>(y) * static_cast<size_t>(width) + static_cast<size_t>(x)];
+  if (!std::isfinite(scene_depth) || scene_depth > 1e20f) {
+    return true;
+  }
+  return outline_depth <= scene_depth + 1e-3f;
+}
+
+static void draw_disc_pixel_depth(std::vector<uchar4>& host_pixels, const std::vector<float>* depth_buffer, int width,
+                                  int height, int px, int py, int radius, float depth, const uchar4& color) {
   if (radius <= 0) {
-    if (px >= 0 && px < width && py >= 0 && py < height) {
+    if (px >= 0 && px < width && py >= 0 && py < height &&
+        outline_pixel_visible(depth_buffer, width, height, px, py, depth)) {
       host_pixels[static_cast<size_t>(py) * static_cast<size_t>(width) + static_cast<size_t>(px)] = color;
     }
     return;
@@ -1842,35 +2010,18 @@ static void draw_disc_pixel(std::vector<uchar4>& host_pixels, int width, int hei
       }
       int x = px + dx;
       int y = py + dy;
-      if (x >= 0 && x < width && y >= 0 && y < height) {
+      if (x >= 0 && x < width && y >= 0 && y < height &&
+          outline_pixel_visible(depth_buffer, width, height, x, y, depth)) {
         host_pixels[static_cast<size_t>(y) * static_cast<size_t>(width) + static_cast<size_t>(x)] = color;
       }
     }
   }
 }
 
-static void draw_line_host(std::vector<uchar4>& host_pixels, int width, int height, float x0, float y0, float x1,
-                           float y1, int thickness, const uchar4& color) {
-  float dx = x1 - x0;
-  float dy = y1 - y0;
-  int steps = static_cast<int>(std::ceil(std::max(std::fabs(dx), std::fabs(dy))));
-  if (steps <= 0) {
-    draw_disc_pixel(host_pixels, width, height, static_cast<int>(std::lround(x0)), static_cast<int>(std::lround(y0)),
-                    std::max(0, thickness / 2), color);
-    return;
-  }
-  int radius = std::max(0, thickness / 2);
-  for (int i = 0; i <= steps; i++) {
-    float t = static_cast<float>(i) / static_cast<float>(steps);
-    int px = static_cast<int>(std::lround(x0 + dx * t));
-    int py = static_cast<int>(std::lround(y0 + dy * t));
-    draw_disc_pixel(host_pixels, width, height, px, py, radius, color);
-  }
-}
-
 static void overlay_bbox_outline_on_host(std::vector<uchar4>& host_pixels, int width, int height, const BBox& bbox,
                                          const float cam_orientation[4], float cam_distance, const float cam_target[3],
-                                         float cam_fov, const ImVec4& outline_color, float outline_thickness) {
+                                         float cam_fov, const ImVec4& outline_color, float outline_thickness,
+                                         const std::vector<float>* depth_buffer = nullptr) {
   if (host_pixels.size() < static_cast<size_t>(width) * static_cast<size_t>(height) || width <= 0 || height <= 0) {
     return;
   }
@@ -1895,13 +2046,14 @@ static void overlay_bbox_outline_on_host(std::vector<uchar4>& host_pixels, int w
     return;
   }
 
-  auto project = [&](const float3& p, bool& behind, float& sx, float& sy) {
+  auto project = [&](const float3& p, bool& behind, float& sx, float& sy, float& depth) {
     float3 v = make_float3(p.x - eye.x, p.y - eye.y, p.z - eye.z);
     float cz = v.x * fwd.x + v.y * fwd.y + v.z * fwd.z;
     if (cz <= 0.001f) {
       behind = true;
       sx = 0.0f;
       sy = 0.0f;
+      depth = 1e30f;
       return;
     }
     float cx = v.x * cam_right.x + v.y * cam_right.y + v.z * cam_right.z;
@@ -1910,6 +2062,7 @@ static void overlay_bbox_outline_on_host(std::vector<uchar4>& host_pixels, int w
     float ndc_y = cy / (cz * half_h);
     sx = (ndc_x * 0.5f + 0.5f) * static_cast<float>(width);
     sy = (0.5f - ndc_y * 0.5f) * static_cast<float>(height);
+    depth = cz;
     behind = false;
   };
 
@@ -1928,10 +2081,26 @@ static void overlay_bbox_outline_on_host(std::vector<uchar4>& host_pixels, int w
     bool b0 = false;
     bool b1 = false;
     float x0 = 0.0f, y0 = 0.0f, x1 = 0.0f, y1 = 0.0f;
-    project(corners[edges[e][0]], b0, x0, y0);
-    project(corners[edges[e][1]], b1, x1, y1);
+    float z0 = 1e30f, z1 = 1e30f;
+    project(corners[edges[e][0]], b0, x0, y0, z0);
+    project(corners[edges[e][1]], b1, x1, y1, z1);
     if (!b0 && !b1) {
-      draw_line_host(host_pixels, width, height, x0, y0, x1, y1, thickness, color);
+      float dx = x1 - x0;
+      float dy = y1 - y0;
+      int steps = static_cast<int>(std::ceil(std::max(std::fabs(dx), std::fabs(dy))));
+      int radius = std::max(0, thickness / 2);
+      if (steps <= 0) {
+        draw_disc_pixel_depth(host_pixels, depth_buffer, width, height, static_cast<int>(std::lround(x0)),
+                              static_cast<int>(std::lround(y0)), radius, z0, color);
+      } else {
+        for (int i = 0; i <= steps; i++) {
+          float t = static_cast<float>(i) / static_cast<float>(steps);
+          int px = static_cast<int>(std::lround(x0 + dx * t));
+          int py = static_cast<int>(std::lround(y0 + dy * t));
+          float z = z0 * (1.0f - t) + z1 * t;
+          draw_disc_pixel_depth(host_pixels, depth_buffer, width, height, px, py, radius, z, color);
+        }
+      }
     }
   }
 }
@@ -2515,6 +2684,7 @@ static void extract_fluid_mesh(const std::string& density_filepath, const std::s
 
 static void cleanup_optix(OptixState& state) {
   if (state.d_image) cudaFree(reinterpret_cast<void*>(state.d_image));
+  if (state.d_depth) cudaFree(reinterpret_cast<void*>(state.d_depth));
   if (state.d_denoised_image) cudaFree(reinterpret_cast<void*>(state.d_denoised_image));
   if (state.d_denoiser_state) cudaFree(reinterpret_cast<void*>(state.d_denoiser_state));
   if (state.d_denoiser_scratch) cudaFree(reinterpret_cast<void*>(state.d_denoiser_scratch));
@@ -2598,6 +2768,7 @@ int main(int argc, char* argv[]) {
   GroundState ground;
   DatasetState dataset;
   RenderMiscState misc;
+  TimestepOverlayState timestep_overlay;
   RayTracingState rt;
   CameraState camera;
 
@@ -2660,8 +2831,21 @@ int main(int argc, char* argv[]) {
   float& prev_ground_opacity = ground.prev_opacity;
 
   bool& show_outlines = misc.show_outlines;
+  bool& prev_show_outlines = misc.prev_show_outlines;
   ImVec4& outline_color = misc.outline_color;
+  ImVec4& prev_outline_color = misc.prev_outline_color;
   float& outline_thickness = misc.outline_thickness;
+  float& prev_outline_thickness = misc.prev_outline_thickness;
+  bool& show_timestep = timestep_overlay.show;
+  bool& prev_show_timestep = timestep_overlay.prev_show;
+  float& timestep_x = timestep_overlay.x;
+  float& prev_timestep_x = timestep_overlay.prev_x;
+  float& timestep_y = timestep_overlay.y;
+  float& prev_timestep_y = timestep_overlay.prev_y;
+  float& timestep_size = timestep_overlay.size;
+  float& prev_timestep_size = timestep_overlay.prev_size;
+  int& timestep_font_index = timestep_overlay.font_index;
+  int& prev_timestep_font_index = timestep_overlay.prev_font_index;
   float& rotate_x_deg = misc.rotate_x_deg;
   float& prev_rotate_x_deg = misc.prev_rotate_x_deg;
   float& rotate_y_deg = misc.rotate_y_deg;
@@ -2720,6 +2904,7 @@ int main(int argc, char* argv[]) {
 
   // Host pixel buffer for copying from GPU
   std::vector<uchar4> host_pixels;
+  std::vector<float> host_depth;
   std::string save_image_dir;
   std::string save_image_error_msg;
   std::array<char, 256> save_image_name_buf{};
@@ -2982,21 +3167,25 @@ int main(int argc, char* argv[]) {
       if (ImGui::Button("Begin")) {
         vtk_index = 0;
         jump_file_index_1based = 1;
+        viewport_needs_render = true;
       }
       ImGui::SameLine();
       if (ImGui::Button("Prev") && vtk_index > 0) {
         vtk_index--;
         jump_file_index_1based = vtk_index + 1;
+        viewport_needs_render = true;
       }
       ImGui::SameLine();
       if (ImGui::Button("Next") && vtk_index < (int)vtk_files.size() - 1) {
         vtk_index++;
         jump_file_index_1based = vtk_index + 1;
+        viewport_needs_render = true;
       }
       ImGui::SameLine();
       if (ImGui::Button("End")) {
         vtk_index = (int)vtk_files.size() - 1;
         jump_file_index_1based = vtk_index + 1;
+        viewport_needs_render = true;
       }
       ImGui::Text("Files: %d", static_cast<int>(vtk_files.size()));
       ImGui::SameLine();
@@ -3006,6 +3195,7 @@ int main(int argc, char* argv[]) {
       if (input_int_commit_on_enter("##jump_to_file", jump_file_index_1based, 1, static_cast<int>(vtk_files.size()))) {
         vtk_index = std::clamp(jump_file_index_1based - 1, 0, static_cast<int>(vtk_files.size()) - 1);
         jump_file_index_1based = vtk_index + 1;
+        viewport_needs_render = true;
       }
       ImGui::Spacing();
       if (ImGui::Button("Save Image")) {
@@ -3143,6 +3333,43 @@ int main(int argc, char* argv[]) {
       ImGui::SameLine();
       ImGui::SetNextItemWidth(-1);
       ImGui::SliderFloat("##outline_thickness", &outline_thickness, 1.0f, 10.0f);
+    }
+    if (ImGui::Checkbox("Show Timestep", &show_timestep)) {
+      viewport_needs_render = true;
+    }
+    if (show_timestep) {
+      ImGui::Text("Timestep X");
+      ImGui::SameLine();
+      ImGui::SetNextItemWidth(-1);
+      if (ImGui::SliderFloat("##timestep_x", &timestep_x, 0.0f, 1.0f, "%.3f", ImGuiSliderFlags_NoInput)) {
+        viewport_needs_render = true;
+      }
+      ImGui::Text("Timestep Y");
+      ImGui::SameLine();
+      ImGui::SetNextItemWidth(-1);
+      if (ImGui::SliderFloat("##timestep_y", &timestep_y, 0.0f, 1.0f, "%.3f", ImGuiSliderFlags_NoInput)) {
+        viewport_needs_render = true;
+      }
+      ImGui::Text("Timestep Size");
+      ImGui::SameLine();
+      ImGui::SetNextItemWidth(-1);
+      if (ImGui::SliderFloat("##timestep_size", &timestep_size, 8.0f, 128.0f, "%.1f", ImGuiSliderFlags_NoInput)) {
+        viewport_needs_render = true;
+      }
+      ImGui::Text("Timestep Font");
+      ImGui::SameLine();
+      ImGui::SetNextItemWidth(-1);
+      if (ImGui::BeginCombo("##timestep_font", timestep_font_label(timestep_font_index))) {
+        for (int i = 0; i < 3; i++) {
+          bool selected = (i == timestep_font_index);
+          if (ImGui::Selectable(timestep_font_label(i), selected)) {
+            timestep_font_index = i;
+            viewport_needs_render = true;
+          }
+          if (selected) ImGui::SetItemDefaultFocus();
+        }
+        ImGui::EndCombo();
+      }
     }
     ImGui::Text("Rotate X");
     ImGui::SameLine();
@@ -3720,15 +3947,20 @@ int main(int argc, char* argv[]) {
           if (mesh_loaded && optix_state.gas_handle != 0) {
             render_optix_frame(optix_state, save_image_width, save_image_height, rt_samples, rt_bounces,
                                cam_orientation, cam_distance, cam_target, cam_fov, shadows_enabled, rt_denoise,
-                               host_pixels);
+                               host_pixels, &host_depth);
           } else {
             render_background_to_host(save_image_width, save_image_height, bg_color, host_pixels);
+            host_depth.clear();
           }
           if (show_outlines && mesh_loaded) {
             overlay_bbox_outline_on_host(host_pixels, save_image_width, save_image_height, mesh_bbox, cam_orientation,
                                          cam_distance, cam_target, cam_fov, outline_color,
-                                         outline_thickness);
+                                         outline_thickness, &host_depth);
           }
+          int timestep_1based =
+              (!vtk_files.empty() ? std::clamp(vtk_index + 1, 1, static_cast<int>(vtk_files.size())) : 0);
+          overlay_timestep_text_on_host(host_pixels, save_image_width, save_image_height, timestep_overlay,
+                                        timestep_1based);
 
           int write_ok = stbi_write_png(out_path.string().c_str(), save_image_width, save_image_height, 4,
                                         host_pixels.data(), save_image_width * static_cast<int>(sizeof(uchar4)));
@@ -4212,7 +4444,27 @@ int main(int argc, char* argv[]) {
       }
     }
 
+    bool outline_overlay_changed =
+        (show_outlines != prev_show_outlines || outline_color.x != prev_outline_color.x ||
+         outline_color.y != prev_outline_color.y || outline_color.z != prev_outline_color.z ||
+         std::fabs(outline_thickness - prev_outline_thickness) > 1e-4f);
+    bool timestep_overlay_changed =
+        (show_timestep != prev_show_timestep || std::fabs(timestep_x - prev_timestep_x) > 1e-4f ||
+         std::fabs(timestep_y - prev_timestep_y) > 1e-4f || std::fabs(timestep_size - prev_timestep_size) > 1e-4f ||
+         timestep_font_index != prev_timestep_font_index);
+    if (outline_overlay_changed || timestep_overlay_changed) {
+      viewport_needs_render = true;
+    }
+
     prev_show_mask = show_mask;
+    prev_show_outlines = show_outlines;
+    prev_outline_color = outline_color;
+    prev_outline_thickness = outline_thickness;
+    prev_show_timestep = show_timestep;
+    prev_timestep_x = timestep_x;
+    prev_timestep_y = timestep_y;
+    prev_timestep_size = timestep_size;
+    prev_timestep_font_index = timestep_font_index;
     prev_mask_field_index = mask_field_index;
     prev_solid_flag = solid_flag;
     prev_smooth_iterations = smooth_iterations;
@@ -4324,7 +4576,14 @@ int main(int argc, char* argv[]) {
       viewport_needs_render = false;
       try {
         render_optix_frame(optix_state, vp_w, vp_h, rt_samples, rt_bounces, cam_orientation, cam_distance, cam_target,
-                           cam_fov, shadows_enabled, rt_denoise, host_pixels);
+                           cam_fov, shadows_enabled, rt_denoise, host_pixels, &host_depth);
+        if (show_outlines && mesh_loaded) {
+          overlay_bbox_outline_on_host(host_pixels, vp_w, vp_h, mesh_bbox, cam_orientation, cam_distance, cam_target,
+                                       cam_fov, outline_color, outline_thickness, &host_depth);
+        }
+        int timestep_1based =
+            (!vtk_files.empty() ? std::clamp(vtk_index + 1, 1, static_cast<int>(vtk_files.size())) : 0);
+        overlay_timestep_text_on_host(host_pixels, vp_w, vp_h, timestep_overlay, timestep_1based);
 
         // Upload to SDL texture
         void* tex_pixels = nullptr;
@@ -4346,6 +4605,10 @@ int main(int argc, char* argv[]) {
 
       // Fill viewport with background color (no OptiX)
       render_background_to_host(vp_w, vp_h, bg_color, host_pixels);
+      host_depth.clear();
+      int timestep_1based =
+          (!vtk_files.empty() ? std::clamp(vtk_index + 1, 1, static_cast<int>(vtk_files.size())) : 0);
+      overlay_timestep_text_on_host(host_pixels, vp_w, vp_h, timestep_overlay, timestep_1based);
 
       void* tex_pixels = nullptr;
       int tex_pitch = 0;
@@ -4446,16 +4709,19 @@ int main(int argc, char* argv[]) {
               if (render_any && mesh_loaded && optix_state.gas_handle != 0) {
                 render_optix_frame(optix_state, animation_export.width, animation_export.height, rt_samples, rt_bounces,
                                    cam_orientation, cam_distance, cam_target, cam_fov, shadows_enabled, rt_denoise,
-                                   animation_export.export_pixels);
+                                   animation_export.export_pixels, &host_depth);
               } else {
                 render_background_to_host(animation_export.width, animation_export.height, bg_color,
                                           animation_export.export_pixels);
+                host_depth.clear();
               }
               if (show_outlines && mesh_loaded) {
                 overlay_bbox_outline_on_host(animation_export.export_pixels, animation_export.width,
                                              animation_export.height, mesh_bbox, cam_orientation, cam_distance,
-                                             cam_target, cam_fov, outline_color, outline_thickness);
+                                             cam_target, cam_fov, outline_color, outline_thickness, &host_depth);
               }
+              overlay_timestep_text_on_host(animation_export.export_pixels, animation_export.width,
+                                            animation_export.height, timestep_overlay, timestep_1based);
 
               int write_ok = stbi_write_png(out_path.string().c_str(), animation_export.width, animation_export.height,
                                             4, animation_export.export_pixels.data(),
@@ -4483,55 +4749,7 @@ int main(int argc, char* argv[]) {
     }
 
     if (viewport_tex) {
-      ImVec2 img_cursor = ImGui::GetCursorScreenPos();
       ImGui::Image((ImTextureID)(intptr_t)viewport_tex, avail);
-
-      // Draw bounding box outline overlay
-      if (render_any && mesh_loaded && show_outlines) {
-        Quatf q = quat_from_array(cam_orientation);
-        float3 fwd = normalize3(quat_rotate_vec3(q, make_float3(0.0f, 0.0f, -1.0f)));
-        float3 cam_right = normalize3(quat_rotate_vec3(q, make_float3(1.0f, 0.0f, 0.0f)));
-        float3 cam_up = normalize3(quat_rotate_vec3(q, make_float3(0.0f, 1.0f, 0.0f)));
-        float3 tgt = make_float3(cam_target[0], cam_target[1], cam_target[2]);
-        float3 eye = make_float3(tgt.x - fwd.x * cam_distance, tgt.y - fwd.y * cam_distance, tgt.z - fwd.z * cam_distance);
-
-        float half_h = std::tan(cam_fov * 3.14159265f / 360.0f);
-        float aspect = (float)vp_w / (float)vp_h;
-        float half_w_val = half_h * aspect;
-
-        // Project 3D point to screen
-        auto project = [&](const float3& p, bool& behind) -> ImVec2 {
-          float3 v = make_float3(p.x - eye.x, p.y - eye.y, p.z - eye.z);
-          float cz = v.x * fwd.x + v.y * fwd.y + v.z * fwd.z;
-          if (cz <= 0.001f) {
-            behind = true;
-            return {0, 0};
-          }
-          float cx = v.x * cam_right.x + v.y * cam_right.y + v.z * cam_right.z;
-          float cy = v.x * cam_up.x + v.y * cam_up.y + v.z * cam_up.z;
-          float ndc_x = cx / (cz * half_w_val);
-          float ndc_y = cy / (cz * half_h);
-          behind = false;
-          return ImVec2(img_cursor.x + (ndc_x * 0.5f + 0.5f) * avail.x, img_cursor.y + (0.5f - ndc_y * 0.5f) * avail.y);
-        };
-
-        float3 lo = mesh_bbox.lo, hi = mesh_bbox.hi;
-        float3 corners[8] = {{lo.x, lo.y, lo.z}, {hi.x, lo.y, lo.z}, {hi.x, hi.y, lo.z}, {lo.x, hi.y, lo.z},
-                             {lo.x, lo.y, hi.z}, {hi.x, lo.y, hi.z}, {hi.x, hi.y, hi.z}, {lo.x, hi.y, hi.z}};
-        int edges[12][2] = {{0, 1}, {1, 2}, {2, 3}, {3, 0}, {4, 5}, {5, 6},
-                            {6, 7}, {7, 4}, {0, 4}, {1, 5}, {2, 6}, {3, 7}};
-
-        ImDrawList* draw_list = ImGui::GetWindowDrawList();
-        ImU32 ol_col = ImGui::ColorConvertFloat4ToU32(outline_color);
-        for (int e = 0; e < 12; e++) {
-          bool b0, b1;
-          ImVec2 p0 = project(corners[edges[e][0]], b0);
-          ImVec2 p1 = project(corners[edges[e][1]], b1);
-          if (!b0 && !b1) {
-            draw_list->AddLine(p0, p1, ol_col, outline_thickness);
-          }
-        }
-      }
     }
 
     ImGui::End();
