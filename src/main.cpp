@@ -301,7 +301,7 @@ struct RenderMiscState {
 struct TimestepOverlayState {
   bool show = false;
   bool prev_show = false;
-  ImVec4 color = ImVec4(1.0f, 1.0f, 1.0f, 1.0f);
+  ImVec4 color = ImVec4(0.0f, 0.0f, 0.0f, 1.0f);
   ImVec4 prev_color = color;
   float x = 0.02f;
   float prev_x = x;
@@ -1809,7 +1809,6 @@ static void overlay_timestep_text_on_host(std::vector<uchar4>& host_pixels, int 
   int x0 = static_cast<int>(std::lround(std::clamp(overlay.x, 0.0f, 1.0f) * static_cast<float>(width - 1)));
   int y0 = static_cast<int>(std::lround(std::clamp(overlay.y, 0.0f, 1.0f) * static_cast<float>(height - 1)));
   int baseline = y0 + static_cast<int>(std::lround(ascent * scale));
-  uchar4 shadow = make_uchar4(0, 0, 0, 255);
   uchar4 fg = make_uchar4(static_cast<unsigned char>(std::clamp(overlay.color.x, 0.0f, 1.0f) * 255.0f + 0.5f),
                           static_cast<unsigned char>(std::clamp(overlay.color.y, 0.0f, 1.0f) * 255.0f + 0.5f),
                           static_cast<unsigned char>(std::clamp(overlay.color.z, 0.0f, 1.0f) * 255.0f + 0.5f), 255);
@@ -1847,7 +1846,6 @@ static void overlay_timestep_text_on_host(std::vector<uchar4>& host_pixels, int 
     }
   };
 
-  draw_text_at(x0 + 2, baseline + 2, shadow, 0.85f);
   draw_text_at(x0, baseline, fg, 1.0f);
 }
 
@@ -2024,7 +2022,8 @@ static bool outline_pixel_visible(const std::vector<float>* depth_buffer, int wi
   if (!std::isfinite(scene_depth) || scene_depth > 1e20f) {
     return true;
   }
-  return outline_depth <= scene_depth + 1e-3f;
+  float depth_epsilon = std::max(1e-3f, std::fabs(outline_depth) * 0.01f);
+  return outline_depth <= scene_depth + depth_epsilon;
 }
 
 static void draw_disc_pixel_depth(std::vector<uchar4>& host_pixels, const std::vector<float>* depth_buffer, int width,
