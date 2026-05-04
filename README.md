@@ -74,7 +74,7 @@ Outputs:
 
 - `Enable Shadows`
 - `Show Outlines` draws depth-tested bounding-box outlines
-- `Show Timestep` overlays current dataset index; controls include position, size, and font
+- `Show Timestep` overlays current dataset index; text fields control position/size with invalid values reset to defaults
 - `Rotate X`, `Rotate Y`, `Rotate Z`
 - Ray tracing `Bounces` supports `1..20`
 

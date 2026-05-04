@@ -301,6 +301,8 @@ struct RenderMiscState {
 struct TimestepOverlayState {
   bool show = false;
   bool prev_show = false;
+  ImVec4 color = ImVec4(1.0f, 1.0f, 1.0f, 1.0f);
+  ImVec4 prev_color = color;
   float x = 0.02f;
   float prev_x = x;
   float y = 0.02f;
@@ -967,6 +969,36 @@ static bool input_float_commit_on_enter(const char* label, float& value, float m
       value = parsed;
       committed = true;
     }
+    sync_deferred_input_buffer(state, "%.6f", static_cast<double>(value));
+  } else if (!is_active && state.was_active) {
+    sync_deferred_input_buffer(state, "%.6f", static_cast<double>(value));
+  }
+
+  state.was_active = is_active;
+  return committed;
+}
+
+static bool input_float_commit_on_enter_or_default(const char* label, float& value, float min_value, float max_value,
+                                                   float default_value) {
+  ImGuiID id = ImGui::GetID(label);
+  auto& state = g_deferred_numeric_input_states[id];
+  if (!state.initialized || !state.was_active) {
+    sync_deferred_input_buffer(state, "%.6f", static_cast<double>(value));
+  }
+
+  bool submitted = ImGui::InputText(label, state.buffer.data(), state.buffer.size(),
+                                    ImGuiInputTextFlags_CharsScientific | ImGuiInputTextFlags_EnterReturnsTrue);
+  bool is_active = ImGui::IsItemActive();
+  bool committed = false;
+  if (submitted) {
+    char* end_ptr = nullptr;
+    float parsed = std::strtof(state.buffer.data(), &end_ptr);
+    if (end_ptr == state.buffer.data() || !std::isfinite(parsed) || parsed < min_value || parsed > max_value) {
+      value = default_value;
+    } else {
+      value = parsed;
+    }
+    committed = true;
     sync_deferred_input_buffer(state, "%.6f", static_cast<double>(value));
   } else if (!is_active && state.was_active) {
     sync_deferred_input_buffer(state, "%.6f", static_cast<double>(value));
@@ -1778,7 +1810,9 @@ static void overlay_timestep_text_on_host(std::vector<uchar4>& host_pixels, int 
   int y0 = static_cast<int>(std::lround(std::clamp(overlay.y, 0.0f, 1.0f) * static_cast<float>(height - 1)));
   int baseline = y0 + static_cast<int>(std::lround(ascent * scale));
   uchar4 shadow = make_uchar4(0, 0, 0, 255);
-  uchar4 fg = make_uchar4(255, 255, 255, 255);
+  uchar4 fg = make_uchar4(static_cast<unsigned char>(std::clamp(overlay.color.x, 0.0f, 1.0f) * 255.0f + 0.5f),
+                          static_cast<unsigned char>(std::clamp(overlay.color.y, 0.0f, 1.0f) * 255.0f + 0.5f),
+                          static_cast<unsigned char>(std::clamp(overlay.color.z, 0.0f, 1.0f) * 255.0f + 0.5f), 255);
 
   auto draw_text_at = [&](int base_x, int base_y, const uchar4& color, float alpha_scale) {
     int pen_x = base_x;
@@ -2838,6 +2872,8 @@ int main(int argc, char* argv[]) {
   float& prev_outline_thickness = misc.prev_outline_thickness;
   bool& show_timestep = timestep_overlay.show;
   bool& prev_show_timestep = timestep_overlay.prev_show;
+  ImVec4& timestep_color = timestep_overlay.color;
+  ImVec4& prev_timestep_color = timestep_overlay.prev_color;
   float& timestep_x = timestep_overlay.x;
   float& prev_timestep_x = timestep_overlay.prev_x;
   float& timestep_y = timestep_overlay.y;
@@ -3341,19 +3377,23 @@ int main(int argc, char* argv[]) {
       ImGui::Text("Timestep X");
       ImGui::SameLine();
       ImGui::SetNextItemWidth(-1);
-      if (ImGui::SliderFloat("##timestep_x", &timestep_x, 0.0f, 1.0f, "%.3f", ImGuiSliderFlags_NoInput)) {
+      if (input_float_commit_on_enter_or_default("##timestep_x", timestep_x, 0.0f, 1.0f, 0.02f)) {
         viewport_needs_render = true;
       }
       ImGui::Text("Timestep Y");
       ImGui::SameLine();
       ImGui::SetNextItemWidth(-1);
-      if (ImGui::SliderFloat("##timestep_y", &timestep_y, 0.0f, 1.0f, "%.3f", ImGuiSliderFlags_NoInput)) {
+      if (input_float_commit_on_enter_or_default("##timestep_y", timestep_y, 0.0f, 1.0f, 0.02f)) {
         viewport_needs_render = true;
       }
       ImGui::Text("Timestep Size");
       ImGui::SameLine();
       ImGui::SetNextItemWidth(-1);
-      if (ImGui::SliderFloat("##timestep_size", &timestep_size, 8.0f, 128.0f, "%.1f", ImGuiSliderFlags_NoInput)) {
+      if (input_float_commit_on_enter_or_default("##timestep_size", timestep_size, 8.0f, 128.0f, 32.0f)) {
+        viewport_needs_render = true;
+      }
+      ImGui::Text("Timestep Color");
+      if (ImGui::ColorEdit3("##timestep_color", (float*)&timestep_color)) {
         viewport_needs_render = true;
       }
       ImGui::Text("Timestep Font");
@@ -4451,7 +4491,8 @@ int main(int argc, char* argv[]) {
     bool timestep_overlay_changed =
         (show_timestep != prev_show_timestep || std::fabs(timestep_x - prev_timestep_x) > 1e-4f ||
          std::fabs(timestep_y - prev_timestep_y) > 1e-4f || std::fabs(timestep_size - prev_timestep_size) > 1e-4f ||
-         timestep_font_index != prev_timestep_font_index);
+         timestep_font_index != prev_timestep_font_index || timestep_color.x != prev_timestep_color.x ||
+         timestep_color.y != prev_timestep_color.y || timestep_color.z != prev_timestep_color.z);
     if (outline_overlay_changed || timestep_overlay_changed) {
       viewport_needs_render = true;
     }
@@ -4461,6 +4502,7 @@ int main(int argc, char* argv[]) {
     prev_outline_color = outline_color;
     prev_outline_thickness = outline_thickness;
     prev_show_timestep = show_timestep;
+    prev_timestep_color = timestep_color;
     prev_timestep_x = timestep_x;
     prev_timestep_y = timestep_y;
     prev_timestep_size = timestep_size;

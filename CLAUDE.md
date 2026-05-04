@@ -145,7 +145,8 @@ No volumetric texture upload or ray marching is used in the current design.
 
 - `Show Outlines` draws depth-tested bbox outlines into rendered pixels.
 - `Show Timestep` overlays current dataset index into viewport/saved images/animation frames.
-- Timestep controls: normalized X/Y position, pixel size, and built-in font (`Regular`, `Bold`, `Italic`).
+- Timestep controls: normalized X/Y position and pixel size use Enter-commit text fields; invalid values reset to defaults.
+- Timestep also has font color and built-in font (`Regular`, `Bold`, `Italic`).
 
 ### `Render:Mask`
 
