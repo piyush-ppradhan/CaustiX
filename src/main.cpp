@@ -318,7 +318,7 @@ struct AxisOverlayState {
   bool prev_show = false;
   bool export_enabled = true;
   bool prev_export_enabled = true;
-  float size = 80.0f;
+  float size = 60.0f;
   float prev_size = size;
 };
 
@@ -1923,7 +1923,7 @@ static void draw_line_on_host(std::vector<uchar4>& host_pixels, int width, int h
 
 static void draw_arrow_on_host(std::vector<uchar4>& host_pixels, int width, int height, float x0, float y0, float x1,
                                float y1, const uchar4& color) {
-  draw_line_on_host(host_pixels, width, height, x0, y0, x1, y1, 3, color);
+  draw_line_on_host(host_pixels, width, height, x0, y0, x1, y1, 5, color);
   float dx = x1 - x0;
   float dy = y1 - y0;
   float len = std::sqrt(dx * dx + dy * dy);
@@ -1932,12 +1932,12 @@ static void draw_arrow_on_host(std::vector<uchar4>& host_pixels, int width, int 
   dy /= len;
   float px = -dy;
   float py = dx;
-  float head_len = 10.0f;
-  float head_w = 5.0f;
+  float head_len = 9.0f;
+  float head_w = 6.0f;
   draw_line_on_host(host_pixels, width, height, x1, y1, x1 - dx * head_len + px * head_w,
-                    y1 - dy * head_len + py * head_w, 3, color);
+                    y1 - dy * head_len + py * head_w, 5, color);
   draw_line_on_host(host_pixels, width, height, x1, y1, x1 - dx * head_len - px * head_w,
-                    y1 - dy * head_len - py * head_w, 3, color);
+                    y1 - dy * head_len - py * head_w, 5, color);
 }
 
 static void overlay_axis_gizmo_on_host(std::vector<uchar4>& host_pixels, int width, int height,
@@ -1951,9 +1951,9 @@ static void overlay_axis_gizmo_on_host(std::vector<uchar4>& host_pixels, int wid
   Quatf q = quat_from_array(cam_orientation);
   float3 cam_right = normalize3(quat_rotate_vec3(q, make_float3(1.0f, 0.0f, 0.0f)));
   float3 cam_up = normalize3(quat_rotate_vec3(q, make_float3(0.0f, 1.0f, 0.0f)));
-  float origin_x = std::max(48.0f, overlay.size * 0.75f);
+  float origin_x = std::max(72.0f, overlay.size * 1.25f);
   float origin_y = static_cast<float>(height) - std::max(48.0f, overlay.size * 0.75f);
-  float axis_len = std::clamp(overlay.size, 32.0f, 200.0f);
+  float axis_len = std::clamp(overlay.size, 32.0f, 200.0f) * 0.78f;
 
   struct AxisSpec {
     float3 dir;
@@ -3516,7 +3516,7 @@ int main(int argc, char* argv[]) {
       ImGui::Text("Axis Size");
       ImGui::SameLine();
       ImGui::SetNextItemWidth(-1);
-      if (input_float_commit_on_enter_or_default("##axis_size", axis_size, 32.0f, 200.0f, 80.0f)) {
+      if (input_float_commit_on_enter_or_default("##axis_size", axis_size, 32.0f, 200.0f, 60.0f)) {
         viewport_needs_render = true;
       }
     }
