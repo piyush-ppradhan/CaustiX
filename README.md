@@ -74,6 +74,8 @@ Outputs:
 
 - `Enable Shadows`
 - `Show Outlines` draws depth-tested bounding-box outlines
+- `Show 3D Axis` draws camera-oriented X/Y/Z axis glyph in bottom-left corner
+- `Axis In Exports` includes axis glyph in saved screenshots and animation frames
 - `Show Timestep` overlays current dataset index; text fields control position/size with invalid values reset to defaults
 - `Rotate X`, `Rotate Y`, `Rotate Z`
 - Ray tracing `Bounces` supports `1..20`
@@ -126,6 +128,7 @@ Config files (`.cfg`) store:
 - Points with `mask == Fluid Flag` are treated as fluid candidates.
 - Thresholding is then applied to the selected data field to build the fluid surface.
 - Timestep overlay is baked into viewport texture, saved PNGs, and animation frames.
+- Animation export can optionally rotate geometry around X/Y/Z at a guarded degrees-per-frame rate.
 - For XDMF input, point the UI at the `.xdmf` file. The app reads the referenced `.hdf5` arrays automatically.
 - XDMF support is intentionally narrow: it targets the dense cell-centered layout written by `save_fields_hdf5_xdmf` in `test.py`, including static fields referenced from separate HDF5 files.
 

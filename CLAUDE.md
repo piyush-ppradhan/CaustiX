@@ -144,6 +144,8 @@ No volumetric texture upload or ray marching is used in the current design.
 ### `Render:Misc`
 
 - `Show Outlines` draws depth-tested bbox outlines into rendered pixels.
+- `Show 3D Axis` draws bottom-left camera-oriented axis glyph: X red, Y blue, Z green, black labels.
+- `Axis In Exports` controls whether axis glyph is baked into saved PNGs and animation frames.
 - `Show Timestep` overlays current dataset index into viewport/saved images/animation frames.
 - Timestep controls: normalized X/Y position and pixel size use Enter-commit text fields; invalid values reset to defaults.
 - Timestep also has font color and built-in font (`Regular`, `Bold`, `Italic`).
@@ -193,6 +195,12 @@ No volumetric texture upload or ray marching is used in the current design.
   - global illumination strength and color
   - ground plane parameters (enabled, y offset, color, metallic, roughness, opacity)
   - all saved camera presets
+
+### Animation Export
+
+- Optional geometry rotation during export applies to global `Rotate X/Y/Z`.
+- Rotation uses selected axis and degrees-per-frame rate; invalid axis/rate reset to sane defaults.
+- Original global rotation is restored after export success, failure, or cancel.
 
 ## Rebuild Strategy
 

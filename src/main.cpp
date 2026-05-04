@@ -313,6 +313,15 @@ struct TimestepOverlayState {
   int prev_font_index = font_index;
 };
 
+struct AxisOverlayState {
+  bool show = false;
+  bool prev_show = false;
+  bool export_enabled = true;
+  bool prev_export_enabled = true;
+  float size = 80.0f;
+  float prev_size = size;
+};
+
 struct RayTracingState {
   int bounces = 4;
   int prev_bounces = bounces;
@@ -372,6 +381,15 @@ struct AnimationExportState {
   int current_target_vtk_index = -1;
   int restore_vtk_index = -1;
   int restore_jump_index = 1;
+  bool rotate_enabled = false;
+  int rotate_axis = 2;
+  float rotate_rate_deg = 1.0f;
+  float restore_rotate_x = 0.0f;
+  float restore_rotate_y = 0.0f;
+  float restore_rotate_z = 0.0f;
+  float base_rotate_x = 0.0f;
+  float base_rotate_y = 0.0f;
+  float base_rotate_z = 0.0f;
   AnimationExportPhase phase = AnimationExportPhase::SetFrame;
   std::vector<uchar4> export_pixels;
 };
@@ -1752,6 +1770,18 @@ static const char* timestep_font_label(int font_index) {
   }
 }
 
+static const char* axis_label(int axis) {
+  switch (axis) {
+    case 0:
+      return "X";
+    case 1:
+      return "Y";
+    case 2:
+    default:
+      return "Z";
+  }
+}
+
 static void blend_pixel(uchar4& dst, const uchar4& src, float alpha) {
   alpha = std::clamp(alpha, 0.0f, 1.0f);
   float inv = 1.0f - alpha;
@@ -1759,6 +1789,12 @@ static void blend_pixel(uchar4& dst, const uchar4& src, float alpha) {
   dst.y = static_cast<unsigned char>(std::clamp(dst.y * inv + src.y * alpha, 0.0f, 255.0f));
   dst.z = static_cast<unsigned char>(std::clamp(dst.z * inv + src.z * alpha, 0.0f, 255.0f));
   dst.w = 255;
+}
+
+static uchar4 imvec4_to_uchar4(const ImVec4& color) {
+  return make_uchar4(static_cast<unsigned char>(std::clamp(color.x, 0.0f, 1.0f) * 255.0f + 0.5f),
+                     static_cast<unsigned char>(std::clamp(color.y, 0.0f, 1.0f) * 255.0f + 0.5f),
+                     static_cast<unsigned char>(std::clamp(color.z, 0.0f, 1.0f) * 255.0f + 0.5f), 255);
 }
 
 static const std::vector<unsigned char>* load_font_bytes_cached(const char* path) {
@@ -1781,14 +1817,14 @@ static const std::vector<unsigned char>* load_font_bytes_cached(const char* path
   return inserted.first->second.empty() ? nullptr : &inserted.first->second;
 }
 
-static void overlay_timestep_text_on_host(std::vector<uchar4>& host_pixels, int width, int height,
-                                          const TimestepOverlayState& overlay, int timestep_1based) {
-  if (!overlay.show || width <= 0 || height <= 0 ||
+static void draw_text_on_host(std::vector<uchar4>& host_pixels, int width, int height, const char* text, int x0, int y0,
+                              float pixel_height, int font_index, const uchar4& color) {
+  if (text == nullptr || text[0] == '\0' || width <= 0 || height <= 0 ||
       host_pixels.size() < static_cast<size_t>(width) * static_cast<size_t>(height)) {
     return;
   }
 
-  const std::vector<unsigned char>* font_bytes = load_font_bytes_cached(timestep_font_path(overlay.font_index));
+  const std::vector<unsigned char>* font_bytes = load_font_bytes_cached(timestep_font_path(font_index));
   if (font_bytes == nullptr) {
     return;
   }
@@ -1799,19 +1835,12 @@ static void overlay_timestep_text_on_host(std::vector<uchar4>& host_pixels, int 
     return;
   }
 
-  char text[64];
-  std::snprintf(text, sizeof(text), "Timestep: %07d", std::max(0, timestep_1based));
-  float pixel_height = std::clamp(overlay.size, 8.0f, 256.0f);
+  pixel_height = std::clamp(pixel_height, 8.0f, 256.0f);
   float scale = stbtt_ScaleForPixelHeight(&font, pixel_height);
   int ascent = 0, descent = 0, line_gap = 0;
   stbtt_GetFontVMetrics(&font, &ascent, &descent, &line_gap);
 
-  int x0 = static_cast<int>(std::lround(std::clamp(overlay.x, 0.0f, 1.0f) * static_cast<float>(width - 1)));
-  int y0 = static_cast<int>(std::lround(std::clamp(overlay.y, 0.0f, 1.0f) * static_cast<float>(height - 1)));
   int baseline = y0 + static_cast<int>(std::lround(ascent * scale));
-  uchar4 fg = make_uchar4(static_cast<unsigned char>(std::clamp(overlay.color.x, 0.0f, 1.0f) * 255.0f + 0.5f),
-                          static_cast<unsigned char>(std::clamp(overlay.color.y, 0.0f, 1.0f) * 255.0f + 0.5f),
-                          static_cast<unsigned char>(std::clamp(overlay.color.z, 0.0f, 1.0f) * 255.0f + 0.5f), 255);
 
   auto draw_text_at = [&](int base_x, int base_y, const uchar4& color, float alpha_scale) {
     int pen_x = base_x;
@@ -1846,7 +1875,108 @@ static void overlay_timestep_text_on_host(std::vector<uchar4>& host_pixels, int 
     }
   };
 
-  draw_text_at(x0, baseline, fg, 1.0f);
+  draw_text_at(x0, baseline, color, 1.0f);
+}
+
+static void overlay_timestep_text_on_host(std::vector<uchar4>& host_pixels, int width, int height,
+                                          const TimestepOverlayState& overlay, int timestep_1based) {
+  if (!overlay.show) {
+    return;
+  }
+  char text[64];
+  std::snprintf(text, sizeof(text), "Timestep: %07d", std::max(0, timestep_1based));
+  int x0 = static_cast<int>(std::lround(std::clamp(overlay.x, 0.0f, 1.0f) * static_cast<float>(width - 1)));
+  int y0 = static_cast<int>(std::lround(std::clamp(overlay.y, 0.0f, 1.0f) * static_cast<float>(height - 1)));
+  draw_text_on_host(host_pixels, width, height, text, x0, y0, overlay.size, overlay.font_index,
+                    imvec4_to_uchar4(overlay.color));
+}
+
+static void draw_disc_on_host(std::vector<uchar4>& host_pixels, int width, int height, int px, int py, int radius,
+                              const uchar4& color) {
+  for (int dy = -radius; dy <= radius; dy++) {
+    for (int dx = -radius; dx <= radius; dx++) {
+      if (dx * dx + dy * dy > radius * radius) continue;
+      int x = px + dx;
+      int y = py + dy;
+      if (x >= 0 && x < width && y >= 0 && y < height) {
+        host_pixels[static_cast<size_t>(y) * width + x] = color;
+      }
+    }
+  }
+}
+
+static void draw_line_on_host(std::vector<uchar4>& host_pixels, int width, int height, float x0, float y0, float x1,
+                              float y1, int thickness, const uchar4& color) {
+  int steps = static_cast<int>(std::ceil(std::max(std::fabs(x1 - x0), std::fabs(y1 - y0))));
+  int radius = std::max(0, thickness / 2);
+  if (steps <= 0) {
+    draw_disc_on_host(host_pixels, width, height, static_cast<int>(std::lround(x0)), static_cast<int>(std::lround(y0)),
+                      radius, color);
+    return;
+  }
+  for (int i = 0; i <= steps; i++) {
+    float t = static_cast<float>(i) / static_cast<float>(steps);
+    draw_disc_on_host(host_pixels, width, height, static_cast<int>(std::lround(x0 + (x1 - x0) * t)),
+                      static_cast<int>(std::lround(y0 + (y1 - y0) * t)), radius, color);
+  }
+}
+
+static void draw_arrow_on_host(std::vector<uchar4>& host_pixels, int width, int height, float x0, float y0, float x1,
+                               float y1, const uchar4& color) {
+  draw_line_on_host(host_pixels, width, height, x0, y0, x1, y1, 3, color);
+  float dx = x1 - x0;
+  float dy = y1 - y0;
+  float len = std::sqrt(dx * dx + dy * dy);
+  if (len <= 1e-5f) return;
+  dx /= len;
+  dy /= len;
+  float px = -dy;
+  float py = dx;
+  float head_len = 10.0f;
+  float head_w = 5.0f;
+  draw_line_on_host(host_pixels, width, height, x1, y1, x1 - dx * head_len + px * head_w,
+                    y1 - dy * head_len + py * head_w, 3, color);
+  draw_line_on_host(host_pixels, width, height, x1, y1, x1 - dx * head_len - px * head_w,
+                    y1 - dy * head_len - py * head_w, 3, color);
+}
+
+static void overlay_axis_gizmo_on_host(std::vector<uchar4>& host_pixels, int width, int height,
+                                       const AxisOverlayState& overlay, const float cam_orientation[4],
+                                       bool for_export) {
+  if (!overlay.show || (for_export && !overlay.export_enabled) || width <= 0 || height <= 0 ||
+      host_pixels.size() < static_cast<size_t>(width) * static_cast<size_t>(height)) {
+    return;
+  }
+
+  Quatf q = quat_from_array(cam_orientation);
+  float3 cam_right = normalize3(quat_rotate_vec3(q, make_float3(1.0f, 0.0f, 0.0f)));
+  float3 cam_up = normalize3(quat_rotate_vec3(q, make_float3(0.0f, 1.0f, 0.0f)));
+  float origin_x = std::max(48.0f, overlay.size * 0.75f);
+  float origin_y = static_cast<float>(height) - std::max(48.0f, overlay.size * 0.75f);
+  float axis_len = std::clamp(overlay.size, 32.0f, 200.0f);
+
+  struct AxisSpec {
+    float3 dir;
+    const char* label;
+    uchar4 color;
+  };
+  AxisSpec axes[3] = {{make_float3(1.0f, 0.0f, 0.0f), "X", make_uchar4(255, 0, 0, 255)},
+                      {make_float3(0.0f, 1.0f, 0.0f), "Y", make_uchar4(0, 0, 255, 255)},
+                      {make_float3(0.0f, 0.0f, 1.0f), "Z", make_uchar4(0, 200, 0, 255)}};
+  uchar4 label_color = make_uchar4(0, 0, 0, 255);
+  for (const AxisSpec& axis : axes) {
+    float sx = dot3(axis.dir, cam_right);
+    float sy = -dot3(axis.dir, cam_up);
+    float len = std::sqrt(sx * sx + sy * sy);
+    if (len <= 1e-6f) continue;
+    sx /= len;
+    sy /= len;
+    float x1 = origin_x + sx * axis_len;
+    float y1 = origin_y + sy * axis_len;
+    draw_arrow_on_host(host_pixels, width, height, origin_x, origin_y, x1, y1, axis.color);
+    draw_text_on_host(host_pixels, width, height, axis.label, static_cast<int>(std::lround(x1 + sx * 8.0f)),
+                      static_cast<int>(std::lround(y1 + sy * 8.0f - 8.0f)), 18.0f, 1, label_color);
+  }
 }
 
 static uchar4 linear_to_srgb_uchar4(const float4& c) {
@@ -2802,6 +2932,7 @@ int main(int argc, char* argv[]) {
   DatasetState dataset;
   RenderMiscState misc;
   TimestepOverlayState timestep_overlay;
+  AxisOverlayState axis_overlay;
   RayTracingState rt;
   CameraState camera;
 
@@ -2881,6 +3012,12 @@ int main(int argc, char* argv[]) {
   float& prev_timestep_size = timestep_overlay.prev_size;
   int& timestep_font_index = timestep_overlay.font_index;
   int& prev_timestep_font_index = timestep_overlay.prev_font_index;
+  bool& show_axis = axis_overlay.show;
+  bool& prev_show_axis = axis_overlay.prev_show;
+  bool& export_axis = axis_overlay.export_enabled;
+  bool& prev_export_axis = axis_overlay.prev_export_enabled;
+  float& axis_size = axis_overlay.size;
+  float& prev_axis_size = axis_overlay.prev_size;
   float& rotate_x_deg = misc.rotate_x_deg;
   float& prev_rotate_x_deg = misc.prev_rotate_x_deg;
   float& rotate_y_deg = misc.rotate_y_deg;
@@ -3368,6 +3505,20 @@ int main(int argc, char* argv[]) {
       ImGui::SameLine();
       ImGui::SetNextItemWidth(-1);
       ImGui::SliderFloat("##outline_thickness", &outline_thickness, 1.0f, 10.0f);
+    }
+    if (ImGui::Checkbox("Show 3D Axis", &show_axis)) {
+      viewport_needs_render = true;
+    }
+    if (show_axis) {
+      if (ImGui::Checkbox("Axis In Exports", &export_axis)) {
+        viewport_needs_render = true;
+      }
+      ImGui::Text("Axis Size");
+      ImGui::SameLine();
+      ImGui::SetNextItemWidth(-1);
+      if (input_float_commit_on_enter_or_default("##axis_size", axis_size, 32.0f, 200.0f, 80.0f)) {
+        viewport_needs_render = true;
+      }
     }
     if (ImGui::Checkbox("Show Timestep", &show_timestep)) {
       viewport_needs_render = true;
@@ -3996,6 +4147,8 @@ int main(int argc, char* argv[]) {
                                          cam_distance, cam_target, cam_fov, outline_color,
                                          outline_thickness, &host_depth);
           }
+          overlay_axis_gizmo_on_host(host_pixels, save_image_width, save_image_height, axis_overlay, cam_orientation,
+                                     true);
           int timestep_1based =
               (!vtk_files.empty() ? std::clamp(vtk_index + 1, 1, static_cast<int>(vtk_files.size())) : 0);
           overlay_timestep_text_on_host(host_pixels, save_image_width, save_image_height, timestep_overlay,
@@ -4076,6 +4229,29 @@ int main(int argc, char* argv[]) {
       ImGui::SetNextItemWidth(120.0f);
       input_int_commit_on_enter("##anim_step", animation_export.step_size, 1, 1000000);
 
+      ImGui::Spacing();
+      ImGui::Checkbox("Rotate Geometry", &animation_export.rotate_enabled);
+      if (animation_export.rotate_enabled) {
+        ImGui::Text("Rotate Axis");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(120.0f);
+        if (ImGui::BeginCombo("##anim_rotate_axis", axis_label(animation_export.rotate_axis))) {
+          for (int axis = 0; axis < 3; axis++) {
+            bool selected = (animation_export.rotate_axis == axis);
+            if (ImGui::Selectable(axis_label(axis), selected)) {
+              animation_export.rotate_axis = axis;
+            }
+            if (selected) ImGui::SetItemDefaultFocus();
+          }
+          ImGui::EndCombo();
+        }
+        ImGui::Text("Degrees/Frame");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(120.0f);
+        input_float_commit_on_enter_or_default("##anim_rotate_rate", animation_export.rotate_rate_deg, -360.0f,
+                                               360.0f, 1.0f);
+      }
+
       if (!animation_export.error_message.empty()) {
         ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "%s", animation_export.error_message.c_str());
       }
@@ -4095,6 +4271,13 @@ int main(int argc, char* argv[]) {
                                                    animation_export.frame_indices, animation_export.error_message)) {
           // error set by helper
         } else {
+          if (animation_export.rotate_axis < 0 || animation_export.rotate_axis > 2) {
+            animation_export.rotate_axis = 2;
+          }
+          if (!std::isfinite(animation_export.rotate_rate_deg) || animation_export.rotate_rate_deg < -360.0f ||
+              animation_export.rotate_rate_deg > 360.0f) {
+            animation_export.rotate_rate_deg = 1.0f;
+          }
           std::error_code mkdir_ec;
           std::filesystem::create_directories(animation_export.output_dir, mkdir_ec);
           if (mkdir_ec) {
@@ -4116,6 +4299,12 @@ int main(int argc, char* argv[]) {
             animation_export.phase = AnimationExportPhase::SetFrame;
             animation_export.restore_vtk_index = vtk_index;
             animation_export.restore_jump_index = jump_file_index_1based;
+            animation_export.restore_rotate_x = rotate_x_deg;
+            animation_export.restore_rotate_y = rotate_y_deg;
+            animation_export.restore_rotate_z = rotate_z_deg;
+            animation_export.base_rotate_x = rotate_x_deg;
+            animation_export.base_rotate_y = rotate_y_deg;
+            animation_export.base_rotate_z = rotate_z_deg;
             ImGui::CloseCurrentPopup();
           }
         }
@@ -4492,7 +4681,9 @@ int main(int argc, char* argv[]) {
          std::fabs(timestep_y - prev_timestep_y) > 1e-4f || std::fabs(timestep_size - prev_timestep_size) > 1e-4f ||
          timestep_font_index != prev_timestep_font_index || timestep_color.x != prev_timestep_color.x ||
          timestep_color.y != prev_timestep_color.y || timestep_color.z != prev_timestep_color.z);
-    if (outline_overlay_changed || timestep_overlay_changed) {
+    bool axis_overlay_changed = (show_axis != prev_show_axis || export_axis != prev_export_axis ||
+                                 std::fabs(axis_size - prev_axis_size) > 1e-4f);
+    if (outline_overlay_changed || timestep_overlay_changed || axis_overlay_changed) {
       viewport_needs_render = true;
     }
 
@@ -4506,6 +4697,9 @@ int main(int argc, char* argv[]) {
     prev_timestep_y = timestep_y;
     prev_timestep_size = timestep_size;
     prev_timestep_font_index = timestep_font_index;
+    prev_show_axis = show_axis;
+    prev_export_axis = export_axis;
+    prev_axis_size = axis_size;
     prev_mask_field_index = mask_field_index;
     prev_solid_flag = solid_flag;
     prev_smooth_iterations = smooth_iterations;
@@ -4622,6 +4816,7 @@ int main(int argc, char* argv[]) {
           overlay_bbox_outline_on_host(host_pixels, vp_w, vp_h, mesh_bbox, cam_orientation, cam_distance, cam_target,
                                        cam_fov, outline_color, outline_thickness, &host_depth);
         }
+        overlay_axis_gizmo_on_host(host_pixels, vp_w, vp_h, axis_overlay, cam_orientation, false);
         int timestep_1based =
             (!vtk_files.empty() ? std::clamp(vtk_index + 1, 1, static_cast<int>(vtk_files.size())) : 0);
         overlay_timestep_text_on_host(host_pixels, vp_w, vp_h, timestep_overlay, timestep_1based);
@@ -4650,6 +4845,7 @@ int main(int argc, char* argv[]) {
       int timestep_1based =
           (!vtk_files.empty() ? std::clamp(vtk_index + 1, 1, static_cast<int>(vtk_files.size())) : 0);
       overlay_timestep_text_on_host(host_pixels, vp_w, vp_h, timestep_overlay, timestep_1based);
+      overlay_axis_gizmo_on_host(host_pixels, vp_w, vp_h, axis_overlay, cam_orientation, false);
 
       void* tex_pixels = nullptr;
       int tex_pitch = 0;
@@ -4672,6 +4868,9 @@ int main(int argc, char* argv[]) {
         animation_export.phase = AnimationExportPhase::SetFrame;
         animation_export.current_target_vtk_index = -1;
         animation_export.wait_iterations = 0;
+        rotate_x_deg = animation_export.restore_rotate_x;
+        rotate_y_deg = animation_export.restore_rotate_y;
+        rotate_z_deg = animation_export.restore_rotate_z;
 
         if (!vtk_files.empty()) {
           int restore_index = animation_export.restore_vtk_index;
@@ -4701,6 +4900,19 @@ int main(int argc, char* argv[]) {
             animation_export.current_target_vtk_index = target_index;
             vtk_index = target_index;
             jump_file_index_1based = target_index + 1;
+            if (animation_export.rotate_enabled) {
+              float angle = static_cast<float>(animation_export.next_frame_cursor) * animation_export.rotate_rate_deg;
+              rotate_x_deg = animation_export.base_rotate_x;
+              rotate_y_deg = animation_export.base_rotate_y;
+              rotate_z_deg = animation_export.base_rotate_z;
+              if (animation_export.rotate_axis == 0) {
+                rotate_x_deg += angle;
+              } else if (animation_export.rotate_axis == 1) {
+                rotate_y_deg += angle;
+              } else {
+                rotate_z_deg += angle;
+              }
+            }
             animation_export.wait_iterations = 0;
             animation_export.phase = AnimationExportPhase::WaitSceneReady;
             viewport_needs_render = true;
@@ -4761,6 +4973,8 @@ int main(int argc, char* argv[]) {
                                              animation_export.height, mesh_bbox, cam_orientation, cam_distance,
                                              cam_target, cam_fov, outline_color, outline_thickness, &host_depth);
               }
+              overlay_axis_gizmo_on_host(animation_export.export_pixels, animation_export.width,
+                                         animation_export.height, axis_overlay, cam_orientation, true);
               overlay_timestep_text_on_host(animation_export.export_pixels, animation_export.width,
                                             animation_export.height, timestep_overlay, timestep_1based);
 
