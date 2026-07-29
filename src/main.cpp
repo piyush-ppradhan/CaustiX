@@ -442,6 +442,7 @@ struct OptixState {
   int denoiser_w = 0;
   int denoiser_h = 0;
   int img_w = 0, img_h = 0;
+  std::vector<float4> host_linear_scratch;
 };
 
 // --- PTX file loader ---
@@ -1124,11 +1125,7 @@ static viskores::cont::ArrayHandle<int> cast_scalar_field_to_int32(const viskore
 }
 
 static void sync_data_layer_caches(std::vector<DataLayer>& layers, std::vector<MeshCache>& layer_mesh_caches) {
-  if (layer_mesh_caches.size() < layers.size()) {
-    layer_mesh_caches.resize(layers.size());
-  } else if (layer_mesh_caches.size() > layers.size()) {
-    layer_mesh_caches.resize(layers.size());
-  }
+  layer_mesh_caches.resize(layers.size());
 }
 
 static void add_data_layer(std::vector<DataLayer>& layers, std::vector<MeshCache>& layer_mesh_caches,
@@ -1992,12 +1989,35 @@ static void overlay_axis_gizmo_on_host(std::vector<uchar4>& host_pixels, int wid
   }
 }
 
+// LUT-based sRGB encode: replaces a per-channel std::pow (called ~6M times per
+// 1080p frame) with a table lookup + linear interpolation, built once.
+static constexpr size_t kSrgbLutSize = 4096;
+
+static const std::array<float, kSrgbLutSize>& srgb_lut() {
+  static const std::array<float, kSrgbLutSize> lut = [] {
+    std::array<float, kSrgbLutSize> table{};
+    for (size_t i = 0; i < kSrgbLutSize; i++) {
+      float v = static_cast<float>(i) / static_cast<float>(kSrgbLutSize - 1);
+      table[i] = std::pow(v, 1.0f / 2.2f);
+    }
+    return table;
+  }();
+  return lut;
+}
+
+static unsigned char srgb_encode_channel(float v) {
+  const auto& lut = srgb_lut();
+  float clamped = std::clamp(v, 0.0f, 1.0f);
+  float scaled = clamped * static_cast<float>(kSrgbLutSize - 1);
+  size_t idx0 = static_cast<size_t>(scaled);
+  size_t idx1 = std::min(idx0 + 1, kSrgbLutSize - 1);
+  float frac = scaled - static_cast<float>(idx0);
+  float srgb = lut[idx0] * (1.0f - frac) + lut[idx1] * frac;
+  return static_cast<unsigned char>(srgb * 255.0f + 0.5f);
+}
+
 static uchar4 linear_to_srgb_uchar4(const float4& c) {
-  auto map = [](float v) -> unsigned char {
-    float clamped = std::clamp(v, 0.0f, 1.0f);
-    float srgb = std::pow(clamped, 1.0f / 2.2f);
-    return static_cast<unsigned char>(srgb * 255.0f + 0.5f);
-  };
+  auto map = srgb_encode_channel;
   return make_uchar4(map(c.x), map(c.y), map(c.z), static_cast<unsigned char>(std::clamp(c.w, 0.0f, 1.0f) * 255.0f + 0.5f));
 }
 
@@ -2078,7 +2098,8 @@ static void render_optix_frame(OptixState& optix_state, int width, int height, i
     optix_state.img_h = height;
   }
   host_pixels.resize(static_cast<size_t>(width) * static_cast<size_t>(height));
-  std::vector<float4> host_linear(static_cast<size_t>(width) * static_cast<size_t>(height));
+  std::vector<float4>& host_linear = optix_state.host_linear_scratch;
+  host_linear.resize(static_cast<size_t>(width) * static_cast<size_t>(height));
 
   Params launch_params = {};
   launch_params.image = reinterpret_cast<float4*>(optix_state.d_image);
@@ -2685,6 +2706,7 @@ static void extract_fluid_mesh(const std::string& density_filepath, const std::s
 
   bool found_fluid_flag = false;
   bool found_in_range = false;
+  std::vector<float> filtered_density(static_cast<size_t>(num_points), 0.0f);
   for (viskores::Id i = 0; i < num_points; i++) {
     int mask_value = mask_portal.Get(i);
     if (mask_value == fluid_flag) {
@@ -2692,6 +2714,7 @@ static void extract_fluid_mesh(const std::string& density_filepath, const std::s
       float d = density_portal.Get(i);
       if (d >= threshold_min && d <= threshold_max) {
         found_in_range = true;
+        filtered_density[static_cast<size_t>(i)] = 1.0f;
       }
     }
   }
@@ -2700,17 +2723,6 @@ static void extract_fluid_mesh(const std::string& density_filepath, const std::s
   }
   if (!found_in_range) {
     throw std::runtime_error("No fluid points fall inside the selected threshold range.");
-  }
-  std::vector<float> filtered_density(static_cast<size_t>(num_points), 0.0f);
-
-  for (viskores::Id i = 0; i < num_points; i++) {
-    int mask_value = mask_portal.Get(i);
-    if (mask_value == fluid_flag) {
-      float d = density_portal.Get(i);
-      if (d >= threshold_min && d <= threshold_max) {
-        filtered_density[static_cast<size_t>(i)] = 1.0f;
-      }
-    }
   }
 
   viskores::cont::ArrayHandle<float> filtered_density_array;
